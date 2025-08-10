@@ -6,7 +6,12 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # Load environment variables
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS") TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") ETHERSCAN_API = os.getenv("ETHERSCAN_API") DEX_PAIRS = os.getenv("DEX_PAIRS", "") PRICE_MOVE_THRESHOLD = float(os.getenv("PRICE_MOVE_THRESHOLD", "5.0"))
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS") 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") 
+ETHERSCAN_API = os.getenv("ETHERSCAN_API") 
+DEX_PAIRS = os.getenv("DEX_PAIRS", "") 
+PRICE_MOVE_THRESHOLD = float(os.getenv("PRICE_MOVE_THRESHOLD", "5.0"))
 
 # API endpoints
 CRONOSCAN_API_URL = "https://api.cronoscan.com/api"
