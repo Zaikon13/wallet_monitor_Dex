@@ -1,65 +1,85 @@
-# main.py - Wallet monitor (Cronos via Etherscan Multichain) + Dexscreener Live Scanner
-# Plug-and-play. Uses the exact Railway env var names you already have.
+# main.py - Wallet monitor (Cronos via Etherscan Multichain) + Dexscreener Live Scanner + Auto Discovery
+# Plug-and-play. Uses EXACT Railway env var names you already set.
+
 import os
 import time
 import threading
-import requests
 from collections import deque
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========== Environment variables (MUST match Railway names EXACTLY) ==========
+# ========================= Environment (exact names) =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-ETHERSCAN_API = os.getenv("ETHERSCAN_API")  # Etherscan Multichain key (used with chainid=25)
-DEX_PAIRS = os.getenv("DEX_PAIRS", "")      # comma-separated slugs like "cronos/0x...,cronos/0x..."
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+WALLET_ADDRESS     = os.getenv("WALLET_ADDRESS")
+ETHERSCAN_API      = os.getenv("ETHERSCAN_API")       # Etherscan Multichain (used with chainid=25)
+DEX_PAIRS          = os.getenv("DEX_PAIRS", "")       # "cronos/0xPAIR1,cronos/0xPAIR2"
 PRICE_MOVE_THRESHOLD = float(os.getenv("PRICE_MOVE_THRESHOLD", "5.0"))
-WALLET_POLL = int(os.getenv("WALLET_POLL", "15"))
-DEX_POLL = int(os.getenv("DEX_POLL", "30"))
+WALLET_POLL        = int(os.getenv("WALLET_POLL", "15"))
+DEX_POLL           = int(os.getenv("DEX_POLL", "60"))
 
-# Additional tuning (you can set these env vars if you want)
-PRICE_WINDOW = int(os.getenv("PRICE_WINDOW", "3"))     # how many last prices to keep to detect spikes (small integer)
-SPIKE_THRESHOLD = float(os.getenv("SPIKE_THRESHOLD", "8.0"))  # percent change within PRICE_WINDOW to call "spike"
-MIN_VOLUME_FOR_ALERT = float(os.getenv("MIN_VOLUME_FOR_ALERT", "0"))  # optional min vol threshold
+# ====== Optional (defaults ok even if you don't set them in Railway) ======
+PRICE_WINDOW       = int(os.getenv("PRICE_WINDOW", "3"))          # samples kept for spike detection
+SPIKE_THRESHOLD    = float(os.getenv("SPIKE_THRESHOLD", "8.0"))   # % change across PRICE_WINDOW
+MIN_VOLUME_FOR_ALERT = float(os.getenv("MIN_VOLUME_FOR_ALERT", "0"))
 
-# ========== Internal state ==========
-_seen_tx_hashes = set()
-_last_prices = {}         # slug -> last observed price (float)
-_price_history = {}       # slug -> deque([p1, p2, ...]) length PRICE_WINDOW
-_last_pair_tx = {}        # slug -> last tx hash (to dedupe trade alerts)
-_token_balances = {}      # token_contract -> last balance (for wallet token monitoring)
-_rate_limit_last_sent = 0 # global simple rate limiter timestamp
+DISCOVER_ENABLED   = os.getenv("DISCOVER_ENABLED", "true").lower() in ("1","true","yes","on")
+DISCOVER_QUERY     = os.getenv("DISCOVER_QUERY", "cronos")        # search keyword; we filter to cronos anyway
+DISCOVER_LIMIT     = int(os.getenv("DISCOVER_LIMIT", "10"))       # max new pairs to adopt per discovery round
+DISCOVER_POLL      = int(os.getenv("DISCOVER_POLL", "120"))       # seconds
+TOKENS             = os.getenv("TOKENS", "")                      # e.g. "cronos/0xTokenA,cronos/0xTokenB"
 
-# Constants
-ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
-CRONOS_CHAINID = 25
-DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex/pairs"
-TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
+# ========================= Constants =========================
+ETHERSCAN_V2_URL   = "https://api.etherscan.io/v2/api"            # multichain endpoint (needs chainid)
+CRONOS_CHAINID     = 25
+DEX_BASE_PAIRS     = "https://api.dexscreener.com/latest/dex/pairs"
+DEX_BASE_TOKENS    = "https://api.dexscreener.com/latest/dex/tokens"
+DEX_BASE_SEARCH    = "https://api.dexscreener.com/latest/dex/search"
+DEXSITE_PAIR       = "https://dexscreener.com/{chain}/{pair}"     # for user links
+CRONOS_TX          = "https://cronoscan.com/tx/{txhash}"
+TELEGRAM_URL       = "https://api.telegram.org/bot{token}/sendMessage"
 
-# ========== Helpers ==========
-def send_telegram(message):
-    """Send message to Telegram. On 401 exit so you can fix token."""
-    global _rate_limit_last_sent
-    # Simple rate limit: at most one message per 0.8s to avoid flooding
+# Global session with UA to avoid 403s
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+})
+
+# ========================= State =========================
+_seen_tx_hashes   = set()
+_last_prices      = {}                    # slug -> float
+_price_history    = {}                    # slug -> deque
+_last_pair_tx     = {}                    # slug -> tx hash
+_rate_limit_last  = 0.0                   # simple TG rate limit
+_tracked_pairs    = set()                 # set of slugs "cronos/0xPAIR"
+_known_pairs_meta = {}                    # slug -> dict(meta we got from API), optional
+
+# ========================= Utils =========================
+def send_telegram(message: str) -> bool:
+    global _rate_limit_last
     now = time.time()
-    if now - _rate_limit_last_sent < 0.8:
-        time.sleep(0.8 - (now - _rate_limit_last_sent))
+    # soft rate limit 0.8s
+    if now - _rate_limit_last < 0.8:
+        time.sleep(0.8 - (now - _rate_limit_last))
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID).")
         return False
+
     url = TELEGRAM_URL.format(token=TELEGRAM_BOT_TOKEN)
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        _rate_limit_last_sent = time.time()
+        r = SESSION.post(url, data=payload, timeout=12)
+        _rate_limit_last = time.time()
         if r.status_code == 401:
-            print("❌ Telegram API 401 Unauthorized. Regenerate token in @BotFather and update TELEGRAM_BOT_TOKEN in Railway.")
-            print("Telegram response:", r.text)
+            print("❌ Telegram 401 Unauthorized. Regenerate token in @BotFather and update TELEGRAM_BOT_TOKEN.")
+            print("Telegram response:", r.text[:300])
             raise SystemExit(1)
         if r.status_code != 200:
-            print("⚠️ Telegram API returned", r.status_code, r.text[:400])
+            print("⚠️ Telegram API returned", r.status_code, r.text[:300])
             return False
         return True
     except SystemExit:
@@ -68,20 +88,20 @@ def send_telegram(message):
         print("Exception sending telegram:", e)
         return False
 
-def safe_json(resp):
-    if resp is None:
+def safe_json(r):
+    if r is None:
         return None
-    if not getattr(resp, "ok", False):
-        print("HTTP error fetching:", getattr(resp, "status_code", None), getattr(resp, "text", "")[:300])
+    if not getattr(r, "ok", False):
+        print("HTTP error:", getattr(r, "status_code", None), str(getattr(r, "text", ""))[:300])
         return None
     try:
-        return resp.json()
+        return r.json()
     except Exception:
-        preview = (resp.text[:800].replace("\n", " ")) if hasattr(resp, "text") else "<no body>"
-        print("Response not JSON (preview):", preview)
+        txt = (r.text[:800].replace("\n", " ")) if hasattr(r, "text") else "<no body>"
+        print("Response not JSON (preview):", txt)
         return None
 
-# ========== Wallet (Cronos via Etherscan Multichain) ==========
+# ========================= Wallet (Cronos via Etherscan Multichain) =========================
 def fetch_latest_wallet_txs(limit=25):
     if not WALLET_ADDRESS or not ETHERSCAN_API:
         print("Missing WALLET_ADDRESS or ETHERSCAN_API.")
@@ -99,47 +119,29 @@ def fetch_latest_wallet_txs(limit=25):
         "apikey": ETHERSCAN_API,
     }
     try:
-        r = requests.get(ETHERSCAN_V2_URL, params=params, timeout=15)
+        r = SESSION.get(ETHERSCAN_V2_URL, params=params, timeout=15)
         data = safe_json(r)
         if not data:
             return []
-        status = str(data.get("status", "")).strip()
-        if status == "1" and isinstance(data.get("result"), list):
+        if str(data.get("status", "")).strip() == "1" and isinstance(data.get("result"), list):
             return data["result"]
-        else:
-            # Print a short preview
-            print("Unexpected wallet response:", str(data)[:600])
-            return []
+        print("Unexpected wallet response:", str(data)[:600])
+        return []
     except Exception as e:
         print("Error fetching wallet txs:", e)
         return []
 
-def fetch_token_balances_from_txlist(txs):
-    """
-    Extract token transfers from txlist results (ERC20 tokenTx not always present in txlist),
-    so we better query token transfers separately if needed. Here: keep it simple:
-    - we inspect txs for value transfers in CRO (native) and for token transfer logs (if returned as logs)
-    """
-    # For robust token balances you would call the tokenbalance endpoint per token contract.
-    # Here we provide a lightweight approach: gather contract addresses from token transfers if present in tx results.
-    tokens = {}
-    for tx in txs:
-        # many txs from txlist are native transfers; token transfers require separate endpoint `tokentx`
-        # we leave heavy token balance fetching optional (not enabled by default)
-        pass
-    return tokens
-
 def wallet_monitor_loop():
-    global _seen_tx_hashes, _token_balances
+    global _seen_tx_hashes
     print("Wallet monitor starting; loading initial recent txs...")
     initial = fetch_latest_wallet_txs(limit=50)
     try:
         _seen_tx_hashes = set(tx.get("hash") for tx in initial if isinstance(tx, dict) and tx.get("hash"))
     except Exception:
         _seen_tx_hashes = set()
-    # Inform startup
+
     try:
-        send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}`. Watching for new txs.")
+        send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}` (Cronos).")
     except SystemExit:
         print("Telegram token error on startup. Exiting wallet monitor.")
         return
@@ -149,100 +151,144 @@ def wallet_monitor_loop():
         if not txs:
             print("No txs returned; retrying...")
         else:
-            for tx in reversed(txs):  # oldest → newest
+            for tx in reversed(txs):  # send oldest→newest
                 if not isinstance(tx, dict):
                     continue
                 h = tx.get("hash")
-                if not h:
+                if not h or h in _seen_tx_hashes:
                     continue
-                if h not in _seen_tx_hashes:
-                    _seen_tx_hashes.add(h)
-                    # value handling
-                    val_raw = tx.get("value", "0")
+                _seen_tx_hashes.add(h)
+
+                # value (Cronos native 18 decimals)
+                val_raw = tx.get("value", "0")
+                try:
+                    value = int(val_raw) / 10**18
+                except Exception:
                     try:
-                        value = int(val_raw) / 10**18
+                        value = float(val_raw)
                     except Exception:
-                        try:
-                            value = float(val_raw)
-                        except Exception:
-                            value = 0
-                    frm = tx.get("from")
-                    to = tx.get("to")
-                    blk = tx.get("blockNumber")
-                    link = f"https://cronoscan.com/tx/{h}"
-                    msg = (
-                        f"*New Cronos TX*\nAddress: `{WALLET_ADDRESS}`\nHash: {link}\n"
-                        f"From: `{frm}`\nTo: `{to}`\nValue: {value:.6f} CRO\nBlock: {blk}"
-                    )
-                    print("Sending wallet alert for", h)
-                    send_telegram(msg)
+                        value = 0.0
+
+                frm  = tx.get("from")
+                to   = tx.get("to")
+                blk  = tx.get("blockNumber")
+                link = CRONOS_TX.format(txhash=h)
+
+                msg = (
+                    f"*New Cronos TX*\n"
+                    f"Address: `{WALLET_ADDRESS}`\n"
+                    f"Hash: {link}\n"
+                    f"From: `{frm}`\n"
+                    f"To: `{to}`\n"
+                    f"Value: {value:.6f} CRO\n"
+                    f"Block: {blk}"
+                )
+                print("Sending wallet alert for", h)
+                send_telegram(msg)
         time.sleep(WALLET_POLL)
 
-# ========== Dexscreener Live Scanner ==========
-def fetch_pair_raw(slug):
-    if not slug:
-        return None
-    url = f"{DEXSCREENER_BASE}/{slug}"
+# ========================= Dexscreener helpers =========================
+def slug(chain: str, pair_address: str) -> str:
+    return f"{chain}/{pair_address}".lower()
+
+def fetch_pair(slug_str: str):
+    # slug is "cronos/0xPAIR"
+    url = f"{DEX_BASE_PAIRS}/{slug_str}"
     try:
-        r = requests.get(url, timeout=12)
+        r = SESSION.get(url, timeout=12)
         return safe_json(r)
     except Exception as e:
-        print("Error fetching dexscreener", slug, e)
+        print("Error fetching pair", slug_str, e)
         return None
 
-def update_price_history(slug, price):
-    hist = _price_history.get(slug)
+def fetch_token_pairs(chain: str, token_address: str):
+    # returns pairs list for a token (we'll pick the first/top)
+    url = f"{DEX_BASE_TOKENS}/{chain}/{token_address}"
+    try:
+        r = SESSION.get(url, timeout=12)
+        data = safe_json(r)
+        if isinstance(data, dict) and "pairs" in data and isinstance(data["pairs"], list):
+            return data["pairs"]
+        return []
+    except Exception as e:
+        print("Error fetching token", chain, token_address, e)
+        return []
+
+def fetch_search(query: str):
+    # generic search (we’ll filter to chainId == 'cronos')
+    try:
+        r = SESSION.get(DEX_BASE_SEARCH, params={"q": query}, timeout=15)
+        data = safe_json(r)
+        if isinstance(data, dict) and "pairs" in data and isinstance(data["pairs"], list):
+            return data["pairs"]
+        return []
+    except Exception as e:
+        print("Error search dexscreener:", e)
+        return []
+
+def ensure_tracking_pair(chain: str, pair_address: str, meta: dict = None):
+    s = slug(chain, pair_address)
+    if s not in _tracked_pairs:
+        _tracked_pairs.add(s)
+        _last_prices[s]   = None
+        _last_pair_tx[s]  = None
+        _price_history[s] = deque(maxlen=PRICE_WINDOW)
+        if meta:
+            _known_pairs_meta[s] = meta
+        # notify adoption
+        ds_link = DEXSITE_PAIR.format(chain=chain, pair=pair_address)
+        sym = None
+        if isinstance(meta, dict):
+            bt = meta.get("baseToken") or {}
+            sym = bt.get("symbol")
+        title = f"{sym} ({s})" if sym else s
+        send_telegram(f"🆕 Now monitoring pair: {title}\n{ds_link}")
+
+# ========================= Dexscreener monitor (pairs already tracked) =========================
+def update_price_history(slg, price):
+    hist = _price_history.get(slg)
     if hist is None:
         hist = deque(maxlen=PRICE_WINDOW)
-        _price_history[slug] = hist
+        _price_history[slg] = hist
     hist.append(price)
-    _last_prices[slug] = price
+    _last_prices[slg] = price
 
-def detect_spike(slug):
-    hist = _price_history.get(slug)
+def detect_spike(slg):
+    hist = _price_history.get(slg)
     if not hist or len(hist) < 2:
         return None
     first = hist[0]
-    last = hist[-1]
-    if first == 0 or first is None:
+    last  = hist[-1]
+    if first in (None, 0):
         return None
-    pct = (last - first) / first * 100
-    if abs(pct) >= SPIKE_THRESHOLD:
-        return pct
-    return None
+    pct = (last - first) / first * 100.0
+    return pct if abs(pct) >= SPIKE_THRESHOLD else None
 
-def dexscreener_loop():
-    pairs = [p.strip() for p in (DEX_PAIRS or "").split(",") if p.strip()]
-    if not pairs:
-        print("No DEX_PAIRS configured; skipping dexscreener monitor.")
-        return
-    # startup
-    try:
-        send_telegram(f"🚀 Dexscreener monitor started for pairs: {', '.join(pairs)}")
-    except SystemExit:
-        print("Telegram token error on startup (dex). Exiting dexscreener.")
-        return
-
-    # init arrays
-    for slug in pairs:
-        _last_prices[slug] = None
-        _last_pair_tx[slug] = None
-        _price_history[slug] = deque(maxlen=PRICE_WINDOW)
+def monitor_tracked_pairs_loop():
+    if not _tracked_pairs:
+        print("No tracked pairs; monitor waits until discovery/seed adds some.")
+        # still run loop to allow discovery thread to fill
+    else:
+        send_telegram(f"🚀 Dexscreener monitor started for: {', '.join(sorted(_tracked_pairs))}")
 
     while True:
-        for slug in pairs:
-            raw = fetch_pair_raw(slug)
-            if not raw:
+        if not _tracked_pairs:
+            time.sleep(DEX_POLL)
+            continue
+
+        for s in list(_tracked_pairs):
+            data = fetch_pair(s)
+            if not data:
                 continue
-            # normalise possible shapes
+
+            # normalize structure
             pair = None
-            if isinstance(raw, dict) and "pair" in raw and isinstance(raw["pair"], dict):
-                pair = raw["pair"]
-            elif isinstance(raw, dict) and "pairs" in raw and isinstance(raw["pairs"], list) and raw["pairs"]:
-                pair = raw["pairs"][0]
+            if isinstance(data, dict) and isinstance(data.get("pair"), dict):
+                pair = data["pair"]
+            elif isinstance(data, dict) and isinstance(data.get("pairs"), list) and data["pairs"]:
+                pair = data["pairs"][0]
             else:
-                # if Dexscreener returns unexpected, log and skip
-                print("Unexpected dexscreener format for", slug)
+                print("Unexpected dexscreener format for", s)
                 continue
 
             # price
@@ -252,7 +298,7 @@ def dexscreener_loop():
             except Exception:
                 price_val = None
 
-            # volume (h1) optional
+            # vol (h1, optional)
             vol_h1 = None
             vol = pair.get("volume") or {}
             if isinstance(vol, dict):
@@ -261,53 +307,101 @@ def dexscreener_loop():
                 except Exception:
                     vol_h1 = None
 
-            # update history and detect spike
+            # symbol
+            symbol = (pair.get("baseToken") or {}).get("symbol") or s
+
+            # history + spike
             if price_val is not None:
-                update_price_history(slug, price_val)
-                spike_pct = detect_spike(slug)
-                # only alert on significant spike and optional volume threshold
+                update_price_history(s, price_val)
+                spike_pct = detect_spike(s)
                 if spike_pct is not None:
                     if MIN_VOLUME_FOR_ALERT and vol_h1 and vol_h1 < MIN_VOLUME_FOR_ALERT:
-                        # skip small-volume spikes
                         pass
                     else:
-                        symbol = (pair.get("baseToken") or {}).get("symbol") or slug
-                        msg = (f"🚨 Spike detected for {symbol} ({slug}): {spike_pct:.2f}% over last {len(_price_history[slug])} samples\n"
-                               f"Price: ${price_val:.6f} Vol1h: {vol_h1}")
-                        # dedupe using last prices: only send if last spike different
-                        print("Sending spike alert for", slug, spike_pct)
-                        send_telegram(msg)
-                        # reset history after spike to avoid repeated alerts
-                        _price_history[slug].clear()
-                        _last_prices[slug] = price_val
+                        send_telegram(
+                            f"🚨 Spike on {symbol}: {spike_pct:.2f}% over last {len(_price_history[s])} samples\n"
+                            f"Price: ${price_val:.6f} Vol1h: {vol_h1}"
+                        )
+                        _price_history[s].clear()
+                        _last_prices[s] = price_val
 
-            # detect price move beyond PRICE_MOVE_THRESHOLD relative to last price
-            prev = _last_prices.get(slug)
+            # price move vs last
+            prev = _last_prices.get(s)
             if prev is not None and price_val is not None and prev != 0:
-                delta_pct = (price_val - prev) / prev * 100
-                if abs(delta_pct) >= PRICE_MOVE_THRESHOLD:
-                    symbol = (pair.get("baseToken") or {}).get("symbol") or slug
-                    msg = (f"📈 Price move for {symbol} ({slug}): {delta_pct:.2f}%\n"
-                           f"Price: ${price_val:.6f} (prev ${prev:.6f})")
-                    print("Sending price move alert for", slug, delta_pct)
-                    send_telegram(msg)
-                    _last_prices[slug] = price_val
+                delta = (price_val - prev) / prev * 100.0
+                if abs(delta) >= PRICE_MOVE_THRESHOLD:
+                    send_telegram(
+                        f"📈 Price move on {symbol}: {delta:.2f}%\n"
+                        f"Price: ${price_val:.6f} (prev ${prev:.6f})"
+                    )
+                    _last_prices[s] = price_val
 
-            # detect new lastTx (trade)
+            # lastTx detection
             last_tx = pair.get("lastTx") or {}
-            last_tx_hash = None
-            if isinstance(last_tx, dict):
-                last_tx_hash = last_tx.get("hash")
+            last_tx_hash = last_tx.get("hash") if isinstance(last_tx, dict) else None
             if last_tx_hash:
-                prev_tx = _last_pair_tx.get(slug)
+                prev_tx = _last_pair_tx.get(s)
                 if prev_tx != last_tx_hash:
-                    _last_pair_tx[slug] = last_tx_hash
-                    msg = f"🔔 New trade on {slug}\nTx: https://cronoscan.com/tx/{last_tx_hash}"
-                    print("Sending trade alert for", slug, last_tx_hash)
-                    send_telegram(msg)
+                    _last_pair_tx[s] = last_tx_hash
+                    send_telegram(f"🔔 New trade on {symbol}\nTx: {CRONOS_TX.format(txhash=last_tx_hash)}")
+
         time.sleep(DEX_POLL)
 
-# ========== Entrypoint ==========
+# ========================= Auto discovery (search + tokens) =========================
+def discovery_loop():
+    # 1) Seed from fixed DEX_PAIRS (existing env)
+    seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
+    for s in seeds:
+        # accept only cronos/* slugs, ignore others quietly
+        if s.startswith("cronos/"):
+            ensure_tracking_pair("cronos", s.split("/",1)[1])
+
+    # 2) Seed from TOKENS (optional): resolve each token to its top pair and track it
+    token_items = [t.strip().lower() for t in (TOKENS or "").split(",") if t.strip()]
+    for t in token_items:
+        if not t.startswith("cronos/"):
+            continue
+        _, token_addr = t.split("/", 1)
+        pairs = fetch_token_pairs("cronos", token_addr)
+        if pairs:
+            # pick the first (dexscreener usually orders by liquidity/relevance)
+            p = pairs[0]
+            pair_addr = p.get("pairAddress")
+            if pair_addr:
+                ensure_tracking_pair("cronos", pair_addr, meta=p)
+
+    # 3) Continuous discovery from /search
+    if not DISCOVER_ENABLED:
+        print("Discovery disabled (DISCOVER_ENABLED=false).")
+        return
+
+    send_telegram("🧭 Dexscreener auto-discovery enabled (Cronos).")
+
+    while True:
+        try:
+            found = fetch_search(DISCOVER_QUERY)
+            adopted = 0
+            for p in found or []:
+                # keep only Cronos
+                if str(p.get("chainId", "")).lower() != "cronos":
+                    continue
+                pair_addr = p.get("pairAddress")
+                if not pair_addr:
+                    continue
+                s = slug("cronos", pair_addr)
+                if s in _tracked_pairs:
+                    continue
+                # adopt new pair
+                ensure_tracking_pair("cronos", pair_addr, meta=p)
+                adopted += 1
+                if adopted >= DISCOVER_LIMIT:
+                    break
+        except Exception as e:
+            print("Discovery error:", e)
+
+        time.sleep(DISCOVER_POLL)
+
+# ========================= Entrypoint =========================
 def main():
     print("Starting monitor with config:")
     print("WALLET_ADDRESS:", WALLET_ADDRESS)
@@ -315,11 +409,16 @@ def main():
     print("TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID)
     print("ETHERSCAN_API present:", bool(ETHERSCAN_API))
     print("DEX_PAIRS:", DEX_PAIRS)
+    print("DISCOVER_ENABLED:", DISCOVER_ENABLED, "| DISCOVER_QUERY:", DISCOVER_QUERY)
 
-    t1 = threading.Thread(target=wallet_monitor_loop, daemon=True)
-    t2 = threading.Thread(target=dexscreener_loop, daemon=True)
-    t1.start()
-    t2.start()
+    # Threads
+    t_wallet  = threading.Thread(target=wallet_monitor_loop, daemon=True)
+    t_pairs   = threading.Thread(target=monitor_tracked_pairs_loop, daemon=True)
+    t_discover= threading.Thread(target=discovery_loop, daemon=True)
+
+    t_wallet.start()
+    t_pairs.start()
+    t_discover.start()
 
     try:
         while True:
