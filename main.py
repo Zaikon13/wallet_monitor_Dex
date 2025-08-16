@@ -162,27 +162,22 @@ def safe_json(r):
         print("Response not JSON (preview):", txt)
         return None
 
-# ========================= Price helpers =========================
-def _search_pairs(query: str):
-    try:
-        r = SESSION.get(DEX_BASE_SEARCH, params={"q": query}, timeout=15)
-        data = safe_json(r)
-        if isinstance(data, dict) and "pairs" in data and isinstance(data["pairs"], list):
-            return data["pairs"]
-    except Exception as e:
-        print("Error search dexscreener:", e)
-    return []
+# cache για τιμές (TTL σε δευτ.)
+PRICE_CACHE = {}
+PRICE_CACHE_TTL = 60
 
+# ---------- Improved price helpers (Dexscreener + CoinGecko fallbacks) ----------
 def _top_price_from_pairs(pairs):
-    """Pick the best priceUsd from a list of pairs (prefer highest liquidity)."""
     if not pairs:
         return None
     best = None
     best_liq = -1.0
     for p in pairs:
         try:
-            if str(p.get("chainId","")).lower() != "cronos":
-                continue
+            if str(p.get("chainId","")).lower() != "cronos" and p.get("chainId") != "cronos":
+                # some results use numeric chainId; we keep only cronos textual tag if present
+                pass
+            # liquidity usd (may be missing)
             liq = float((p.get("liquidity") or {}).get("usd") or 0)
             price = float(p.get("priceUsd") or 0)
             if price <= 0:
@@ -194,47 +189,140 @@ def _top_price_from_pairs(pairs):
             continue
     return best
 
-def _price_from_token_endpoint(token_addr: str):
-    # Use tokens endpoint to get pairs and take best
-    url = f"{DEX_BASE_TOKENS}/cronos/{token_addr}"
+def _price_from_dexscreener_token(token_addr):
+    # use /tokens/cronos/{token} endpoint to get top pairs -> priceUsd
     try:
+        url = f"{DEX_BASE_TOKENS}/cronos/{token_addr}"
         r = SESSION.get(url, timeout=12)
         data = safe_json(r)
-        if isinstance(data, dict) and isinstance(data.get("pairs"), list):
-            return _top_price_from_pairs(data["pairs"])
+        if not data:
+            return None
+        pairs = data.get("pairs") if isinstance(data, dict) else None
+        return _top_price_from_pairs(pairs)
     except Exception as e:
-        print("Error _price_from_token_endpoint:", e)
+        print("Error _price_from_dexscreener_token:", e)
+        return None
+
+def _price_from_dexscreener_search(symbol_or_query):
+    try:
+        r = SESSION.get(DEX_BASE_SEARCH, params={"q": symbol_or_query}, timeout=12)
+        data = safe_json(r)
+        if not data:
+            return None
+        pairs = data.get("pairs") if isinstance(data, dict) else None
+        return _top_price_from_pairs(pairs)
+    except Exception as e:
+        print("Error _price_from_dexscreener_search:", e)
+        return None
+
+def _price_from_coingecko_contract(token_addr):
+    # CoinGecko token price by contract on Cronos (contract_addresses param expects lower-case)
+    try:
+        addr = token_addr.lower()
+        url = "https://api.coingecko.com/api/v3/simple/token_price/cronos"
+        params = {"contract_addresses": addr, "vs_currencies": "usd"}
+        r = SESSION.get(url, params=params, timeout=12)
+        data = safe_json(r)
+        if not data:
+            return None
+        # data keys are the contract addresses (lowercase)
+        val = None
+        if isinstance(data, dict):
+            # try direct key
+            v = data.get(addr)
+            if v and "usd" in v:
+                val = v["usd"]
+            else:
+                # sometimes response key casing may vary; try find
+                for k, vv in data.items():
+                    if k.lower() == addr and isinstance(vv, dict) and "usd" in vv:
+                        val = vv["usd"]
+                        break
+        if val is not None:
+            try:
+                return float(val)
+            except Exception:
+                return None
+    except Exception as e:
+        print("Error _price_from_coingecko_contract:", e)
+    return None
+
+def _price_from_coingecko_ids_for_cro():
+    # try a couple of CoinGecko ids that may represent Cronos native token
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        ids = "cronos,crypto-com-chain"
+        r = SESSION.get(url, params={"ids": ids, "vs_currencies": "usd"}, timeout=8)
+        data = safe_json(r)
+        if not data:
+            return None
+        # prefer 'cronos', fallback to 'crypto-com-chain'
+        for idk in ("cronos", "crypto-com-chain"):
+            if idk in data and "usd" in data[idk]:
+                try:
+                    return float(data[idk]["usd"])
+                except Exception:
+                    continue
+    except Exception as e:
+        print("Error _price_from_coingecko_ids_for_cro:", e)
     return None
 
 def get_price_usd(symbol_or_addr: str):
     """
-    Returns USD price for:
-     - "CRO" (native): search for CRO/USDT (or WCRO) on Cronos and pick the best-liquidity price
-     - ERC20 address (0x...): resolve via /tokens endpoint and pick top pair priceUsd
+    Robust price fetch:
+      - accepts "CRO" / "cro" or contract address "0x..."
+      - uses Dexscreener tokens endpoint, Dexscreener search, and CoinGecko contract price as fallback
+    Caches results for PRICE_CACHE_TTL seconds.
     """
+    if not symbol_or_addr:
+        return None
     key = symbol_or_addr.strip().lower()
-    # light cache in memory to reduce calls
-    cache_key = f"USDPRICE::{key}"
-    c = _token_meta.get(cache_key)
-    if c and isinstance(c, dict):
-        # (price, ts)
-        if time.time() - c.get("ts", 0) < 30:  # 30s cache
-            return c.get("price")
+
+    # cache
+    now_ts = time.time()
+    cached = PRICE_CACHE.get(key)
+    if cached:
+        price, ts = cached
+        if now_ts - ts < PRICE_CACHE_TTL:
+            return price
 
     price = None
-    if key == "cro":
-        # Try search for CRO (or WCRO) on Cronos
-        pairs = _search_pairs("cro usdt")
-        if not pairs:
-            pairs = _search_pairs("wCRO usdt")
-        price = _top_price_from_pairs(pairs)
-    elif key.startswith("0x") and len(key) == 42:
-        price = _price_from_token_endpoint(key)
 
-    if price is not None and price > 0:
-        _token_meta[cache_key] = {"price": price, "ts": time.time()}
-        return price
-    return None
+    # CRO path
+    if key in ("cro", "wcro", "w-cro", "wrappedcro", "wrapped cro"):
+        # try dexscreener search first for CRO/USDT or WCRO/USDT
+        price = _price_from_dexscreener_search("cro usdt") or _price_from_dexscreener_search("wcro usdt")
+        if not price:
+            price = _price_from_coingecko_ids_for_cro()
+
+    # if looks like an address -> token contract path
+    elif key.startswith("0x") and len(key) == 42:
+        # try dexscreener tokens endpoint (best)
+        price = _price_from_dexscreener_token(key)
+        if not price:
+            # try coingecko contract price
+            price = _price_from_coingecko_contract(key)
+        if not price:
+            # last resort: search by contract on dexscreener search
+            price = _price_from_dexscreener_search(key)
+
+    else:
+        # treat as symbol or free text: try search on dexscreener
+        price = _price_from_dexscreener_search(key)
+        # if not found, try searching 'symbol usdt' (common)
+        if not price and len(key) <= 8:
+            price = _price_from_dexscreener_search(f"{key} usdt")
+
+    # store in cache (even None for short TTL)
+    try:
+        PRICE_CACHE[key] = (price, now_ts)
+    except Exception:
+        pass
+
+    if price is None:
+        # helpful debug printed once per call: show why earlier USD were 0
+        print(f"Price lookup failed for '{symbol_or_addr}' (returned None).")
+    return price
 
 # ========================= Wallet (Cronos via Etherscan Multichain) =========================
 def fetch_latest_wallet_txs(limit=25):
