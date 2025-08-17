@@ -83,7 +83,6 @@ _token_meta       = {}                    # token_address -> {"symbol":..., "dec
 # cost-basis (FIFO-ish via avg cost) + realized PnL (per day, rebuilt on boot from today's file)
 _position_qty     = defaultdict(float)    # token_key -> qty held (>=0)
 _position_cost    = defaultdict(float)    # token_key -> total USD cost of held qty (>=0)
-# we'll keep realized in daily files as well as in-memory
 _realized_pnl_today = 0.0
 EPSILON           = 1e-12
 # Note: For native CRO we use key "CRO"
@@ -394,17 +393,16 @@ def _format_amount(a):
     return f"{a:.8f}"
 
 # ========================= Cost-basis / PnL =========================
-def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float, record_realized: bool = True):
+def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float):
     """
     Avg-cost model.
     Positive amount => buy (increase qty + cost)
     Negative amount => sell (realize PnL up to held qty; no shorting)
     Returns realized_pnl for this movement (can be 0).
-    If record_realized==False, realized will NOT be added to global _realized_pnl_today (caller will handle it).
     """
     global _realized_pnl_today
-    qty = _position_qty.get(token_key, 0.0)
-    cost = _position_cost.get(token_key, 0.0)
+    qty = _position_qty[token_key]
+    cost = _position_cost[token_key]
     realized = 0.0
     if signed_amount > EPSILON:
         # buy
@@ -425,8 +423,7 @@ def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float, r
             # reduce inventory & cost
             _position_qty[token_key] = qty - sell_qty
             _position_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
-    if record_realized and realized:
-        _realized_pnl_today += realized
+    _realized_pnl_today += realized
     return realized
 
 def _replay_today_cost_basis():
@@ -441,29 +438,107 @@ def _replay_today_cost_basis():
         key = "CRO" if (e.get("token_addr") in (None, "", "None") and e.get("token") == "CRO") else (e.get("token_addr") or "CRO")
         amt = float(e.get("amount") or 0.0)
         price = float(e.get("price_usd") or 0.0)
-        # replay with record_realized True but realized may already be included in file; to avoid double counting,
-        # we will replay with record_realized=False and accumulate realized from file instead:
-        _update_cost_basis(key, amt, price, record_realized=False)
-    # rebuild realized_pnl_today from saved file
+        realized = _update_cost_basis(key, amt, price)
+        e["realized_pnl"] = realized  # ensure existing entries carry the realized
+    # persist updated realized in file (idempotent)
     try:
-        total_real = float(data.get("realized_pnl", 0.0))
-        _realized_pnl_today = total_real
+        total_real = sum(float(e.get("realized_pnl", 0.0)) for e in data.get("entries", []))
+        data["realized_pnl"] = total_real
+        write_json(path, data)
     except Exception:
         pass
 
-# ========================= Tx group processor (handles swaps across multiple tokens/pools) =========
-def _normalize_token_row_to_move(r):
+# ========================= Handlers =========================
+def handle_native_tx(tx: dict):
     """
-    Convert an Etherscan tokentx row to unified move dict:
-    { 'token_addr', 'symbol', 'decimals', 'amount', 'from', 'to', 'txhash', 'timeStamp' }
+    Handle native CRO transfer from txlist.
     """
-    token_addr = (r.get("contractAddress") or "").lower()
-    symbol = r.get("tokenSymbol") or token_addr[:8]
+    h = tx.get("hash")
+    if not h or h in _seen_tx_hashes:
+        return
+    _seen_tx_hashes.add(h)
+
+    val_raw = tx.get("value", "0")
+    # CRO has 18 decimals
     try:
-        decimals = int(r.get("tokenDecimal") or 18)
+        amount_cro = int(val_raw) / 10**18
+    except Exception:
+        try:
+            amount_cro = float(val_raw)
+        except Exception:
+            amount_cro = 0.0
+
+    frm  = (tx.get("from") or "").lower()
+    to   = (tx.get("to") or "").lower()
+    ts   = int(tx.get("timeStamp") or 0)
+    dt   = datetime.fromtimestamp(ts) if ts > 0 else now_dt()
+
+    # direction relative to our wallet
+    sign = 0
+    if to == WALLET_ADDRESS:
+        sign = +1  # incoming
+    elif frm == WALLET_ADDRESS:
+        sign = -1  # outgoing
+
+    if sign == 0 or abs(amount_cro) <= EPSILON:
+        return
+
+    price = get_price_usd("CRO") or 0.0
+    usd_value = sign * amount_cro * price
+
+    # update CRO balance
+    _token_balances["CRO"] += sign * amount_cro
+    # save meta for CRO
+    _token_meta["CRO"] = {"symbol": "CRO", "decimals": 18}
+
+    # PnL (realized when OUT only, but we apply generic update for both)
+    realized = _update_cost_basis("CRO", sign * amount_cro, price)
+
+    link = CRONOS_TX.format(txhash=h)
+    msg = (
+        f"*Native TX* ({'IN' if sign>0 else 'OUT'}) CRO\n"
+        f"Hash: {link}\n"
+        f"Time: {dt.strftime('%H:%M:%S')}\n"
+        f"Amount: {sign*amount_cro:.6f} CRO  (~${_format_amount(amount_cro*price)})"
+    )
+    print("Sending wallet alert for", h)
+    send_telegram(msg)
+
+    entry = {
+        "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "txhash": h,
+        "type": "native",
+        "token": "CRO",
+        "token_addr": None,
+        "amount": sign * amount_cro,
+        "price_usd": price,
+        "usd_value": usd_value,
+        "realized_pnl": realized,
+        "from": frm,
+        "to": to,
+    }
+    _append_ledger(entry)
+
+def handle_erc20_tx(t: dict):
+    """
+    Handle ERC20 transfer from tokentx.
+    """
+    h = t.get("hash")
+    if not h:
+        return
+    frm  = (t.get("from") or "").lower()
+    to   = (t.get("to") or "").lower()
+    if WALLET_ADDRESS not in (frm, to):
+        return
+
+    token_addr = (t.get("contractAddress") or "").lower()
+    symbol     = t.get("tokenSymbol") or token_addr[:8]
+    try:
+        decimals = int(t.get("tokenDecimal") or 18)
     except Exception:
         decimals = 18
-    val_raw = r.get("value", "0")
+
+    val_raw = t.get("value", "0")
     try:
         amount = int(val_raw) / (10 ** decimals)
     except Exception:
@@ -471,227 +546,56 @@ def _normalize_token_row_to_move(r):
             amount = float(val_raw)
         except Exception:
             amount = 0.0
-    return {
+
+    ts = int(t.get("timeStamp") or 0)
+    dt = datetime.fromtimestamp(ts) if ts > 0 else now_dt()
+
+    sign = +1 if to == WALLET_ADDRESS else -1
+    price = get_price_usd(token_addr) or 0.0
+    usd_value = sign * amount * price
+
+    # track balances/meta
+    _token_balances[token_addr] += sign * amount
+    _token_meta[token_addr] = {"symbol": symbol, "decimals": decimals}
+
+    # PnL update
+    realized = _update_cost_basis(token_addr, sign * amount, price)
+
+    link = CRONOS_TX.format(txhash=h)
+    send_telegram(
+        f"*Token TX* ({'IN' if sign>0 else 'OUT'}) {symbol}\n"
+        f"Hash: {link}\n"
+        f"Time: {dt.strftime('%H:%M:%S')}\n"
+        f"Amount: {sign*amount:.6f} {symbol}  (~${_format_amount(abs(amount*price))})"
+    )
+
+    entry = {
+        "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "txhash": h,
+        "type": "erc20",
+        "token": symbol,
         "token_addr": token_addr,
-        "symbol": symbol,
-        "decimals": decimals,
-        "amount": amount,
-        "from": (r.get("from") or "").lower(),
-        "to": (r.get("to") or "").lower(),
-        "txhash": r.get("hash"),
-        "timeStamp": int(r.get("timeStamp") or 0)
+        "amount": sign * amount,
+        "price_usd": price,
+        "usd_value": usd_value,
+        "realized_pnl": realized,
+        "from": frm,
+        "to": to,
     }
+    _append_ledger(entry)
 
-def _normalize_native_tx_to_move(tx):
-    """
-    Convert native tx to move dict representing CRO transfer.
-    """
-    val_raw = tx.get("value", "0")
-    try:
-        amount = int(val_raw) / 10**18
-    except Exception:
-        try:
-            amount = float(val_raw)
-        except Exception:
-            amount = 0.0
-    return {
-        "token_addr": None,
-        "symbol": "CRO",
-        "decimals": 18,
-        "amount": amount,
-        "from": (tx.get("from") or "").lower(),
-        "to": (tx.get("to") or "").lower(),
-        "txhash": tx.get("hash"),
-        "timeStamp": int(tx.get("timeStamp") or 0)
-    }
-
-def process_tx_group(txhash: str, native_tx: dict, token_rows: list):
-    """
-    Process one transaction (may contain native + multiple tokentx rows).
-    Groups net token movements, detects swaps, computes realized properly.
-    """
-    # build moves list
-    moves = []
-    if native_tx:
-        m = _normalize_native_tx_to_move(native_tx)
-        # only include if involves our wallet
-        if WALLET_ADDRESS in (m["from"], m["to"]):
-            moves.append(m)
-    for r in token_rows:
-        nr = _normalize_token_row_to_move(r)
-        if WALLET_ADDRESS in (nr["from"], nr["to"]):
-            moves.append(nr)
-    if not moves:
-        return
-
-    # compute nets per token_key
-    nets = {}  # token_key -> {"symbol":..., "decimals":..., "net":float}
-    ts = None
-    for m in moves:
-        key = "CRO" if m["token_addr"] in (None, "", "None") else m["token_addr"]
-        sign = 1.0 if m["to"] == WALLET_ADDRESS else -1.0
-        amt = sign * (m["amount"] or 0.0)
-        if key not in nets:
-            nets[key] = {"symbol": m["symbol"], "decimals": m["decimals"], "net": 0.0}
-        nets[key]["net"] += amt
-        if not ts:
-            ts = m.get("timeStamp") or 0
-    # filter zero nets
-    nets = {k: v for k, v in nets.items() if abs(v.get("net", 0.0)) > EPSILON}
-    if not nets:
-        return
-
-    # determine if swap: both incoming and outgoing tokens present
-    has_in = any(v["net"] > 0 for v in nets.values())
-    has_out = any(v["net"] < 0 for v in nets.values())
-    tx_time = datetime.fromtimestamp(ts) if ts and ts > 0 else now_dt()
-
-    if has_in and has_out:
-        # swap/trade: compute USD received and cost basis of sold tokens
-        usd_received_total = 0.0
-        usd_paid_markets = 0.0  # using market prices for sold tokens (for reporting)
-        usd_cost_basis_sold = 0.0  # using position cost basis
-        price_map = {}
-        # prices for all tokens (market)
-        for token_key, info in nets.items():
-            # token_key == 'CRO' means native
-            lookup = token_key if token_key != "CRO" else "CRO"
-            p = get_price_usd(lookup) or 0.0
-            price_map[token_key] = p
-
-        # USD received from positive nets
-        for token_key, info in nets.items():
-            net = info["net"]
-            if net > 0:
-                usd_received_total += net * (price_map.get(token_key) or 0.0)
-
-        # USD cost basis for sold tokens (use avg cost if available, fallback to market price)
-        for token_key, info in nets.items():
-            net = info["net"]
-            if net < 0:
-                sell_qty = -net
-                qty_on_book = _position_qty.get(token_key, 0.0)
-                cost_on_book = _position_cost.get(token_key, 0.0)
-                if qty_on_book > EPSILON:
-                    avg_cost = cost_on_book / qty_on_book
-                else:
-                    # no book: fallback to market price
-                    avg_cost = price_map.get(token_key) or 0.0
-                usd_cost_basis_sold += avg_cost * sell_qty
-                usd_paid_markets += sell_qty * (price_map.get(token_key) or 0.0)
-
-        # realized: received - cost_basis_sold
-        realized = usd_received_total - usd_cost_basis_sold
-
-        # update book: reduce sold (record_realized=False), increase received (record_realized=False)
-        for token_key, info in nets.items():
-            net = info["net"]
-            p_market = price_map.get(token_key) or 0.0
-            # update cost basis inventory but do not record realized here (we will add realized once)
-            _update_cost_basis(token_key, net, p_market, record_realized=False)
-
-        # now record realized global
-        try:
-            global _realized_pnl_today
-            _realized_pnl_today += realized
-        except Exception:
-            pass
-
-        # update balances and meta
-        for token_key, info in nets.items():
-            _token_balances[token_key] += info["net"]
-            # update meta symbol if unknown
-            if token_key not in _token_meta:
-                _token_meta[token_key] = {"symbol": info.get("symbol"), "decimals": info.get("decimals")}
-
-        # ledger entry summarizing the swap
-        sold = []
-        recved = []
-        for token_key, info in nets.items():
-            if info["net"] < 0:
-                sold.append({"token": _token_meta.get(token_key, {}).get("symbol") or token_key, "token_addr": token_key, "amount": info["net"]})
-            else:
-                recved.append({"token": _token_meta.get(token_key, {}).get("symbol") or token_key, "token_addr": token_key, "amount": info["net"]})
-        entry = {
-            "time": tx_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "txhash": txhash,
-            "type": "swap",
-            "sold": sold,
-            "received": recved,
-            "price_map": price_map,
-            "usd_received": usd_received_total,
-            "usd_paid_markets": usd_paid_markets,
-            "usd_cost_basis_sold": usd_cost_basis_sold,
-            "usd_value": usd_received_total - usd_paid_markets,  # net flow using market prices
-            "realized_pnl": realized,
-        }
-        # send aggregated telegram
-        try:
-            sold_txt = ", ".join(f"{s['amount']:.6f} {s['token']}" for s in sold)
-            rec_txt = ", ".join(f"{r['amount']:.6f} {r['token']}" for r in recved)
-            msg = (f"🔁 *Swap detected*\nTx: {CRONOS_TX.format(txhash=txhash)}\n"
-                   f"Sold: {sold_txt}\nReceived: {rec_txt}\n"
-                   f"Realized PnL: ${_format_amount(realized)}\n"
-                   f"USD Received: ${_format_amount(usd_received_total)}  CostBasisSold: ${_format_amount(usd_cost_basis_sold)}")
-            send_telegram(msg)
-        except Exception:
-            pass
-
-        _append_ledger(entry)
-    else:
-        # not a swap: treat each net token movement as individual entry (like simple IN/OUT)
-        for token_key, info in nets.items():
-            net = info["net"]
-            token_symbol = info.get("symbol")
-            token_addr = None if token_key == "CRO" else token_key
-            price = get_price_usd(token_key if token_key != "CRO" else "CRO") or 0.0
-            usd_value = net * price
-            # update pos & realized (the update function will record realized for sells)
-            realized = _update_cost_basis(token_key, net, price, record_realized=True)
-            # update balances/meta
-            _token_balances[token_key] += net
-            _token_meta[token_key] = {"symbol": token_symbol, "decimals": info.get("decimals", 18)}
-            # send telegram
-            try:
-                direction = "IN" if net > 0 else "OUT"
-                msg = (f"*Token TX* ({direction}) {token_symbol}\n"
-                       f"Tx: {CRONOS_TX.format(txhash=txhash)}\n"
-                       f"Amount: {net:.6f} {token_symbol}  (~${_format_amount(abs(net*price))})")
-                send_telegram(msg)
-            except Exception:
-                pass
-            entry = {
-                "time": tx_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "txhash": txhash,
-                "type": "erc20" if token_key != "CRO" else "native",
-                "token": token_symbol,
-                "token_addr": token_addr,
-                "amount": net,
-                "price_usd": price,
-                "usd_value": usd_value,
-                "realized_pnl": realized,
-            }
-            _append_ledger(entry)
-
-# ========================= Wallet monitor (grouped tx processing) =========================
 def wallet_monitor_loop():
     global _seen_tx_hashes
     print("Wallet monitor starting; loading initial recent txs...")
 
-    # seed known tx hashes so we don't spam at startup
-    initial_native = fetch_latest_wallet_txs(limit=50)
-    initial_tokentx = fetch_latest_token_txs(limit=200)
+    # seed native tx hashes to avoid spamming on first run
+    initial = fetch_latest_wallet_txs(limit=50)
     try:
-        s1 = set(tx.get("hash") for tx in initial_native if isinstance(tx, dict) and tx.get("hash"))
+        _seen_tx_hashes = set(tx.get("hash") for tx in initial if isinstance(tx, dict) and tx.get("hash"))
     except Exception:
-        s1 = set()
-    try:
-        s2 = set(t.get("hash") for t in initial_tokentx if isinstance(t, dict) and t.get("hash"))
-    except Exception:
-        s2 = set()
-    _seen_tx_hashes = set.union(s1, s2)
+        _seen_tx_hashes = set()
 
-    # rebuild cost-basis / realized from today's ledger
+    # rebuild cost-basis from today's file (so restarts keep PnL consistent)
     _replay_today_cost_basis()
 
     try:
@@ -700,68 +604,40 @@ def wallet_monitor_loop():
         print("Telegram token error on startup. Exiting wallet monitor.")
         return
 
-    # rolling set to avoid reprocessing many times
-    processed_token_hashes = set()
+    last_tokentx_seen = set()  # simple rolling set for last N token tx hashes
     while True:
-        native_txs = fetch_latest_wallet_txs(limit=25)
-        token_txs = fetch_latest_token_txs(limit=200)
+        # Native txs
+        txs = fetch_latest_wallet_txs(limit=25)
+        if not txs:
+            print("No native txs returned; retrying...")
+        else:
+            for tx in reversed(txs):  # oldest → newest
+                if not isinstance(tx, dict):
+                    continue
+                handle_native_tx(tx)
 
-        native_by_hash = {}
-        for tx in native_txs or []:
-            h = tx.get("hash")
-            if h:
-                native_by_hash[h] = tx
-
-        token_groups = defaultdict(list)
-        for t in token_txs or []:
-            h = t.get("hash")
-            if not h:
-                continue
-            token_groups[h].append(t)
-
-        all_hashes = set(native_by_hash.keys()) | set(token_groups.keys())
-
-        # sort by earliest timestamp available to process oldest-first
-        def hash_ts(h):
-            # take native ts if exists, else token first ts, else 0
-            nt = native_by_hash.get(h)
-            if nt:
-                try:
-                    return int(nt.get("timeStamp") or 0)
-                except Exception:
-                    return 0
-            rows = token_groups.get(h, [])
-            if rows:
-                try:
-                    return int(rows[0].get("timeStamp") or 0)
-                except Exception:
-                    return 0
-            return 0
-
-        for h in sorted(all_hashes, key=hash_ts):
-            if h in _seen_tx_hashes:
-                continue
-            nt = native_by_hash.get(h)
-            rows = token_groups.get(h, [])
-            # process grouped tx
-            try:
-                process_tx_group(h, nt, rows)
-            except Exception as e:
-                print("Error processing tx group", h, e)
-            _seen_tx_hashes.add(h)
-            # keep processed_token_hashes bounded
-            processed_token_hashes.add(h)
-            if len(processed_token_hashes) > 1000:
-                # keep last ~500
-                processed_token_hashes = set(list(processed_token_hashes)[-500:])
+        # ERC20 transfers
+        toks = fetch_latest_token_txs(limit=50)
+        if toks:
+            for t in reversed(toks):
+                h = t.get("hash")
+                if h and h in last_tokentx_seen:
+                    continue
+                handle_erc20_tx(t)
+                if h:
+                    last_tokentx_seen.add(h)
+            # keep set bounded
+            if len(last_tokentx_seen) > 500:
+                last_tokentx_seen = set(list(last_tokentx_seen)[-300:])
 
         time.sleep(WALLET_POLL)
 
-# ========================= Dexscreener helpers / monitors (unchanged) =========================
+# ========================= Dexscreener helpers =========================
 def slug(chain: str, pair_address: str) -> str:
     return f"{chain}/{pair_address}".lower()
 
 def fetch_pair(slug_str: str):
+    # slug is "cronos/0xPAIR"
     url = f"{DEX_BASE_PAIRS}/{slug_str}"
     try:
         r = SESSION.get(url, timeout=12)
@@ -771,6 +647,7 @@ def fetch_pair(slug_str: str):
         return None
 
 def fetch_token_pairs(chain: str, token_address: str):
+    # returns pairs list for a token (we'll pick the first/top)
     url = f"{DEX_BASE_TOKENS}/{chain}/{token_address}"
     try:
         r = SESSION.get(url, timeout=12)
@@ -783,6 +660,7 @@ def fetch_token_pairs(chain: str, token_address: str):
         return []
 
 def fetch_search(query: str):
+    # generic search (we’ll filter to chainId == 'cronos')
     try:
         r = SESSION.get(DEX_BASE_SEARCH, params={"q": query}, timeout=15)
         data = safe_json(r)
@@ -802,6 +680,7 @@ def ensure_tracking_pair(chain: str, pair_address: str, meta: dict = None):
         _price_history[s] = deque(maxlen=PRICE_WINDOW)
         if meta:
             _known_pairs_meta[s] = meta
+        # notify adoption
         ds_link = DEXSITE_PAIR.format(chain=chain, pair=pair_address)
         sym = None
         if isinstance(meta, dict):
@@ -810,6 +689,7 @@ def ensure_tracking_pair(chain: str, pair_address: str, meta: dict = None):
         title = f"{sym} ({s})" if sym else s
         send_telegram(f"🆕 Now monitoring pair: {title}\n{ds_link}")
 
+# ========================= Dexscreener monitor (pairs already tracked) =========================
 def update_price_history(slg, price):
     hist = _price_history.get(slg)
     if hist is None:
@@ -1044,7 +924,7 @@ def build_day_report_text():
         lines.append("*Transactions:*")
         MAX_LINES = 20
         for i, e in enumerate(entries[-MAX_LINES:]):
-            tok = e.get("token") or e.get("type") or "?"
+            tok = e.get("token") or "?"
             amt = e.get("amount") or 0
             usd = e.get("usd_value") or 0
             tm  = e.get("time","")[-8:]
@@ -1110,7 +990,7 @@ def end_of_day_scheduler_loop():
         except Exception as e:
             print("EOD report error:", e)
 
-# ========================= Dexscreener monitor wrapper =========================
+# ========================= Dexscreener monitor core (existing) =========================
 def monitor_tracked_pairs_loop_wrapper():
     try:
         monitor_tracked_pairs_loop()
