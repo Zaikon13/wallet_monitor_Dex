@@ -172,27 +172,84 @@ def safe_json(r):
         return None
 
 # ========================= Improved price helpers (Dexscreener + CoinGecko fallbacks) =========================
+def _extract_price_from_pair(pair):
+    """
+    Tries multiple ways to obtain USD price from a dexscreener 'pair' object:
+     - priceUsd if present
+     - priceNative/price fields interpreted as price in native token (CRO) -> convert via CRO->USD
+     - if quoteToken symbol suggests USDT/USDC treat priceNative as USD
+    Returns float USD price or None.
+    """
+    try:
+        # 1) explicit USD
+        p_usd = pair.get("priceUsd") or pair.get("price_usd") or None
+        if p_usd is not None:
+            try:
+                pu = float(p_usd)
+                if pu > 0:
+                    return pu
+            except Exception:
+                pass
+
+        # 2) try known numeric fields that often represent price in native token
+        for k in ("priceNative", "price_native", "price", "priceBase", "priceInQuote"):
+            v = pair.get(k)
+            if v is None:
+                continue
+            try:
+                vnum = float(v)
+            except Exception:
+                continue
+            if vnum <= 0:
+                continue
+
+            # detect quote token symbol if available
+            qsym = ""
+            q = pair.get("quoteToken") or pair.get("quote_token") or pair.get("quoteTokenInfo") or {}
+            if isinstance(q, dict):
+                qsym = (q.get("symbol") or q.get("symbolName") or "").lower()
+            # If quote is USDT/USDC => treat value as USD
+            if any(x in qsym for x in ("usdt", "usdc", "usd", "tether")):
+                return vnum
+            # If quote is CRO/WCRO => multiply by CRO->USD
+            if "cro" in qsym or "wcro" in qsym or "w-cro" in qsym:
+                cro_price = get_price_usd("CRO") or 0.0
+                return vnum * cro_price
+            # Fallback: assume vnum is in native units -> multiply by CRO
+            cro_price = get_price_usd("CRO") or 0.0
+            return vnum * cro_price
+
+    except Exception as e:
+        print("Error extracting price from pair:", e)
+    return None
+
 def _top_price_from_pairs_pricehelpers(pairs):
+    """Pick the best USD price from a list of pairs (prefer highest liquidity)."""
     if not pairs:
         return None
-    best = None
+    best_price = None
     best_liq = -1.0
     for p in pairs:
         try:
-            # keep Cronos results if chainId tag exists; otherwise accept but prefer higher liq
-            chain_id = str(p.get("chainId","")).lower()
-            if chain_id and chain_id != "cronos":
+            # ensure Cronos chain if tagged
+            chain_tag = str(p.get("chainId", "")).lower()
+            if chain_tag and chain_tag != "cronos":
                 continue
-            liq = float((p.get("liquidity") or {}).get("usd") or 0)
-            price = float(p.get("priceUsd") or 0)
-            if price <= 0:
+            price = _extract_price_from_pair(p)
+            if not price or price <= 0:
                 continue
+            # liquidity (fall back to zero)
+            try:
+                liq = float((p.get("liquidity") or {}).get("usd") or 0)
+            except Exception:
+                liq = 0.0
+            # choose highest liquidity
             if liq > best_liq:
                 best_liq = liq
-                best = price
+                best_price = price
         except Exception:
             continue
-    return best
+    return best_price
 
 def _price_from_dexscreener_token(token_addr):
     try:
@@ -741,6 +798,12 @@ def monitor_tracked_pairs_loop():
                 price_val = float(pair.get("priceUsd") or 0)
             except Exception:
                 price_val = None
+            # if priceUsd missing, try extraction
+            if not price_val or price_val <= 0:
+                try:
+                    price_val = _extract_price_from_pair(pair)
+                except Exception:
+                    price_val = None
 
             # vol (h1, optional)
             vol_h1 = None
