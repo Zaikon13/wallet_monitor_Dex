@@ -448,30 +448,74 @@ def _replay_today_cost_basis():
     except Exception:
         pass
 
+def _format_price(p):
+    try:
+        p = float(p)
+    except Exception:
+        return str(p)
+    # 6 δεκαδικά για "ακριβή" τιμή
+    return f"{p:,.6f}"
+
+def _nonzero(v, eps=1e-12):
+    try:
+        return abs(float(v)) > eps
+    except Exception:
+        return False
+
 # ========================= Handlers =========================
 def handle_native_tx(tx: dict):
-    """
-    Handle native CRO transfer from txlist.
-    """
     h = tx.get("hash")
     if not h or h in _seen_tx_hashes:
         return
     _seen_tx_hashes.add(h)
 
     val_raw = tx.get("value", "0")
-    # CRO has 18 decimals
     try:
         amount_cro = int(val_raw) / 10**18
     except Exception:
-        try:
-            amount_cro = float(val_raw)
-        except Exception:
-            amount_cro = 0.0
+        amount_cro = float(val_raw) if val_raw else 0.0
 
-    frm  = (tx.get("from") or "").lower()
-    to   = (tx.get("to") or "").lower()
-    ts   = int(tx.get("timeStamp") or 0)
-    dt   = datetime.fromtimestamp(ts) if ts > 0 else now_dt()
+    frm = (tx.get("from") or "").lower()
+    to  = (tx.get("to") or "").lower()
+    ts  = int(tx.get("timeStamp") or 0)
+    dt  = datetime.fromtimestamp(ts) if ts > 0 else now_dt()
+
+    sign = +1 if to == WALLET_ADDRESS else (-1 if frm == WALLET_ADDRESS else 0)
+    if sign == 0 or abs(amount_cro) <= EPSILON:
+        return
+
+    price = get_price_usd("CRO") or 0.0
+    usd_value = sign * amount_cro * price
+
+    _token_balances["CRO"] += sign * amount_cro
+    _token_meta["CRO"] = {"symbol": "CRO", "decimals": 18}
+
+    realized = _update_cost_basis("CRO", sign * amount_cro, price)
+
+    link = CRONOS_TX.format(txhash=h)
+    send_telegram(
+        f"*Native TX* ({'IN' if sign>0 else 'OUT'}) CRO\n"
+        f"Hash: {link}\n"
+        f"Time: {dt.strftime('%H:%M:%S')}\n"
+        f"Amount: {sign*amount_cro:.6f} CRO\n"
+        f"Price: ${_format_price(price)} per CRO\n"
+        f"USD value: ${_format_amount(usd_value)}"
+    )
+
+    entry = {
+        "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "txhash": h,
+        "type": "native",
+        "token": "CRO",
+        "token_addr": None,
+        "amount": sign * amount_cro,
+        "price_usd": price,
+        "usd_value": usd_value,
+        "realized_pnl": realized,
+        "from": frm,
+        "to": to,
+    }
+    _append_ledger(entry)
 
     # direction relative to our wallet
     sign = 0
@@ -520,14 +564,11 @@ def handle_native_tx(tx: dict):
     _append_ledger(entry)
 
 def handle_erc20_tx(t: dict):
-    """
-    Handle ERC20 transfer from tokentx.
-    """
     h = t.get("hash")
     if not h:
         return
-    frm  = (t.get("from") or "").lower()
-    to   = (t.get("to") or "").lower()
+    frm = (t.get("from") or "").lower()
+    to  = (t.get("to") or "").lower()
     if WALLET_ADDRESS not in (frm, to):
         return
 
@@ -542,23 +583,18 @@ def handle_erc20_tx(t: dict):
     try:
         amount = int(val_raw) / (10 ** decimals)
     except Exception:
-        try:
-            amount = float(val_raw)
-        except Exception:
-            amount = 0.0
+        amount = float(val_raw) if val_raw else 0.0
 
     ts = int(t.get("timeStamp") or 0)
     dt = datetime.fromtimestamp(ts) if ts > 0 else now_dt()
 
-    sign = +1 if to == WALLET_ADDRESS else -1
+    sign  = +1 if to == WALLET_ADDRESS else -1
     price = get_price_usd(token_addr) or 0.0
     usd_value = sign * amount * price
 
-    # track balances/meta
     _token_balances[token_addr] += sign * amount
     _token_meta[token_addr] = {"symbol": symbol, "decimals": decimals}
 
-    # PnL update
     realized = _update_cost_basis(token_addr, sign * amount, price)
 
     link = CRONOS_TX.format(txhash=h)
@@ -566,7 +602,9 @@ def handle_erc20_tx(t: dict):
         f"*Token TX* ({'IN' if sign>0 else 'OUT'}) {symbol}\n"
         f"Hash: {link}\n"
         f"Time: {dt.strftime('%H:%M:%S')}\n"
-        f"Amount: {sign*amount:.6f} {symbol}  (~${_format_amount(abs(amount*price))})"
+        f"Amount: {sign*amount:.6f} {symbol}\n"
+        f"Price: ${_format_price(price)} per {symbol}\n"
+        f"USD value: ${_format_amount(usd_value)}"
     )
 
     entry = {
@@ -917,6 +955,25 @@ def build_day_report_text():
     net_flow = float(data.get("net_usd_flow", 0.0))
     realized_today = float(data.get("realized_pnl", 0.0))
 
+    # --- Per-asset aggregates for TODAY ---
+    per_asset_flow = defaultdict(float)      # USD flow sum
+    per_asset_real = defaultdict(float)      # realized pnl sum
+    per_asset_amt  = defaultdict(float)      # signed token amt sum (για context)
+    per_asset_last_price = {}                # last seen price for the token today (fallback: live fetch)
+    per_asset_token_addr = {}
+
+    for e in entries:
+        tok = e.get("token") or "?"
+        addr = e.get("token_addr")
+        per_asset_flow[tok] += float(e.get("usd_value") or 0.0)
+        per_asset_real[tok] += float(e.get("realized_pnl") or 0.0)
+        per_asset_amt[tok]  += float(e.get("amount") or 0.0)
+        if _nonzero(e.get("price_usd", 0.0)):
+            per_asset_last_price[tok] = float(e.get("price_usd"))
+        if addr and tok not in per_asset_token_addr:
+            per_asset_token_addr[tok] = addr
+
+    # --- Header ---
     lines = [f"*📒 Daily Report* ({data.get('date')})"]
     if not entries:
         lines.append("_No transactions today._")
@@ -929,6 +986,7 @@ def build_day_report_text():
             usd = e.get("usd_value") or 0
             tm  = e.get("time","")[-8:]
             direction = "IN" if float(amt) > 0 else "OUT"
+            unit_price = e.get("price_usd") or 0.0
             pnl_line = ""
             try:
                 rp = float(e.get("realized_pnl", 0.0))
@@ -936,24 +994,62 @@ def build_day_report_text():
                     pnl_line = f"  PnL: ${_format_amount(rp)}"
             except Exception:
                 pass
-            lines.append(f"• {tm} — {direction} {tok} { _format_amount(amt) }  (${_format_amount(usd)}){pnl_line}")
+            lines.append(
+                f"• {tm} — {direction} {tok} {_format_amount(amt)}  "
+                f"@ ${_format_price(unit_price)}  "
+                f"(${_format_amount(usd)}){pnl_line}"
+            )
         if len(entries) > MAX_LINES:
             lines.append(f"_…and {len(entries)-MAX_LINES} earlier txs._")
 
+    # --- Totals (today) ---
     lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
     lines.append(f"*Realized PnL today:* ${_format_amount(realized_today)}")
 
+    # --- Holdings now (με ακριβή τρέχουσα τιμή/μονάδα) ---
     holdings_total, breakdown, unrealized = compute_holdings_usd()
     lines.append(f"*Holdings (MTM) now:* ${_format_amount(holdings_total)}")
     if breakdown:
-        for b in breakdown[:10]:
-            lines.append(f"  – {b['token']}: { _format_amount(b['amount']) } @ ${_format_amount(b['price_usd'])} = ${_format_amount(b['usd_value'])}")
-        if len(breakdown) > 10:
-            lines.append(f"  …and {len(breakdown)-10} more.")
+        # δείξε έως 15 γραμμές, με τιμή/μονάδα πάντα
+        for b in breakdown[:15]:
+            tok = b['token']
+            lines.append(
+                f"  – {tok}: {_format_amount(b['amount'])} @ ${_format_price(b['price_usd'])} = ${_format_amount(b['usd_value'])}"
+            )
+        if len(breakdown) > 15:
+            lines.append(f"  …and {len(breakdown)-15} more.")
     lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
 
+    # --- Per-asset summary (flows & realized σήμερα) με current live price ---
+    if per_asset_flow:
+        lines.append("\n*Per-Asset Summary (Today):*")
+        # ταξινόμηση κατά μέγεθος ροής
+        order = sorted(per_asset_flow.items(), key=lambda kv: abs(kv[1]), reverse=True)
+        LIMIT = 12
+        for idx, (tok, flow) in enumerate(order[:LIMIT]):
+            addr = per_asset_token_addr.get(tok)
+            # live τιμή (αν δεν υπάρχει από σημερινό entry)
+            live_price = per_asset_last_price.get(tok)
+            if live_price is None:
+                # προσπάθησε live
+                if tok.upper() == "CRO":
+                    live_price = get_price_usd("CRO") or 0.0
+                elif addr:
+                    live_price = get_price_usd(addr) or 0.0
+                else:
+                    live_price = get_price_usd(tok) or 0.0
+            amt_sum = per_asset_amt.get(tok, 0.0)
+            real_sum = per_asset_real.get(tok, 0.0)
+            lines.append(
+                f"  • {tok}: flow ${_format_amount(flow)} | realized ${_format_amount(real_sum)} | "
+                f"today qty {_format_amount(amt_sum)} | price ${_format_price(live_price)}"
+            )
+        if len(order) > LIMIT:
+            lines.append(f"  …and {len(order)-LIMIT} more.")
+
+    # --- Month aggregates ---
     month_flow, month_real = sum_month_net_flows_and_realized()
-    lines.append(f"*Month Net Flow:* ${_format_amount(month_flow)}")
+    lines.append(f"\n*Month Net Flow:* ${_format_amount(month_flow)}")
     lines.append(f"*Month Realized PnL:* ${_format_amount(month_real)}")
 
     return "\n".join(lines)
