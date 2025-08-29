@@ -973,6 +973,41 @@ def build_day_report_text():
         if addr and tok not in per_asset_token_addr:
             per_asset_token_addr[tok] = addr
 
+# ========================= Intraday Report (Final Plug&Play) =================
+
+def send_intraday_report(wallet_balances, prices, daily_flows, realized_pnl, unrealized_pnl, month_flows, month_realized):
+    lines = []
+    total_value = 0.0
+    
+    lines.append("🟡 Intraday Update")
+    lines.append(f"📒 Daily Report ({datetime.utcnow().date()})\n")
+    
+    if abs(daily_flows) < 1e-9 and abs(realized_pnl) < 1e-9:
+        lines.append("No transactions today.\n")
+    
+    lines.append(f"Net USD flow today: ${daily_flows:,.2f}")
+    lines.append(f"Realized PnL today: ${realized_pnl:,.2f}")
+    lines.append("Holdings (MTM):")
+    
+    for symbol, amount in wallet_balances.items():
+        if amount == 0:
+            continue
+        price = prices.get(symbol, 0.0)
+        value = amount * price
+        total_value += value
+        lines.append(f"  – {symbol}: {amount:,.4f} @ ${price:,.6f} = ${value:,.2f}")
+    
+    lines.append(f"\n📊 Total Portfolio Value: ${total_value:,.2f}")
+    lines.append(f"Unrealized PnL: ${unrealized_pnl:,.2f}")
+    lines.append(f"Month Net Flow: ${month_flows:,.2f}")
+    lines.append(f"Month Realized PnL: ${month_realized:,.2f}")
+    
+    text = "\n".join(lines)
+    
+    # === Push direct to Telegram ===
+    telegram_url = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/sendMessage"
+    requests.post(telegram_url, json={"chat_id": os.getenv("TELEGRAM_USER_ID"), "text": text})
+
     # --- Header ---
     lines = [f"*📒 Daily Report* ({data.get('date')})"]
     if not entries:
