@@ -1,2 +1,3 @@
 requests
 python-dotenv
+websocket-client
