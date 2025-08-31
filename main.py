@@ -970,6 +970,34 @@ def _build_asset_aggregates(entries):
     return agg
 
 # ----------------------- Report builder (daily/intraday) -----------------------
+def sum_month_net_flows_and_realized():
+    """
+    Returns the total net flows and realized PnL for the current month.
+    """
+    now = datetime.now()
+    month_start = datetime(now.year, now.month, 1)
+    month_key = month_start.strftime("%Y-%m")
+
+    total_net = 0
+    total_realized = 0
+
+    # ledger είναι global (list of dicts)
+    for tx in ledger:
+        ts = tx.get("ts")
+        if not ts:
+            continue
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts)
+            except:
+                continue
+
+        if ts >= month_start:
+            total_net += tx.get("net_flow", 0)
+            total_realized += tx.get("realized", 0)
+
+    return total_net, total_realized
+
 def build_day_report_text():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
