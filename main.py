@@ -396,7 +396,9 @@ def _append_ledger(entry: dict):
         path = data_file_for_today()
         data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
         data["entries"].append(entry)
+        # net USD flow: incoming positive, outgoing negative (already signed in entry["usd_value"])
         data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
+        # realized pnl accumulates
         data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
         write_json(path, data)
 
@@ -487,7 +489,7 @@ def handle_native_tx(tx: dict):
         f"*Native TX* ({'IN' if sign>0 else 'OUT'}) CRO\n"
         f"Hash: {link}\n"
         f"Time: {dt.strftime('%H:%M:%S')}\n"
-       f"Amount: {sign*amount_cro:.6f} CRO\n"
+        f"Amount: {sign*amount_cro:.6f} CRO\n"
         f"Price: ${_format_price(price)} per CRO\n"
         f"USD value: ${_format_amount(usd_value)}"
     )
@@ -859,15 +861,98 @@ def get_wallet_balances_snapshot(address):
     return balances
 
 # ----------------------- Compute holdings / MTM -----------------------
-def compute_holdings_usd():
+# (we add a stricter version that updates ATH and uses snapshot if available)
+ATH_PATH = os.path.join(DATA_DIR, "ath.json")
+
+def _ath_load():
+    try:
+        return read_json(ATH_PATH, default={})
+    except Exception:
+        return {}
+
+def _ath_save(d):
+    try:
+        write_json(ATH_PATH, d)
+    except Exception:
+        pass
+
+def _ath_update(symbol: str, price: float):
+    if not symbol or not _nonzero(price):
+        return
+    sym = str(symbol).upper()
+    d = _ath_load()
+    cur = float(d.get(sym, 0.0) or 0.0)
+    if price > cur:
+        d[sym] = float(price)
+        _ath_save(d)
+
+def _build_asset_aggregates(entries):
+    from collections import defaultdict
+    agg = {}
+    in_qty   = defaultdict(float)
+    out_qty  = defaultdict(float)
+    in_usd   = defaultdict(float)
+    out_usd  = defaultdict(float)
+    realized = defaultdict(float)
+    last_px  = {}
+    tok_addr = {}
+
+    for e in entries or []:
+        sym = e.get("token") or "?"
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        rp  = float(e.get("realized_pnl", 0.0) or 0.0)
+        px  = e.get("price_usd")
+        if _nonzero(px):
+            last_px[sym] = float(px)
+        addr = e.get("token_addr")
+        if addr and sym not in tok_addr:
+            tok_addr[sym] = addr
+
+        if amt >= 0:
+            in_qty[sym]  += amt
+            in_usd[sym]  += usd
+        else:
+            out_qty[sym] += -amt
+            out_usd[sym] += -usd
+        realized[sym]  += rp
+
+    for sym in set(list(in_qty.keys())+list(out_qty.keys())+list(realized.keys())):
+        agg[sym] = {
+            "in_qty": in_qty[sym],
+            "out_qty": out_qty[sym],
+            "net_qty_today": in_qty[sym] - out_qty[sym],
+            "in_usd": in_usd[sym],
+            "out_usd": out_usd[sym],
+            "net_flow_usd": in_usd[sym] - out_usd[sym],
+            "realized_sum": realized[sym],
+            "last_price": last_px.get(sym),
+            "token_addr": tok_addr.get(sym)
+        }
+    return agg
+
+def _get_live_price_for(symbol: str, addr: str | None):
+    p = 0.0
+    if symbol and symbol.upper() == "CRO":
+        p = get_price_usd("CRO") or 0.0
+    elif addr and isinstance(addr, str) and addr.startswith("0x") and len(addr) == 42:
+        p = get_token_price("cronos", addr) or get_price_usd(addr) or 0.0
+    else:
+        p = get_price_usd(symbol or "") or 0.0
+    if _nonzero(p):
+        _ath_update(symbol, p)
+    return p
+
+def compute_holdings_usd_strict():
+    balances = get_wallet_balances_snapshot(WALLET_ADDRESS)  # snapshot if available
     total = 0.0
     breakdown = []
     unrealized = 0.0
 
-    cro_amt = max(0.0, _token_balances.get("CRO", 0.0))
+    cro_amt = float(balances.get("CRO", 0.0))
     if cro_amt > EPSILON:
-        cro_price = get_price_usd("CRO") or 0.0
-        cro_val = cro_amt * cro_price
+        cro_price = _get_live_price_for("CRO", None) or 0.0
+        cro_val   = cro_amt * cro_price
         total += cro_val
         breakdown.append({"token":"CRO","token_addr":None,"amount":cro_amt,"price_usd":cro_price,"usd_value":cro_val})
         rem_qty = _position_qty.get("CRO",0.0)
@@ -875,45 +960,33 @@ def compute_holdings_usd():
         if rem_qty > EPSILON:
             unrealized += (cro_val - rem_cost)
 
-    for addr, amt in list(_token_balances.items()):
-        if addr == "CRO":
+    for sym, amt in sorted(balances.items()):
+        if sym.upper() == "CRO":
             continue
-        amt = max(0.0, amt)
+        amt = float(amt or 0.0)
         if amt <= EPSILON:
             continue
-        meta = _token_meta.get(addr,{})
-        sym = meta.get("symbol") or addr[:8]
-        price = 0.0
-        if isinstance(addr, str) and addr.startswith("0x") and len(addr) == 42:
-            price = get_token_price("cronos", addr) or get_price_usd(addr) or 0.0
-        else:
-            price = get_price_usd(sym) or get_price_usd(addr) or 0.0
-        val = amt * price
+
+        addr = None
+        for k, meta in _token_meta.items():
+            if isinstance(meta, dict) and (meta.get("symbol") or "").upper() == sym.upper():
+                addr = k if (isinstance(k, str) and k.startswith("0x") and len(k)==42) else None
+                break
+
+        price = _get_live_price_for(sym, addr) or 0.0
+        val   = amt * price
         total += val
         breakdown.append({"token":sym,"token_addr":addr,"amount":amt,"price_usd":price,"usd_value":val})
-        rem_qty = _position_qty.get(addr,0.0)
-        rem_cost= _position_cost.get(addr,0.0)
+
+        key = addr if (addr and addr.startswith("0x") and len(addr)==42) else sym
+        rem_qty = _position_qty.get(key, 0.0)
+        rem_cost= _position_cost.get(key, 0.0)
         if rem_qty > EPSILON:
             unrealized += (val - rem_cost)
+
     return total, breakdown, unrealized
 
-# ----------------------- Month aggregates -----------------------
-def sum_month_net_flows_and_realized():
-    pref = month_prefix()
-    total_flow = 0.0
-    total_real = 0.0
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json") and pref in fn:
-                data = read_json(os.path.join(DATA_DIR, fn), default=None)
-                if isinstance(data, dict):
-                    total_flow += float(data.get("net_usd_flow", 0.0))
-                    total_real += float(data.get("realized_pnl", 0.0))
-    except Exception:
-        pass
-    return total_flow, total_real
-
-# ----------------------- Report builder (daily/intraday) -----------------------
+# -- REPLACE: build_day_report_text() -------------------------------------------
 def build_day_report_text():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -921,43 +994,21 @@ def build_day_report_text():
     net_flow = float(data.get("net_usd_flow", 0.0))
     realized_today = float(data.get("realized_pnl", 0.0))
 
-    per_asset_flow = defaultdict(float)
-    per_asset_real = defaultdict(float)
-    per_asset_amt  = defaultdict(float)
-    per_asset_last_price = {}
-    per_asset_token_addr = {}
-
-    for e in entries:
-        tok = e.get("token") or "?"
-        addr = e.get("token_addr")
-        per_asset_flow[tok] += float(e.get("usd_value") or 0.0)
-        per_asset_real[tok] += float(e.get("realized_pnl") or 0.0)
-        per_asset_amt[tok]  += float(e.get("amount") or 0.0)
-        if _nonzero(e.get("price_usd", 0.0)):
-            per_asset_last_price[tok] = float(e.get("price_usd"))
-        if addr and tok not in per_asset_token_addr:
-            per_asset_token_addr[tok] = addr
-
     lines = [f"*📒 Daily Report* ({data.get('date')})"]
     if not entries:
         lines.append("_No transactions today._")
     else:
         lines.append("*Transactions:*")
         MAX_LINES = 20
-        for i, e in enumerate(entries[-MAX_LINES:]):
+        for e in entries[-MAX_LINES:]:
             tok = e.get("token") or "?"
-            amt = e.get("amount") or 0
-            usd = e.get("usd_value") or 0
-            tm  = e.get("time","")[-8:]
-            direction = "IN" if float(amt) > 0 else "OUT"
-            unit_price = e.get("price_usd") or 0.0
-            pnl_line = ""
-            try:
-                rp = float(e.get("realized_pnl", 0.0))
-                if abs(rp) > 1e-9:
-                    pnl_line = f"  PnL: ${_format_amount(rp)}"
-            except Exception:
-                pass
+            amt = float(e.get("amount") or 0.0)
+            usd = float(e.get("usd_value") or 0.0)
+            tm  = (e.get("time","")[-8:]) or ""
+            direction = "IN" if amt > 0 else "OUT"
+            unit_price = float(e.get("price_usd") or 0.0)
+            rp = float(e.get("realized_pnl", 0.0) or 0.0)
+            pnl_line = f"  PnL: ${_format_amount(rp)}" if _nonzero(rp) else ""
             lines.append(
                 f"• {tm} — {direction} {tok} {_format_amount(amt)}  "
                 f"@ ${_format_price(unit_price)}  "
@@ -969,11 +1020,12 @@ def build_day_report_text():
     lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
     lines.append(f"*Realized PnL today:* ${_format_amount(realized_today)}")
 
-    holdings_total, breakdown, unrealized = compute_holdings_usd()
+    holdings_total, breakdown, unrealized = compute_holdings_usd_strict()
     lines.append(f"*Holdings (MTM) now:* ${_format_amount(holdings_total)}")
     if breakdown:
         for b in breakdown[:15]:
             tok = b['token']
+            _ath_update(tok, b.get('price_usd') or 0.0)
             lines.append(
                 f"  – {tok}: {_format_amount(b['amount'])} @ ${_format_price(b['price_usd'])} = ${_format_amount(b['usd_value'])}"
             )
@@ -981,25 +1033,32 @@ def build_day_report_text():
             lines.append(f"  …and {len(breakdown)-15} more.")
     lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
 
-    if per_asset_flow:
+    agg = _build_asset_aggregates(entries)
+    if agg:
         lines.append("\n*Per-Asset Summary (Today):*")
-        order = sorted(per_asset_flow.items(), key=lambda kv: abs(kv[1]), reverse=True)
+        order = sorted(agg.items(), key=lambda kv: abs(kv[1]["net_flow_usd"]), reverse=True)
         LIMIT = 12
-        for idx, (tok, flow) in enumerate(order[:LIMIT]):
-            addr = per_asset_token_addr.get(tok)
-            live_price = per_asset_last_price.get(tok)
-            if live_price is None:
-                if tok.upper() == "CRO":
-                    live_price = get_price_usd("CRO") or 0.0
-                elif addr and isinstance(addr, str) and addr.startswith("0x"):
-                    live_price = get_token_price("cronos", addr) or 0.0
-                else:
-                    live_price = get_price_usd(tok) or 0.0
-            amt_sum = per_asset_amt.get(tok, 0.0)
-            real_sum = per_asset_real.get(tok, 0.0)
+        for idx, (sym, a) in enumerate(order[:LIMIT]):
+            addr = a.get("token_addr")
+            live = a.get("last_price")
+            if live is None:
+                live = _get_live_price_for(sym, addr) or 0.0
+
+            key = addr if (addr and addr.startswith("0x") and len(addr)==42) else sym
+            rem_qty  = _position_qty.get(key, 0.0)
+            rem_cost = _position_cost.get(key, 0.0)
+            rem_val  = rem_qty * (live or 0.0)
+            unreal   = rem_val - rem_cost
+
+            ath_d = _ath_load()
+            ath_v = float(ath_d.get(sym.upper(), 0.0) or 0.0)
+
             lines.append(
-                f"  • {tok}: flow ${_format_amount(flow)} | realized ${_format_amount(real_sum)} | "
-                f"today qty {_format_amount(amt_sum)} | price ${_format_price(live_price)}"
+                f"  • {sym}: in ${_format_amount(a['in_usd'])} | out ${_format_amount(a['out_usd'])} | "
+                f"net ${_format_amount(a['net_flow_usd'])} | realized ${_format_amount(a['realized_sum'])} | "
+                f"today qty {_format_amount(a['net_qty_today'])} | price ${_format_price(live)} | "
+                f"pos {_format_amount(rem_qty)} (MTM ${_format_amount(rem_val)}, UPNL ${_format_amount(unreal)}) | "
+                f"ATH ${_format_price(ath_v)}"
             )
         if len(order) > LIMIT:
             lines.append(f"  …and {len(order)-LIMIT} more.")
@@ -1010,43 +1069,74 @@ def build_day_report_text():
 
     return "\n".join(lines)
 
-# ----------------------- Intraday & EOD reporters -----------------------
+# ----------------------- Intraday & EOD reporters (replacement) -----------------------
 def intraday_report_loop():
     global _last_intraday_sent
     time.sleep(5)
-    send_telegram("⏱ Intraday reporting enabled.")
+    try:
+        txt = build_day_report_text()
+        send_telegram("🟡 *Intraday Update*\n" + txt)
+        _last_intraday_sent = time.time()
+    except Exception as e:
+        log.exception("Intraday immediate report error: %s", e)
+
+    slot = max(1, int(INTRADAY_HOURS)) * 3600
     while not shutdown_event.is_set():
         try:
-            if time.time() - _last_intraday_sent >= INTRADAY_HOURS * 3600:
-                txt = build_day_report_text()
-                send_telegram("🟡 *Intraday Update*\n" + txt)
-                _last_intraday_sent = time.time()
-        except Exception as e:
-            log.exception("Intraday report error: %s", e)
-        for i in range(30):
+            now = datetime.now()
+            seconds_since_midnight = (now - now.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
+            next_k = int(seconds_since_midnight // slot) + 1
+            next_ts = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() + next_k * slot
+
+            wait_s = max(5.0, next_ts - time.time())
+            while wait_s > 0 and not shutdown_event.is_set():
+                step = min(wait_s, 5.0)
+                time.sleep(step)
+                wait_s -= step
             if shutdown_event.is_set():
                 break
-            time.sleep(1)
+
+            txt = build_day_report_text()
+            send_telegram("🟡 *Intraday Update*\n" + txt)
+            _last_intraday_sent = time.time()
+
+        except Exception as e:
+            log.exception("Intraday report loop error: %s", e)
+            for _ in range(6):
+                if shutdown_event.is_set():
+                    break
+                time.sleep(5)
 
 def end_of_day_scheduler_loop():
-    send_telegram(f"🕛 End-of-day scheduler active (at {EOD_HOUR:02d}:{EOD_MINUTE:02d} {TZ}).")
+    try:
+        send_telegram(f"🕛 End-of-day scheduler active (at {EOD_HOUR:02d}:{EOD_MINUTE:02d} {TZ}).")
+    except Exception:
+        pass
+
     while not shutdown_event.is_set():
-        now = now_dt()
-        target = now.replace(hour=EOD_HOUR, minute=EOD_MINUTE, second=0, microsecond=0)
-        if now > target:
-            target = target + timedelta(days=1)
-        wait_s = (target - now).total_seconds()
-        while wait_s > 0 and not shutdown_event.is_set():
-            s = min(wait_s, 30)
-            time.sleep(s)
-            wait_s -= s
-        if shutdown_event.is_set():
-            break
         try:
-            txt = build_day_report_text()
-            send_telegram("🟢 *End of Day Report*\n" + txt)
+            now = now_dt()
+            target = now.replace(hour=EOD_HOUR, minute=EOD_MINUTE, second=0, microsecond=0)
+            if now > target:
+                target = target + timedelta(days=1)
+            wait_s = (target - now).total_seconds()
+            while wait_s > 0 and not shutdown_event.is_set():
+                s = min(wait_s, 30)
+                time.sleep(s)
+                wait_s -= s
+            if shutdown_event.is_set():
+                break
+            try:
+                txt = build_day_report_text()
+                send_telegram("🟢 *End of Day Report*\n" + txt)
+            except Exception as e:
+                log.exception("EOD report error: %s", e)
         except Exception as e:
-            log.exception("EOD report error: %s", e)
+            log.exception("End-of-day scheduler error: %s", e)
+            for _ in range(10):
+                if shutdown_event.is_set():
+                    break
+                time.sleep(1)
 
 # ----------------------- Reconciliation helper -----------------------
 def reconcile_swaps_from_entries():
@@ -1108,14 +1198,12 @@ def main():
     threads.append(run_with_restart(end_of_day_scheduler_loop, "eod_scheduler"))
 
     try:
-        # main thread waits for shutdown_event
         while not shutdown_event.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt: shutting down...")
         shutdown_event.set()
 
-    # wait short for threads to finish
     log.info("Waiting for threads to terminate...")
     for t in threading.enumerate():
         if t is threading.current_thread():
