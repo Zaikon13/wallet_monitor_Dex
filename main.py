@@ -5,7 +5,6 @@ main.py - Complete Wallet monitor (Cronos via Etherscan Multichain) + Dexscreene
 Auto-discovery, PnL (realized & unrealized), intraday/EOD reports, ATH tracking, swap reconciliation.
 Drop-in for Railway worker. Uses environment variables (no hardcoded secrets).
 """
-
 import os
 import sys
 import time
@@ -68,7 +67,7 @@ SESSION.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
 # ----------------------- Shutdown event -----------------------
 shutdown_event = threading.Event()
 
-# ----------------------- State -----------------------
+# ----------------------- State (core) -----------------------
 _seen_tx_hashes   = set()
 _last_prices      = {}
 _price_history    = {}
@@ -79,14 +78,19 @@ _known_pairs_meta = {}
 _day_ledger_lock  = threading.Lock()
 _token_balances   = defaultdict(float)    # token_addr or "CRO" -> amount
 _token_meta       = {}                     # token_addr -> {"symbol","decimals"}
-_position_qty     = defaultdict(float)
-_position_cost    = defaultdict(float)
+_position_qty     = defaultdict(float)    # key -> qty (for cost basis)
+_position_cost    = defaultdict(float)    # key -> total cost (USD)
 _realized_pnl_today = 0.0
 EPSILON           = 1e-12
 _last_intraday_sent = 0.0
 
 PRICE_CACHE = {}
 PRICE_CACHE_TTL = 60
+
+# ----------------------- GLOBAL LEDGER (shared) -----------------------
+# ledger keeps recent transactions in memory for faster aggregation; persisted daily too
+ledger = deque(maxlen=20000)
+ledger_lock = threading.Lock()
 
 # Ensure data dir
 try:
@@ -386,6 +390,7 @@ def fetch_latest_token_txs(limit=50):
 
 # ----------------------- Ledger helpers -----------------------
 def _append_ledger(entry: dict):
+    # persist to daily file and keep in-memory ledger for quick aggregation
     with _day_ledger_lock:
         path = data_file_for_today()
         data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -393,6 +398,8 @@ def _append_ledger(entry: dict):
         data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
         data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
         write_json(path, data)
+    with ledger_lock:
+        ledger.append(entry)
 
 def _replay_today_cost_basis():
     global _position_qty, _position_cost, _realized_pnl_today
@@ -411,6 +418,14 @@ def _replay_today_cost_basis():
         total_real = sum(float(e.get("realized_pnl", 0.0)) for e in data.get("entries", []))
         data["realized_pnl"] = total_real
         write_json(path, data)
+    except Exception:
+        pass
+    # also populate in-memory ledger for today's entries
+    try:
+        with ledger_lock:
+            ledger.clear()
+            for e in data.get("entries", []):
+                ledger.append(e)
     except Exception:
         pass
 
@@ -438,7 +453,7 @@ def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float):
     _realized_pnl_today += realized
     return realized
 
-# ----------------------- Handlers -----------------------
+# ----------------------- Handlers (native + erc20) -----------------------
 def handle_native_tx(tx: dict):
     h = tx.get("hash")
     if not h or h in _seen_tx_hashes:
@@ -488,6 +503,7 @@ def handle_native_tx(tx: dict):
 
     entry = {
         "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": dt.isoformat(),
         "txhash": h,
         "type": "native",
         "token": "CRO",
@@ -550,6 +566,7 @@ def handle_erc20_tx(t: dict):
 
     entry = {
         "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": dt.isoformat(),
         "txhash": h,
         "type": "erc20",
         "token": symbol,
@@ -693,7 +710,10 @@ def monitor_tracked_pairs_loop():
     if not _tracked_pairs:
         log.info("No tracked pairs; monitor waits until discovery/seed adds some.")
     else:
-        send_telegram(f"🚀 Dexscreener monitor started for: {', '.join(sorted(_tracked_pairs))}")
+        try:
+            send_telegram(f"🚀 Dexscreener monitor started for: {', '.join(sorted(_tracked_pairs))}")
+        except Exception:
+            pass
 
     while not shutdown_event.is_set():
         if not _tracked_pairs:
@@ -756,11 +776,13 @@ def monitor_tracked_pairs_loop():
             time.sleep(1)
 
 def discovery_loop():
+    # seed from env pairs
     seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
     for s in seeds:
         if s.startswith("cronos/"):
             ensure_tracking_pair("cronos", s.split("/",1)[1])
 
+    # seed from TOKENS env
     token_items = [t.strip().lower() for t in (TOKENS or "").split(",") if t.strip()]
     for t in token_items:
         if not t.startswith("cronos/"):
@@ -777,7 +799,10 @@ def discovery_loop():
         log.info("Discovery disabled.")
         return
 
-    send_telegram("🧭 Dexscreener auto-discovery enabled (Cronos).")
+    try:
+        send_telegram("🧭 Dexscreener auto-discovery enabled (Cronos).")
+    except Exception:
+        pass
 
     while not shutdown_event.is_set():
         try:
@@ -969,35 +994,27 @@ def _build_asset_aggregates(entries):
         }
     return agg
 
-# ----------------------- Report builder (daily/intraday) -----------------------
+# ----------------------- Month aggregates (reads files) -----------------------
 def sum_month_net_flows_and_realized():
     """
-    Returns the total net flows and realized PnL for the current month.
+    Sum net_usd_flow and realized_pnl from all daily files in current month.
+    This implementation reads persisted daily files in DATA_DIR.
     """
-    now = datetime.now()
-    month_start = datetime(now.year, now.month, 1)
-    month_key = month_start.strftime("%Y-%m")
+    pref = month_prefix()
+    total_flow = 0.0
+    total_real = 0.0
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json") and pref in fn:
+                data = read_json(os.path.join(DATA_DIR, fn), default=None)
+                if isinstance(data, dict):
+                    total_flow += float(data.get("net_usd_flow", 0.0))
+                    total_real += float(data.get("realized_pnl", 0.0))
+    except Exception:
+        pass
+    return total_flow, total_real
 
-    total_net = 0
-    total_realized = 0
-
-    # ledger είναι global (list of dicts)
-    for tx in ledger:
-        ts = tx.get("ts")
-        if not ts:
-            continue
-        if isinstance(ts, str):
-            try:
-                ts = datetime.fromisoformat(ts)
-            except:
-                continue
-
-        if ts >= month_start:
-            total_net += tx.get("net_flow", 0)
-            total_realized += tx.get("realized", 0)
-
-    return total_net, total_realized
-
+# ----------------------- Report builder (daily/intraday) -----------------------
 def build_day_report_text():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -1042,7 +1059,7 @@ def build_day_report_text():
                     pnl_line = f"  PnL: ${_format_amount(rp)}"
             except Exception:
                 pass
-            lines.append(f"• {tm} — {direction} {tok} { _format_amount(amt) }  (${_format_amount(usd)}){pnl_line}")
+            lines.append(f"• {tm} — {direction} {tok} { _format_amount(amt) }  @ ${_format_price(unit_price)}  (${_format_amount(usd)}){pnl_line}")
         if len(entries) > MAX_LINES:
             lines.append(f"_…and {len(entries)-MAX_LINES} earlier txs._")
 
@@ -1073,7 +1090,7 @@ def build_day_report_text():
             if live is None:
                 live = _get_live_price_for(sym, addr) or 0.0
 
-            key = addr if (addr and addr.startswith("0x") and len(addr)==42) else sym
+            key = addr if (addr and isinstance(addr,str) and addr.startswith("0x") and len(addr)==42) else sym
             rem_qty  = _position_qty.get(key, 0.0)
             rem_cost = _position_cost.get(key, 0.0)
             rem_val  = rem_qty * (live or 0.0)
@@ -1110,7 +1127,6 @@ def intraday_report_loop():
         log.exception("Intraday immediate report error: %s", e)
 
     slot = max(1, int(INTRADAY_HOURS)) * 3600
-
     while not shutdown_event.is_set():
         try:
             now = datetime.now()
