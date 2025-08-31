@@ -163,8 +163,13 @@ def safe_json(r):
         log.debug("Response not JSON (preview): %s", txt)
         return None
 
+# ----------------------- Telegram -----------------------
+_rate_limit_last = 0.0
 def send_telegram(message: str) -> bool:
     global _rate_limit_last
+    now = time.time()
+    if now - _rate_limit_last < 0.8:
+        time.sleep(0.8 - (now - _rate_limit_last))
     try:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning("Telegram not configured.")
@@ -172,6 +177,7 @@ def send_telegram(message: str) -> bool:
         url = TELEGRAM_URL.format(token=TELEGRAM_BOT_TOKEN)
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         r = SESSION.post(url, data=payload, timeout=12)
+        _rate_limit_last = time.time()
         if r.status_code == 401:
             log.error("Telegram 401 Unauthorized. Check token.")
             return False
@@ -292,12 +298,7 @@ def get_price_usd(symbol_or_addr: str):
     return price
 
 def get_token_price(chain: str, token_address: str):
-    """
-    Robust token price fetch: tries token pairs endpoint, tokens endpoint, search, coingecko fallback.
-    Returns float price or 0.0 when not found.
-    """
     try:
-        # 1) /tokens/{chain}/{addr}
         url = f"https://api.dexscreener.com/latest/dex/tokens/{chain}/{token_address}"
         r = SESSION.get(url, timeout=10)
         if r.status_code == 200:
@@ -306,8 +307,6 @@ def get_token_price(chain: str, token_address: str):
                 p = _top_price_from_pairs_pricehelpers(d["pairs"])
                 if p:
                     return float(p)
-
-        # 2) /tokens/{addr}
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
         r = SESSION.get(url, timeout=10)
         if r.status_code == 200:
@@ -316,17 +315,12 @@ def get_token_price(chain: str, token_address: str):
                 p = _top_price_from_pairs_pricehelpers(d["pairs"])
                 if p:
                     return float(p)
-
-        # 3) search
         p = _price_from_dexscreener_search(token_address)
         if p:
             return float(p)
-
-        # 4) coingecko contract fallback
         cg = _price_from_coingecko_contract(token_address)
         if cg:
             return float(cg)
-
         return 0.0
     except Exception as e:
         log.debug("[get_token_price] %s", e)
@@ -396,9 +390,7 @@ def _append_ledger(entry: dict):
         path = data_file_for_today()
         data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
         data["entries"].append(entry)
-        # net USD flow: incoming positive, outgoing negative (already signed in entry["usd_value"])
         data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
-        # realized pnl accumulates
         data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
         write_json(path, data)
 
@@ -446,7 +438,7 @@ def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float):
     _realized_pnl_today += realized
     return realized
 
-# ----------------------- Handlers (native + erc20) -----------------------
+# ----------------------- Handlers -----------------------
 def handle_native_tx(tx: dict):
     h = tx.get("hash")
     if not h or h in _seen_tx_hashes:
@@ -571,14 +563,11 @@ def handle_erc20_tx(t: dict):
     }
     _append_ledger(entry)
 
-# ----------------------- Wallet monitor loop (IMPORTANT) -----------------------
+# ----------------------- Wallet monitor loop -----------------------
 def wallet_monitor_loop():
-    """
-    Main wallet monitor: polls native txs and token txs and processes them.
-    """
     global _seen_tx_hashes
     log.info("Wallet monitor starting; loading initial recent txs...")
-    # seed seen hashes to avoid spamming historic txs on startup
+
     initial = fetch_latest_wallet_txs(limit=50)
     try:
         _seen_tx_hashes = set(tx.get("hash") for tx in initial if isinstance(tx, dict) and tx.get("hash"))
@@ -587,7 +576,6 @@ def wallet_monitor_loop():
 
     _replay_today_cost_basis()
 
-    # notify start
     try:
         send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}` (Cronos).")
     except Exception:
@@ -601,7 +589,7 @@ def wallet_monitor_loop():
             if not txs:
                 log.debug("No native txs returned; retrying...")
             else:
-                for tx in reversed(txs):  # oldest -> newest
+                for tx in reversed(txs):
                     if not isinstance(tx, dict):
                         continue
                     handle_native_tx(tx)
@@ -624,13 +612,12 @@ def wallet_monitor_loop():
         except Exception as e:
             log.exception("wallet token tx loop error: %s", e)
 
-        # sleep
         for i in range(WALLET_POLL):
             if shutdown_event.is_set():
                 break
             time.sleep(1)
 
-# ----------------------- Dexscreener pair monitor + discovery -----------------------
+# ----------------------- Dexscreener monitor & discovery -----------------------
 def slug(chain: str, pair_address: str) -> str:
     return f"{chain}/{pair_address}".lower()
 
@@ -769,13 +756,11 @@ def monitor_tracked_pairs_loop():
             time.sleep(1)
 
 def discovery_loop():
-    # seed from DEX_PAIRS env (optional)
     seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
     for s in seeds:
         if s.startswith("cronos/"):
             ensure_tracking_pair("cronos", s.split("/",1)[1])
 
-    # seed from TOKENS env (optional)
     token_items = [t.strip().lower() for t in (TOKENS or "").split(",") if t.strip()]
     for t in token_items:
         if not t.startswith("cronos/"):
@@ -860,15 +845,11 @@ def get_wallet_balances_snapshot(address):
         balances["CRO"] = float(_token_balances.get("CRO", 0.0))
     return balances
 
-# ----------------------- Compute holdings / MTM -----------------------
-# (we add a stricter version that updates ATH and uses snapshot if available)
+# ----------------------- Compute holdings / MTM (strict + ATH updates) -----------------------
 ATH_PATH = os.path.join(DATA_DIR, "ath.json")
 
 def _ath_load():
-    try:
-        return read_json(ATH_PATH, default={})
-    except Exception:
-        return {}
+    return read_json(ATH_PATH, default={})
 
 def _ath_save(d):
     try:
@@ -886,51 +867,6 @@ def _ath_update(symbol: str, price: float):
         d[sym] = float(price)
         _ath_save(d)
 
-def _build_asset_aggregates(entries):
-    from collections import defaultdict
-    agg = {}
-    in_qty   = defaultdict(float)
-    out_qty  = defaultdict(float)
-    in_usd   = defaultdict(float)
-    out_usd  = defaultdict(float)
-    realized = defaultdict(float)
-    last_px  = {}
-    tok_addr = {}
-
-    for e in entries or []:
-        sym = e.get("token") or "?"
-        amt = float(e.get("amount") or 0.0)
-        usd = float(e.get("usd_value") or 0.0)
-        rp  = float(e.get("realized_pnl", 0.0) or 0.0)
-        px  = e.get("price_usd")
-        if _nonzero(px):
-            last_px[sym] = float(px)
-        addr = e.get("token_addr")
-        if addr and sym not in tok_addr:
-            tok_addr[sym] = addr
-
-        if amt >= 0:
-            in_qty[sym]  += amt
-            in_usd[sym]  += usd
-        else:
-            out_qty[sym] += -amt
-            out_usd[sym] += -usd
-        realized[sym]  += rp
-
-    for sym in set(list(in_qty.keys())+list(out_qty.keys())+list(realized.keys())):
-        agg[sym] = {
-            "in_qty": in_qty[sym],
-            "out_qty": out_qty[sym],
-            "net_qty_today": in_qty[sym] - out_qty[sym],
-            "in_usd": in_usd[sym],
-            "out_usd": out_usd[sym],
-            "net_flow_usd": in_usd[sym] - out_usd[sym],
-            "realized_sum": realized[sym],
-            "last_price": last_px.get(sym),
-            "token_addr": tok_addr.get(sym)
-        }
-    return agg
-
 def _get_live_price_for(symbol: str, addr: str | None):
     p = 0.0
     if symbol and symbol.upper() == "CRO":
@@ -944,7 +880,7 @@ def _get_live_price_for(symbol: str, addr: str | None):
     return p
 
 def compute_holdings_usd_strict():
-    balances = get_wallet_balances_snapshot(WALLET_ADDRESS)  # snapshot if available
+    balances = get_wallet_balances_snapshot(WALLET_ADDRESS)
     total = 0.0
     breakdown = []
     unrealized = 0.0
@@ -952,7 +888,7 @@ def compute_holdings_usd_strict():
     cro_amt = float(balances.get("CRO", 0.0))
     if cro_amt > EPSILON:
         cro_price = _get_live_price_for("CRO", None) or 0.0
-        cro_val   = cro_amt * cro_price
+        cro_val = cro_amt * cro_price
         total += cro_val
         breakdown.append({"token":"CRO","token_addr":None,"amount":cro_amt,"price_usd":cro_price,"usd_value":cro_val})
         rem_qty = _position_qty.get("CRO",0.0)
@@ -970,15 +906,16 @@ def compute_holdings_usd_strict():
         addr = None
         for k, meta in _token_meta.items():
             if isinstance(meta, dict) and (meta.get("symbol") or "").upper() == sym.upper():
-                addr = k if (isinstance(k, str) and k.startswith("0x") and len(k)==42) else None
-                break
+                if isinstance(k, str) and k.startswith("0x") and len(k)==42:
+                    addr = k
+                    break
 
         price = _get_live_price_for(sym, addr) or 0.0
-        val   = amt * price
+        val = amt * price
         total += val
         breakdown.append({"token":sym,"token_addr":addr,"amount":amt,"price_usd":price,"usd_value":val})
 
-        key = addr if (addr and addr.startswith("0x") and len(addr)==42) else sym
+        key = addr if (addr and isinstance(addr,str) and addr.startswith("0x") and len(addr)==42) else sym
         rem_qty = _position_qty.get(key, 0.0)
         rem_cost= _position_cost.get(key, 0.0)
         if rem_qty > EPSILON:
@@ -986,7 +923,53 @@ def compute_holdings_usd_strict():
 
     return total, breakdown, unrealized
 
-# -- REPLACE: build_day_report_text() -------------------------------------------
+# ----------------------- Day aggregation builder -----------------------
+def _build_asset_aggregates(entries):
+    from collections import defaultdict
+    agg = {}
+    in_qty = defaultdict(float)
+    out_qty = defaultdict(float)
+    in_usd = defaultdict(float)
+    out_usd = defaultdict(float)
+    realized = defaultdict(float)
+    last_px = {}
+    tok_addr = {}
+
+    for e in entries or []:
+        sym = e.get("token") or "?"
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        rp  = float(e.get("realized_pnl", 0.0) or 0.0)
+        px  = e.get("price_usd")
+        if _nonzero(px):
+            last_px[sym] = float(px)
+        addr = e.get("token_addr")
+        if addr and sym not in tok_addr:
+            tok_addr[sym] = addr
+
+        if amt >= 0:
+            in_qty[sym] += amt
+            in_usd[sym] += usd
+        else:
+            out_qty[sym] += -amt
+            out_usd[sym] += -usd
+        realized[sym] += rp
+
+    for sym in set(list(in_qty.keys())+list(out_qty.keys())+list(realized.keys())):
+        agg[sym] = {
+            "in_qty": in_qty[sym],
+            "out_qty": out_qty[sym],
+            "net_qty_today": in_qty[sym] - out_qty[sym],
+            "in_usd": in_usd[sym],
+            "out_usd": out_usd[sym],
+            "net_flow_usd": in_usd[sym] - out_usd[sym],
+            "realized_sum": realized[sym],
+            "last_price": last_px.get(sym),
+            "token_addr": tok_addr.get(sym)
+        }
+    return agg
+
+# ----------------------- Report builder (daily/intraday) -----------------------
 def build_day_report_text():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -994,26 +977,44 @@ def build_day_report_text():
     net_flow = float(data.get("net_usd_flow", 0.0))
     realized_today = float(data.get("realized_pnl", 0.0))
 
+    per_asset_flow = defaultdict(float)
+    per_asset_real = defaultdict(float)
+    per_asset_amt  = defaultdict(float)
+    per_asset_last_price = {}
+    per_asset_token_addr = {}
+
+    for e in entries:
+        tok = e.get("token") or "?"
+        addr = e.get("token_addr")
+        per_asset_flow[tok] += float(e.get("usd_value") or 0.0)
+        per_asset_real[tok] += float(e.get("realized_pnl") or 0.0)
+        per_asset_amt[tok]  += float(e.get("amount") or 0.0)
+        if _nonzero(e.get("price_usd", 0.0)):
+            per_asset_last_price[tok] = float(e.get("price_usd"))
+        if addr and tok not in per_asset_token_addr:
+            per_asset_token_addr[tok] = addr
+
     lines = [f"*📒 Daily Report* ({data.get('date')})"]
     if not entries:
         lines.append("_No transactions today._")
     else:
         lines.append("*Transactions:*")
         MAX_LINES = 20
-        for e in entries[-MAX_LINES:]:
+        for i, e in enumerate(entries[-MAX_LINES:]):
             tok = e.get("token") or "?"
-            amt = float(e.get("amount") or 0.0)
-            usd = float(e.get("usd_value") or 0.0)
-            tm  = (e.get("time","")[-8:]) or ""
-            direction = "IN" if amt > 0 else "OUT"
-            unit_price = float(e.get("price_usd") or 0.0)
-            rp = float(e.get("realized_pnl", 0.0) or 0.0)
-            pnl_line = f"  PnL: ${_format_amount(rp)}" if _nonzero(rp) else ""
-            lines.append(
-                f"• {tm} — {direction} {tok} {_format_amount(amt)}  "
-                f"@ ${_format_price(unit_price)}  "
-                f"(${_format_amount(usd)}){pnl_line}"
-            )
+            amt = e.get("amount") or 0
+            usd = e.get("usd_value") or 0
+            tm  = e.get("time","")[-8:]
+            direction = "IN" if float(amt) > 0 else "OUT"
+            unit_price = e.get("price_usd") or 0.0
+            pnl_line = ""
+            try:
+                rp = float(e.get("realized_pnl", 0.0))
+                if abs(rp) > 1e-9:
+                    pnl_line = f"  PnL: ${_format_amount(rp)}"
+            except Exception:
+                pass
+            lines.append(f"• {tm} — {direction} {tok} { _format_amount(amt) }  (${_format_amount(usd)}){pnl_line}")
         if len(entries) > MAX_LINES:
             lines.append(f"_…and {len(entries)-MAX_LINES} earlier txs._")
 
@@ -1027,7 +1028,7 @@ def build_day_report_text():
             tok = b['token']
             _ath_update(tok, b.get('price_usd') or 0.0)
             lines.append(
-                f"  – {tok}: {_format_amount(b['amount'])} @ ${_format_price(b['price_usd'])} = ${_format_amount(b['usd_value'])}"
+                f"  – {tok}: { _format_amount(b['amount']) } @ ${_format_price(b['price_usd'])} = ${_format_amount(b['usd_value'])}"
             )
         if len(breakdown) > 15:
             lines.append(f"  …and {len(breakdown)-15} more.")
@@ -1069,7 +1070,7 @@ def build_day_report_text():
 
     return "\n".join(lines)
 
-# ----------------------- Intraday & EOD reporters (replacement) -----------------------
+# ----------------------- Intraday & EOD reporters -----------------------
 def intraday_report_loop():
     global _last_intraday_sent
     time.sleep(5)
@@ -1081,6 +1082,7 @@ def intraday_report_loop():
         log.exception("Intraday immediate report error: %s", e)
 
     slot = max(1, int(INTRADAY_HOURS)) * 3600
+
     while not shutdown_event.is_set():
         try:
             now = datetime.now()
@@ -1132,7 +1134,7 @@ def end_of_day_scheduler_loop():
             except Exception as e:
                 log.exception("EOD report error: %s", e)
         except Exception as e:
-            log.exception("End-of-day scheduler error: %s", e)
+            log.exception("EOD scheduler error: %s", e)
             for _ in range(10):
                 if shutdown_event.is_set():
                     break
@@ -1189,7 +1191,6 @@ def main():
     log.info("DISCOVER_ENABLED: %s | DISCOVER_QUERY: %s", DISCOVER_ENABLED, DISCOVER_QUERY)
     log.info("TZ: %s | INTRADAY_HOURS: %s | EOD: %02d:%02d", TZ, INTRADAY_HOURS, EOD_HOUR, EOD_MINUTE)
 
-    # Threads (wrapped)
     threads = []
     threads.append(run_with_restart(wallet_monitor_loop, "wallet_monitor"))
     threads.append(run_with_restart(monitor_tracked_pairs_loop, "pairs_monitor"))
