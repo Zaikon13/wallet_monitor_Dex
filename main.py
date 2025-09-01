@@ -802,7 +802,7 @@ def monitor_tracked_pairs_loop():
                     if spike_pct is not None:
                          if MIN_VOLUME_FOR_ALERT and vol_h1 and vol_h1 < MIN_VOLUME_FOR_ALERT:
                             pass
-                        else:
+                         else:
                             send_telegram(f"🚨 Spike on {symbol}: {spike_pct:.2f}% over recent samples\nPrice: ${price_val:.6f} Vol1h: {vol_h1}")
                             _price_history[s].clear()
                             _last_prices[s] = price_val
