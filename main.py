@@ -117,95 +117,84 @@ def wallet_monitor_loop():
             send_telegram(f"{tx_type} {symbol} {amount:.4f} @ ${price:.6f}")
         time.sleep(WALLET_POLL)
 
-# main_part2.py (συνέχεια του Part 1)
+# ========================= 2/2 main.py =========================
 
-# ================== Dex Discovery ==================
-def discover_pairs_loop():
-    global tracked_pairs
-    if not DISCOVER_ENABLED:
-        return
+# Aggregation & PnL calculation
+def update_aggregates(tx):
+    asset = tx['token']
+    amount = tx['amount']
+    usd_value = tx['usd_value']
+    if asset not in aggregates:
+        aggregates[asset] = {'qty': 0.0, 'realized': 0.0, 'unrealized': 0.0, 'last_price': 0.0}
+    if tx['type'] == 'IN':
+        aggregates[asset]['qty'] += amount
+        aggregates[asset]['last_price'] = tx['price']
+    elif tx['type'] == 'OUT':
+        sold_qty = min(amount, aggregates[asset]['qty'])
+        realized = sold_qty * tx['price']
+        aggregates[asset]['qty'] -= sold_qty
+        aggregates[asset]['realized'] += realized
+
+# Intraday & EOD reporting
+def send_report(eod=False):
+    report_type = "EOD" if eod else "Intraday"
+    message = f"🟡 {report_type} Update\n📒 Report ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})\nTransactions:\n"
+    for tx in recent_txs:
+        message += f"• {tx['time']} — {tx['type']} {tx['token']} {tx['amount']} @ ${tx['price']} (${'{:.4f}'.format(tx['usd_value'])})\n"
+    message += "\nPer-Asset Summary:\n"
+    for asset, data in aggregates.items():
+        message += f"• {asset}: qty {data['qty']} | realized ${'{:.4f}'.format(data['realized'])} | last price ${data['last_price']}\n"
+    send_telegram(message)
+
+# ATH & spike alerts
+def check_spikes(token, price):
+    last_ath = ath_prices.get(token, 0)
+    if price > last_ath:
+        ath_prices[token] = price
+        send_telegram(f"🚀 New ATH for {token}: ${price}")
+    elif (price - last_ath) / last_ath * 100 >= SPIKE_THRESHOLD:
+        send_telegram(f"⚡ Price spike detected for {token}: ${price}")
+
+# Discovery thread
+def discovery_loop():
     while True:
-        url = f"https://api.dexscreener.com/latest/dex/pairs/{DISCOVER_QUERY}"
-        data = retry_request(url)
-        if data and "pairs" in data:
-            for pair in data["pairs"][:DISCOVER_LIMIT]:
-                addr = pair.get("address")
-                if addr and addr not in tracked_pairs:
-                    tracked_pairs[addr] = pair
-                    send_telegram(f"🆕 Now monitoring pair: {pair.get('name')} ({pair.get('url')})")
+        if DISCOVER_ENABLED:
+            discover_pairs()
         time.sleep(DISCOVER_POLL)
 
-# ================== Intraday & EOD Reporting ==================
-def intraday_report_loop():
+# Wallet monitor thread
+def wallet_loop():
     while True:
-        if intraday_log:
-            now = datetime.now()
-            window_start = now - timedelta(hours=INTRADAY_HOURS)
-            recent_tx = [tx for tx in intraday_log if tx[0] >= window_start]
-            if recent_tx:
-                msg = "🟡 Intraday Update\n"
-                for tx_time, tx_type, symbol, qty, price in recent_tx:
-                    msg += f"{tx_time.strftime('%H:%M:%S')} — {tx_type} {symbol} {qty:.4f} @ ${price:.6f}\n"
-                send_telegram(msg)
+        txs = fetch_wallet_txs(WALLET_ADDRESS)
+        for tx in txs:
+            if tx not in recent_txs_set:
+                recent_txs.append(tx)
+                recent_txs_set.add(tx)
+                update_aggregates(tx)
+                if tx['token'] in tracked_pairs:
+                    check_spikes(tx['token'], tx['price'])
+        time.sleep(WALLET_POLL)
+
+# Dex pairs monitor thread
+def pairs_loop():
+    while True:
+        scan_pairs()
         time.sleep(DEX_POLL)
 
-def eod_report_loop():
-    while True:
-        now = datetime.now()
-        if now.hour == EOD_HOUR and now.minute == EOD_MINUTE:
-            msg = f"📒 Daily Report ({now.strftime('%Y-%m-%d')})\n"
-            msg += format_asset_summary()
-            send_telegram(msg)
-            intraday_log.clear()
-            time.sleep(60)
-        time.sleep(30)
-
-# ================== ATH Tracking ==================
-ath_prices = {}
-
-def ath_monitor_loop():
-    while True:
-        for symbol, data in asset_summary.items():
-            price = data["price"]
-            if symbol not in ath_prices or price > ath_prices[symbol]:
-                ath_prices[symbol] = price
-                send_telegram(f"🔥 New ATH for {symbol}: ${price:.6f}")
-        time.sleep(DEX_POLL)
-
-# ================== Swap Reconciliation ==================
-def reconcile_swaps_loop():
-    while True:
-        # Simple example: check if net qty of any token < 0 (oversell)
-        for symbol, data in asset_summary.items():
-            net_qty = data["in"] - data["out"]
-            if net_qty < 0:
-                send_telegram(f"⚠️ Negative net balance detected for {symbol}: {net_qty:.4f}")
-        time.sleep(DEX_POLL)
-
-# ================== Main Threading ==================
-threads = []
-
-wallet_thread = threading.Thread(target=wallet_monitor_loop, daemon=True)
-threads.append(wallet_thread)
-
-discover_thread = threading.Thread(target=discover_pairs_loop, daemon=True)
-threads.append(discover_thread)
-
-intraday_thread = threading.Thread(target=intraday_report_loop, daemon=True)
-threads.append(intraday_thread)
-
-eod_thread = threading.Thread(target=eod_report_loop, daemon=True)
-threads.append(eod_thread)
-
-ath_thread = threading.Thread(target=ath_monitor_loop, daemon=True)
-threads.append(ath_thread)
-
-reconcile_thread = threading.Thread(target=reconcile_swaps_loop, daemon=True)
-threads.append(reconcile_thread)
+# Scheduler
+def start_scheduler():
+    threading.Thread(target=wallet_loop, daemon=True).start()
+    threading.Thread(target=pairs_loop, daemon=True).start()
+    threading.Thread(target=discovery_loop, daemon=True).start()
+    threading.Thread(target=intraday_scheduler, daemon=True).start()
+    threading.Thread(target=eod_scheduler, daemon=True).start()
 
 if __name__ == "__main__":
-    print("Starting full monitor...")
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    aggregates = {}
+    ath_prices = {}
+    recent_txs = deque(maxlen=500)
+    recent_txs_set = set()
+    tracked_pairs = set()
+    start_scheduler()
+    while True:
+        time.sleep(1)
