@@ -53,6 +53,17 @@ INTRADAY_HOURS     = int(os.getenv("INTRADAY_HOURS", "3"))
 EOD_HOUR           = int(os.getenv("EOD_HOUR", "23"))
 EOD_MINUTE         = int(os.getenv("EOD_MINUTE", "59"))
 
+# -------- Discovery Filters (NEW) --------
+DISCOVER_MIN_LIQ_USD       = float(os.getenv("DISCOVER_MIN_LIQ_USD", "30000"))   # default $30k
+DISCOVER_MIN_VOL24_USD     = float(os.getenv("DISCOVER_MIN_VOL24_USD", "5000"))  # default $5k
+DISCOVER_MIN_CHG_H1_PCT    = float(os.getenv("DISCOVER_MIN_CHG_H1_PCT", "10"))   # abs% ≥ 10 in 1h
+DISCOVER_MIN_CHG_H4_PCT    = float(os.getenv("DISCOVER_MIN_CHG_H4_PCT", "10"))   # abs% ≥ 10 in 4h
+DISCOVER_MIN_CHG_H6_PCT    = float(os.getenv("DISCOVER_MIN_CHG_H6_PCT", "10"))   # abs% ≥ 10 in 6h
+DISCOVER_BASE_WHITELIST    = [s.strip().upper() for s in os.getenv("DISCOVER_BASE_WHITELIST", "").split(",") if s.strip()]
+DISCOVER_BASE_BLACKLIST    = [s.strip().upper() for s in os.getenv("DISCOVER_BASE_BLACKLIST", "").split(",") if s.strip()]
+DISCOVER_REQUIRE_WCRO_QUOTE= os.getenv("DISCOVER_REQUIRE_WCRO_QUOTE","false").lower() in ("1","true","yes","on")
+DISCOVER_MAX_PAIR_AGE_HOURS= int(os.getenv("DISCOVER_MAX_PAIR_AGE_HOURS","24"))  # only pairs created in last 24h
+
 # Alerts Monitor (new)
 ALERTS_INTERVAL_MIN       = int(os.getenv("ALERTS_INTERVAL_MIN", "15"))
 DUMP_ALERT_24H_PCT        = float(os.getenv("DUMP_ALERT_24H_PCT", "15.0"))  # -15%
@@ -832,47 +843,169 @@ def monitor_tracked_pairs_loop():
             if shutdown_event.is_set(): break
             time.sleep(1)
 
+def _get_pair_metrics(p: dict):
+    """
+    Extracts safe metrics from a dexscreener search pair object.
+    Returns (base_sym, quote_sym, liq_usd, vol_h24, chg_h1, chg_h4, chg_h6, created_ms, pair_addr, ds_link)
+    """
+    base = (p.get("baseToken") or {})
+    quote= (p.get("quoteToken") or {})
+    base_sym  = (base.get("symbol") or "").upper()
+    quote_sym = (quote.get("symbol") or "").upper()
+
+    liq_usd = 0.0
+    try:
+        liq_usd = float((p.get("liquidity") or {}).get("usd") or 0)
+    except Exception:
+        pass
+
+    vol = p.get("volume") or {}
+    vol_h24 = 0.0
+    try:
+        vol_h24 = float(vol.get("h24") or 0)
+    except Exception:
+        pass
+
+    pc = p.get("priceChange") or {}
+    chg_h1 = float(pc.get("h1") or 0.0) if pc.get("h1") not in (None,"") else 0.0
+    chg_h4 = float(pc.get("h4") or 0.0) if pc.get("h4") not in (None,"") else 0.0
+    chg_h6 = float(pc.get("h6") or 0.0) if pc.get("h6") not in (None,"") else 0.0
+
+    created_ms = p.get("pairCreatedAt") or p.get("pairCreatedAtMs") or 0
+    try:
+        created_ms = int(created_ms)
+    except Exception:
+        created_ms = 0
+
+    pair_addr = p.get("pairAddress") or ""
+    ds_link = f"https://dexscreener.com/cronos/{pair_addr}" if pair_addr else ""
+
+    return base_sym, quote_sym, liq_usd, vol_h24, chg_h1, chg_h4, chg_h6, created_ms, pair_addr, ds_link
+
+
+def _pair_age_hours(created_ms: int) -> float:
+    if not created_ms:
+        return 1e9  # treat as very old if unknown
+    # Dexscreener returns ms since epoch
+    now_ms = int(time.time() * 1000)
+    delta_ms = max(0, now_ms - created_ms)
+    return delta_ms / 1000.0 / 3600.0
+
+
+def passes_discovery_filters(p: dict) -> tuple[bool, str]:
+    """
+    Apply the user-defined discovery filters to a pair object from /search.
+    Returns (True/False, reason_string_when_rejected_or_empty)
+    """
+    base_sym, quote_sym, liq_usd, vol_h24, chg_h1, chg_h4, chg_h6, created_ms, pair_addr, ds_link = _get_pair_metrics(p)
+
+    # chain must be cronos
+    if str(p.get("chainId","")).lower() != "cronos":
+        return (False, "not cronos")
+
+    # require WCRO quote?
+    if DISCOVER_REQUIRE_WCRO_QUOTE and quote_sym not in ("WCRO","CRO"):
+        return (False, f"quote not WCRO: {quote_sym}")
+
+    # whitelist / blacklist on base symbol
+    if DISCOVER_BASE_WHITELIST and base_sym not in DISCOVER_BASE_WHITELIST:
+        return (False, f"base not whitelisted: {base_sym}")
+    if DISCOVER_BASE_BLACKLIST and base_sym in DISCOVER_BASE_BLACKLIST:
+        return (False, f"base blacklisted: {base_sym}")
+
+    # liquidity + volume
+    if liq_usd < DISCOVER_MIN_LIQ_USD:
+        return (False, f"liq ${liq_usd:.0f} < ${DISCOVER_MIN_LIQ_USD:.0f}")
+    if vol_h24 < DISCOVER_MIN_VOL24_USD:
+        return (False, f"vol24 ${vol_h24:.0f} < ${DISCOVER_MIN_VOL24_USD:.0f}")
+
+    # price change thresholds (abs)
+    if (abs(chg_h1) < DISCOVER_MIN_CHG_H1_PCT) and (abs(chg_h4) < DISCOVER_MIN_CHG_H4_PCT) and (abs(chg_h6) < DISCOVER_MIN_CHG_H6_PCT):
+        return (False, f"low change h1/h4/h6: {chg_h1}/{chg_h4}/{chg_h6}")
+
+    # age (max hours)
+    age_h = _pair_age_hours(created_ms)
+    if age_h > DISCOVER_MAX_PAIR_AGE_HOURS:
+        return (False, f"too old: {age_h:.1f}h > {DISCOVER_MAX_PAIR_AGE_HOURS}h")
+
+    return (True, "")
+
 def discovery_loop():
-    # seed from DEX_PAIRS env (optional)
+    # 1) Προαιρετικό seeding από DEX_PAIRS
     seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
     for s in seeds:
         if s.startswith("cronos/"):
             ensure_tracking_pair("cronos", s.split("/",1)[1])
 
-    # seed from TOKENS env (optional)
+    # 2) Προαιρετικό seeding από TOKENS -> resolve top pair
     token_items = [t.strip().lower() for t in (TOKENS or "").split(",") if t.strip()]
     for t in token_items:
-        if not t.startswith("cronos/"): continue
+        if not t.startswith("cronos/"):
+            continue
         _, token_addr = t.split("/", 1)
         pairs = fetch_token_pairs("cronos", token_addr)
         if pairs:
             p = pairs[0]
             pair_addr = p.get("pairAddress")
             if pair_addr:
-                ensure_tracking_pair("cronos", pair_addr, meta=p)
+                ok, reason = passes_discovery_filters(p)
+                if ok:
+                    ensure_tracking_pair("cronos", pair_addr, meta=p)
+                    base_sym, quote_sym, liq_usd, vol_h24, chg_h1, chg_h4, chg_h6, created_ms, pair_addr, ds_link = _get_pair_metrics(p)
+                    send_telegram(
+                        "🆕 *New Candidate (seed)*: "
+                        f"{base_sym}/{quote_sym}\n"
+                        f"💧Liq: ${liq_usd:,.0f} | 📊Vol24: ${vol_h24:,.0f}\n"
+                        f"Δ% 1h:{chg_h1:+.1f} | 4h:{chg_h4:+.1f} | 6h:{chg_h6:+.1f} | Age: {_pair_age_hours(created_ms):.1f}h\n"
+                        f"{ds_link}"
+                    )
+                else:
+                    log.info("Seed pair filtered out: %s (%s)", pair_addr, reason)
 
     if not DISCOVER_ENABLED:
         log.info("Discovery disabled.")
         return
 
-    send_telegram("🧭 Dexscreener auto-discovery enabled (Cronos).")
+    send_telegram("🧭 Dexscreener auto-discovery *with filters* enabled (Cronos).")
+
     while not shutdown_event.is_set():
         try:
             found = fetch_search(DISCOVER_QUERY)
             adopted = 0
-            for p in found or []:
-                if str(p.get("chainId", "")).lower() != "cronos": continue
+            for p in (found or []):
+                ok, reason = passes_discovery_filters(p)
+                if not ok:
+                    # Optional: log.debug to avoid noise
+                    # log.debug("Discovery filtered: %s", reason)
+                    continue
                 pair_addr = p.get("pairAddress")
-                if not pair_addr: continue
+                if not pair_addr:
+                    continue
                 s = slug("cronos", pair_addr)
-                if s in _tracked_pairs: continue
+                if s in _tracked_pairs:
+                    continue
+
                 ensure_tracking_pair("cronos", pair_addr, meta=p)
                 adopted += 1
-                if adopted >= DISCOVER_LIMIT: break
-        except Exception:
-            pass
-        for _ in range(DISCOVER_POLL):
-            if shutdown_event.is_set(): break
+
+                base_sym, quote_sym, liq_usd, vol_h24, chg_h1, chg_h4, chg_h6, created_ms, pair_addr, ds_link = _get_pair_metrics(p)
+                send_telegram(
+                    "🆕 *New Candidate*: "
+                    f"{base_sym}/{quote_sym}\n"
+                    f"💧Liq: ${liq_usd:,.0f} | 📊Vol24: ${vol_h24:,.0f}\n"
+                    f"Δ% 1h:{chg_h1:+.1f} | 4h:{chg_h4:+.1f} | 6h:{chg_h6:+.1f} | Age: {_pair_age_hours(created_ms):.1f}h\n"
+                    f"{ds_link}"
+                )
+
+                if adopted >= DISCOVER_LIMIT:
+                    break
+
+        except Exception as e:
+            log.debug("Discovery error: %s", e)
+
+        for i in range(DISCOVER_POLL):
+            if shutdown_event.is_set():
+                break
             time.sleep(1)
 
 # ----------------------- Wallet snapshot (Cronoscan optional) -----------------------
