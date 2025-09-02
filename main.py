@@ -1006,6 +1006,109 @@ def inline_asset_summary_line(symbol: str, token_addr: str | None) -> str:
         f"• {symbol}: flow ${_format_amount(flow)} | realized ${_format_amount(realized)} | "
         f"today qty {_format_amount(qty)} | price ${_format_price(live_price)}"
     )
+# ----------------------- Per-asset summarize (today, clean) -----------------------
+def summarize_today_per_asset():
+    """
+    Επιστρέφει dict ανά asset με:
+      - symbol, token_addr
+      - qty_in_today, qty_out_today, net_qty_today
+      - usd_in_today, usd_out_today, net_flow_today
+      - realized_today (άθροισμα realized από entries)
+      - price_now, open_qty_now, unreal_now (μόνο αν open_qty_now > 0)
+    Χρησιμοποιεί το _position_qty/_position_cost για το τρέχον open position.
+    Σέβεται tokens με τιμή 0 (π.χ. dead tokens -> value 0).
+    """
+    path = data_file_for_today()
+    data = read_json(path, default={"date": ymd(), "entries": []})
+    entries = data.get("entries", [])
+
+    per = {}
+    # Pass 1: συγκεντρωτικά ανά token-symbol (όπως γράφεται στα entries)
+    for e in entries:
+        tok  = (e.get("token") or "?").upper()
+        addr = e.get("token_addr")
+        amt  = float(e.get("amount") or 0.0)
+        usd  = float(e.get("usd_value") or 0.0)
+        rp   = float(e.get("realized_pnl") or 0.0)
+        pu   = float(e.get("price_usd") or 0.0)
+
+        row = per.setdefault(tok, {
+            "symbol": tok, "token_addr": addr,
+            "qty_in_today": 0.0, "qty_out_today": 0.0, "net_qty_today": 0.0,
+            "usd_in_today": 0.0, "usd_out_today": 0.0, "net_flow_today": 0.0,
+            "realized_today": 0.0,
+            "price_now": None,
+            "open_qty_now": 0.0, "unreal_now": 0.0,
+            "last_seen_price": None
+        })
+
+        if amt > 0:
+            row["qty_in_today"]  += amt
+            row["usd_in_today"]  += usd
+        elif amt < 0:
+            row["qty_out_today"] += (-amt)
+            row["usd_out_today"] += (-usd)
+
+        row["net_qty_today"]  += amt
+        row["net_flow_today"] += usd
+        row["realized_today"] += rp
+
+        # Κράτα τελευταία τιμή που είδαμε στην ημέρα (αν > 0)
+        if pu > 0:
+            row["last_seen_price"] = pu
+
+        # αν δεν έχουμε ήδη token_addr, κράτα το πρώτο non-empty
+        if not row["token_addr"] and addr:
+            row["token_addr"] = addr
+
+    # Pass 2: ζωντανά στοιχεία (τιμή τώρα, open position, unreal)
+    for tok, row in per.items():
+        addr = row["token_addr"]
+
+        # Ποσότητα που κρατάμε τώρα (από global state, όχι μόνο σημερινό)
+        if tok == "CRO":
+            open_qty = float(_position_qty.get("CRO", 0.0))
+            rem_cost = float(_position_cost.get("CRO", 0.0))
+        else:
+            # Το κλειδί για τα globals είναι το addr για ERC20, αλλιώς το symbol
+            key = addr if (isinstance(addr, str) and addr.startswith("0x") and len(addr) == 42) else tok
+            open_qty = float(_position_qty.get(key, 0.0))
+            rem_cost = float(_position_cost.get(key, 0.0))
+
+        row["open_qty_now"] = max(0.0, open_qty)
+
+        # Live τιμή: προτίμησε contract-based αν έχουμε addr
+        price_now = None
+        if tok == "CRO":
+            price_now = get_price_usd("CRO") or 0.0
+        else:
+            if isinstance(addr, str) and addr.startswith("0x") and len(addr) == 42:
+                price_now = get_token_price("cronos", addr)
+                if not price_now:
+                    # fallback: δοκίμασε και generic
+                    price_now = get_price_usd(addr) or 0.0
+            else:
+                price_now = get_price_usd(tok) or 0.0
+
+        # Αν δεν βρήκαμε live τιμή και έχουμε last_seen_price, κράτα την· αλλιώς 0 (dead tokens ok)
+        if (price_now is None or price_now <= 0) and row.get("last_seen_price"):
+            price_now = float(row["last_seen_price"])
+
+        row["price_now"] = float(price_now or 0.0)
+
+        # Unrealized μόνο για open_qty_now > 0 και price_now > 0
+        if row["open_qty_now"] > 0 and row["price_now"] > 0:
+            mtm_now = row["open_qty_now"] * row["price_now"]
+            row["unreal_now"] = mtm_now - rem_cost
+        else:
+            row["unreal_now"] = 0.0
+
+        # Αν το net_qty_today βγει αρνητικό (καθαρές πωλήσεις), δεν το εμφανίζουμε σαν "αρνητικό holding"
+        # Το realized_today το έχουμε ήδη αθροίσει από τα entries.
+        if row["net_qty_today"] < 0:
+            row["net_qty_today"] = 0.0
+
+    return per
 
 # ----------------------- Report builder (daily/intraday) -----------------------
 def build_day_report_text():
@@ -1075,41 +1178,35 @@ def build_day_report_text():
             lines.append(f"  …and {len(breakdown)-15} more.")
     lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
 
-    if per_asset_flow:
+    # --- Per-Asset Summary (Today) with totals ---
+    per = summarize_today_per_asset()
+    if per:
         lines.append("\n*Per-Asset Summary (Today):*")
-        order = sorted(per_asset_flow.items(), key=lambda kv: abs(kv[1]), reverse=True)
-        LIMIT = 12
-        for idx, (tok, flow) in enumerate(order[:LIMIT]):
-            addr = per_asset_token_addr.get(tok)
-            live_price = per_asset_last_price.get(tok)
-            if live_price is None:
-                if tok.upper() == "CRO":
-                    live_price = get_price_usd("CRO") or 0.0
-                elif addr and isinstance(addr, str) and addr.startswith("0x"):
-                    live_price = get_token_price("cronos", addr) or 0.0
-                else:
-                    live_price = get_price_usd(tok) or 0.0
-            amt_sum = per_asset_amt.get(tok, 0.0)
-            real_sum = per_asset_real.get(tok, 0.0)
-            # unreal only for positive open qty (avoid negative carry)
-            unreal_line = ""
-            try:
-                if addr:
-                    rem_qty = _position_qty.get(addr, 0.0)
-                    rem_cost = _position_cost.get(addr, 0.0)
-                else:
-                    rem_qty = _position_qty.get("CRO", 0.0) if tok == "CRO" else 0.0
-                    rem_cost= _position_cost.get("CRO", 0.0) if tok == "CRO" else 0.0
-                if rem_qty > EPSILON:
-                    unreal_val = rem_qty * (live_price or 0.0) - rem_cost
-                    unreal_line = f" | unreal ${_format_amount(unreal_val)}"
-            except Exception:
-                pass
+        # ταξινόμηση με βάση το απόλυτο net_flow_today (μεγαλύτερα πρώτα)
+        order = sorted(per.values(), key=lambda r: abs(r["net_flow_today"]), reverse=True)
+        LIMIT = 15
+        for row in order[:LIMIT]:
+            tok   = row["symbol"]
+            flow  = row["net_flow_today"]
+            rsum  = row["realized_today"]
+            qty_t = row["net_qty_today"]      # καθαρή ποσότητα που προστέθηκε σήμερα (δεν δείχνουμε αρνητικά)
+            px    = row["price_now"]
+            oq    = row["open_qty_now"]
+            unrl  = row["unreal_now"]
 
-            lines.append(
-                f"  • {tok}: flow ${_format_amount(flow)} | realized ${_format_amount(real_sum)} | "
-                f"today qty {_format_amount(amt_sum)} | price ${_format_price(live_price)}{unreal_line}"
-            )
+            # Γραμμή σύνοψης (σήμερα)
+            base = f"  • {tok}: flow ${_format_amount(flow)} | realized ${_format_amount(rsum)}"
+
+            # Αν είχαμε καθαρή προσθήκη σήμερα, δείξ’ την ποσότητα και την τιμή
+            if qty_t > 0:
+                base += f" | today qty {_format_amount(qty_t)} @ ${_format_price(px)}"
+
+            # Αν υπάρχει ανοιχτή θέση τώρα, δείξε και το unrealized
+            if oq > 0:
+                base += f" | open {_format_amount(oq)} @ ${_format_price(px)} | unreal ${_format_amount(unrl)}"
+
+            lines.append(base)
+
         if len(order) > LIMIT:
             lines.append(f"  …and {len(order)-LIMIT} more.")
 
