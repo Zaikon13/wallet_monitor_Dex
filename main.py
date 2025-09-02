@@ -687,6 +687,65 @@ def handle_erc20_tx(t: dict):
 
     realized = _update_cost_basis(token_addr, sign * amount, price)
 
+    # ATH update (αν έχεις helper, κράτα το· αλλιώς άστο έτσι)
+    # try:
+    #     update_ath(token_addr or symbol, price)
+    # except Exception as _e:
+    #     log.debug("ATH update error: %s", _e)
+
+    # Telegram για το ίδιο το trade
+    link = CRONOS_TX.format(txhash=h)
+    try:
+        send_telegram(
+            f"Token TX {'IN' if sign>0 else 'OUT'} {symbol} "
+            f"{_format_amount(sign*amount)} @ ${_format_price(price)} "
+            f"(${_format_amount(usd_value)})\n"
+            f"Hash: {link}\nTime: {dt.strftime('%H:%M:%S')}"
+        )
+    except Exception as _e:
+        log.debug("token-tx telegram error: %s", _e)
+
+    # Καταγραφή στο ημερήσιο ledger
+    entry = {
+        "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "txhash": h,
+        "type": "erc20",
+        "token": symbol,
+        "token_addr": token_addr,
+        "amount": sign * amount,
+        "price_usd": price,
+        "usd_value": usd_value,
+        "realized_pnl": realized,
+        "from": frm,
+        "to": to,
+    }
+    _append_ledger(entry)
+
+    # --- Mini inline summary (immediate feedback) ---
+    try:
+        per = summarize_today_per_asset()  # πρέπει ήδη να υπάρχει στο main.py σου
+        tok_sym = symbol.upper()
+        rec = per.get(tok_sym)
+        if rec:
+            flow      = rec.get("net_flow_today", 0.0)
+            real      = rec.get("realized_today", 0.0)
+            qty_today = rec.get("net_qty_today", 0.0)
+            price_now = rec.get("price_now", 0.0)
+            unreal    = rec.get("unreal_now", 0.0)
+
+            line = (
+                f"📊 *{tok_sym} intraday* | flow ${_format_amount(flow)}"
+                f" | realized ${_format_amount(real)}"
+            )
+            if abs(qty_today) > EPSILON:
+                line += f" | qty {_format_amount(qty_today)} @ ${_format_price(price_now)}"
+            if price_now and abs(unreal) > EPSILON:
+                line += f" | unreal ${_format_amount(unreal)}"
+
+            send_telegram(line)
+    except Exception as _e:
+        log.debug("mini-summary error: %s", _e)
+
     # ATH update
     key = token_addr or symbol
     if price and update_ath(key, price) and cooldown(f"ath_{key}", 900):
