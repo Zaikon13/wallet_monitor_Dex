@@ -410,6 +410,95 @@ PRICE_ALIASES = {
     "tcro": "cro",
 }
 
+# --- Price symbol aliases (normalize symbols to something priced) ---
+PRICE_ALIASES = {
+    "tcro": "cro",   # tCRO -> CRO
+}
+
+# ----------------------- History maps: last non-zero price & contract map -----------------------
+def _build_history_maps():
+    """
+    Γεμίζει:
+      - _HISTORY_LAST_PRICE: τελευταία μη-μηδενική τιμή ανά contract/symbol
+      - symbol_to_contract: αν υπάρχει *μοναδικό* contract για ένα symbol
+    """
+    symbol_to_contract = {}
+    symbol_conflict = set()
+
+    files = []
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception as ex:
+        log.exception("listdir data error: %s", ex)
+
+    files.sort()  # παλιά -> νέα
+
+    for fn in files:
+        data = read_json(os.path.join(DATA_DIR, fn), default=None)
+        if not isinstance(data, dict): 
+            continue
+        for e in data.get("entries", []):
+            sym  = (e.get("token") or "").strip()
+            addr = (e.get("token_addr") or "").strip().lower()
+            p    = float(e.get("price_usd") or 0.0)
+
+            # last non-zero price per key
+            if p > 0:
+                if addr and addr.startswith("0x"):
+                    _HISTORY_LAST_PRICE[addr] = p
+                if sym:
+                    _HISTORY_LAST_PRICE[sym.upper()] = p
+
+            # symbol -> unique contract
+            if sym and addr and addr.startswith("0x"):
+                if sym in symbol_to_contract and symbol_to_contract[sym] != addr:
+                    symbol_conflict.add(sym)
+                else:
+                    symbol_to_contract.setdefault(sym, addr)
+
+    for s in symbol_conflict:
+        symbol_to_contract.pop(s, None)
+
+    return symbol_to_contract
+
+
+def _history_price_fallback(query_key: str, symbol_hint: str = None):
+    """
+    Δίνει τιμή από ιστορικό αν υπάρχει (μη-μηδενική).
+    Δοκιμάζει: exact, aliases (tCRO->CRO), symbol upper().
+    """
+    if not query_key:
+        return None
+    k = query_key.strip()
+    if not k:
+        return None
+
+    # δοκίμασε exact (contract)
+    if k.startswith("0x"):
+        p = _HISTORY_LAST_PRICE.get(k)
+        if p and p > 0:
+            return p
+
+    # δοκίμασε symbol aliases & upper
+    sym = symbol_hint or k
+    sym = (PRICE_ALIASES.get(sym.lower(), sym.lower())).upper()
+    p = _HISTORY_LAST_PRICE.get(sym)
+    if p and p > 0:
+        return p
+
+    # ειδικά για CRO
+    if sym == "CRO":
+        p = _HISTORY_LAST_PRICE.get("CRO")
+        if p and p > 0:
+            return p
+
+    return None
+
+# --- History-derived price cache (symbol/contract -> last non-zero seen) ---
+_HISTORY_LAST_PRICE = {}   # key: "CRO" or "0x..." or symbol upper()
+
 def get_price_usd(symbol_or_addr: str):
     """Generic price by symbol or contract; cached."""
     if not symbol_or_addr: return None
@@ -1034,67 +1123,117 @@ def sum_month_net_flows_and_realized():
 
 # ----------------------- Open positions from history (all days) -----------------------
 def rebuild_open_positions_from_history():
-    """
-    Διαβάζει ΟΛΑ τα transactions_*.json στο /app/data και ανασυνθέτει
-    τις ανοιχτές ποσότητες (positions) ανά asset (contract-first).
-    Γυρίζει dicts: pos_qty, pos_cost  (ό,τι θα είχαμε αν κάναμε cost-basis από την αρχή).
-    """
     pos_qty  = defaultdict(float)
     pos_cost = defaultdict(float)
 
-    def _update(pos_qty, pos_cost, token_key, signed_amount, price_usd):
-        qty = pos_qty[token_key]
-        cost= pos_cost[token_key]
-        if signed_amount > EPSILON:
-            buy_qty = signed_amount
-            pos_qty[token_key]  = qty + buy_qty
-            pos_cost[token_key] = cost + buy_qty * (price_usd or 0.0)
-        elif signed_amount < -EPSILON:
-            sell_qty_req = -signed_amount
-            if qty > EPSILON:
-                sell_qty = min(sell_qty_req, qty)
-                avg_cost = (cost/qty) if qty > EPSILON else (price_usd or 0.0)
-                pos_qty[token_key]  = qty - sell_qty
-                pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
+    symbol_to_contract = _build_history_maps()  # <- χρησιμοποιεί τα αρχεία
 
+    def _update(pos_qty, pos_cost, token_key, signed_amount, price_usd):
+        qty = pos_qty[token_key]; cost = pos_cost[token_key]
+        if signed_amount > EPSILON:
+            pos_qty[token_key]  = qty + signed_amount
+            pos_cost[token_key] = cost + signed_amount * (price_usd or 0.0)
+        elif signed_amount < -EPSILON and qty > EPSILON:
+            sell_qty = min(-signed_amount, qty)
+            avg_cost = (cost/qty) if qty > EPSILON else (price_usd or 0.0)
+            pos_qty[token_key]  = qty - sell_qty
+            pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
+
+    files = []
     try:
-        files = []
         for fn in os.listdir(DATA_DIR):
             if fn.startswith("transactions_") and fn.endswith(".json"):
                 files.append(fn)
-        # ταξινόμηση με χρονολογική σειρά
-        files.sort()
-        for fn in files:
-            data = read_json(os.path.join(DATA_DIR, fn), default=None)
-            if not isinstance(data, dict): continue
-            for e in data.get("entries", []):
-                addr = (e.get("token_addr") or "")
-                sym  = e.get("token") or "?"
-                key  = addr if (addr and addr.startswith("0x")) else ("CRO" if sym=="CRO" else (addr or sym))
-                amt  = float(e.get("amount") or 0.0)
-                pr   = float(e.get("price_usd") or 0.0)
-                _update(pos_qty, pos_cost, key, amt, pr)
     except Exception as ex:
-        log.exception("rebuild_open_positions_from_history error: %s", ex)
+        log.exception("listdir data error: %s", ex)
 
-    # καθάρισμα σχεδόν μηδενικών
+    files.sort()
+    for fn in files:
+        data = read_json(os.path.join(DATA_DIR, fn), default=None)
+        if not isinstance(data, dict): 
+            continue
+        for e in data.get("entries", []):
+            sym_raw  = (e.get("token") or "").strip()
+            addr_raw = (e.get("token_addr") or "").strip().lower()
+            amt  = float(e.get("amount") or 0.0)
+            pr   = float(e.get("price_usd") or 0.0)
+
+            symU = sym_raw.upper() if sym_raw else sym_raw
+            if symU == "TCRO":  # unify tCRO -> CRO
+                symU = "CRO"
+
+            # κλειδί: contract > (unique contract map) > symbol
+            if addr_raw and addr_raw.startswith("0x"):
+                key = addr_raw
+            else:
+                mapped = symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
+                key = mapped if (mapped and mapped.startswith("0x")) else ("CRO" if symU=="CRO" else symU)
+
+            _update(pos_qty, pos_cost, key, amt, pr)
+
     for k, v in list(pos_qty.items()):
         if abs(v) < 1e-10:
             pos_qty[k] = 0.0
     return pos_qty, pos_cost
 
-
 def compute_holdings_usd_from_history_positions():
-    """
-    Χρησιμοποιεί τις *ανακατασκευασμένες* ανοιχτές ποσότητες από το ιστορικό
-    (άρα πιάνει και coins που δεν είχαν πρόσφατο tx στο current runtime).
-    Επιστρέφει (total, breakdown, unrealized) όπως το compute_holdings_usd().
-    """
     pos_qty, pos_cost = rebuild_open_positions_from_history()
 
     total = 0.0
     breakdown = []
     unrealized = 0.0
+
+    def _sym_for_key(key):
+        if key == "CRO": return "CRO"
+        if isinstance(key, str) and key.startswith("0x"):
+            return _token_meta.get(key, {}).get("symbol") or key[:8].upper()
+        return str(key)
+
+    def _price_for(key, sym_hint):
+        p = None
+        if key == "CRO":
+            p = get_price_usd("CRO")
+        elif isinstance(key, str) and key.startswith("0x"):
+            p = get_price_usd(key)
+        else:
+            # aliases εδώ
+            sym_l = PRICE_ALIASES.get(sym_hint.lower(), sym_hint.lower())
+            p = get_price_usd(sym_l)
+        # history fallback αν 0/None
+        if (p is None) or (not p) or (float(p) <= 0):
+            p = _history_price_fallback(key if isinstance(key,str) and key.startswith("0x") else sym_hint, symbol_hint=sym_hint) or 0.0
+        return float(p or 0.0)
+
+    # CRO
+    if pos_qty.get("CRO", 0.0) > EPSILON:
+        amt = pos_qty["CRO"]; p = _price_for("CRO", "CRO"); v = amt*p
+        total += v
+        breakdown.append({"token":"CRO","token_addr":None,"amount":amt,"price_usd":p,"usd_value":v})
+        cost = pos_cost.get("CRO", 0.0)
+        if amt>EPSILON and _nonzero(p): unrealized += (amt*p - cost)
+
+    # others
+    for key, amt in pos_qty.items():
+        if key == "CRO": continue
+        amt = max(0.0, float(amt))
+        if amt <= EPSILON: continue
+        sym = _sym_for_key(key)
+        if sym.upper() == "TCRO": sym = "CRO"
+        p = _price_for(key, sym)
+        v = amt * p
+        total += v
+        breakdown.append({
+            "token": sym,
+            "token_addr": key if (isinstance(key,str) and key.startswith("0x")) else None,
+            "amount": amt,
+            "price_usd": p,
+            "usd_value": v
+        })
+        cost = pos_cost.get(key, 0.0)
+        if amt>EPSILON and _nonzero(p): unrealized += (amt*p - cost)
+
+    breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
+    return total, breakdown, unrealized
 
     def _add_line(token_key, symbol_hint=None):
         nonlocal total, unrealized
@@ -1501,6 +1640,12 @@ def main():
     log.info("DISCOVER_ENABLED: %s | DISCOVER_QUERY: %s", DISCOVER_ENABLED, DISCOVER_QUERY)
     log.info("TZ: %s | INTRADAY_HOURS: %s | EOD: %02d:%02d", TZ, INTRADAY_HOURS, EOD_HOUR, EOD_MINUTE)
     log.info("Alerts interval: %sm | Wallet 24h dump/pump: %s/%s", ALERTS_INTERVAL_MIN, DUMP_ALERT_24H_PCT, PUMP_ALERT_24H_PCT)
+
+    try:
+        _ = _build_history_maps()
+        log.info("History maps initialized. Last-price cache: %s keys", len(_HISTORY_LAST_PRICE))
+    except Exception as e:
+        log.warning("History maps init failed: %s", e)
 
     threads = []
     threads.append(run_with_restart(wallet_monitor_loop, "wallet_monitor"))
