@@ -788,7 +788,6 @@ def _format_wallet_assets_message():
         for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
             lines.append(f"  – {sym}: {_format_amount(amt)}")
     return "\n".join(lines)
-
 def handle_native_tx(tx: dict):
     h = tx.get("hash")
     if not h or h in _seen_tx_hashes: return
