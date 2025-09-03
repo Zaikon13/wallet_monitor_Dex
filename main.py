@@ -318,34 +318,35 @@ def _norm_cmd(text: str) -> str:
 
 def _format_wallet_assets_message():
     """
-    Δημιουργεί μήνυμα για τα assets σου:
-    - Balances ανά token
-    - Live price (USD)
-    - Value (USD)
-    - Σύνολο & Unrealized PnL (open positions)
+    Δείχνει ΟΛΑ τα assets:
+    - Προτίμηση σε ανακατασκευή από ιστορικό (συμπεριλαμβάνει coins χωρίς πρόσφατο tx)
+    - Συντηρεί unrealized PnL σωστά (cost-basis από όλο το ιστορικό)
+    - Προσθέτει και γρήγορο runtime snapshot ποσοτήτων
     """
-    total, breakdown, unrealized = compute_holdings_usd()
+    total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+    if not breakdown:
+        # fallback σε runtime αν για κάποιο λόγο δεν βρέθηκε ιστορικό
+        total, breakdown, unrealized = compute_holdings_usd()
+
     if not breakdown:
         return "📦 Δεν βρέθηκαν θετικά balances αυτή τη στιγμή."
 
     lines = ["*💼 Wallet Assets (MTM):*"]
-    # ταξινόμηση με βάση την αξία
-    breakdown_sorted = sorted(breakdown, key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
-    for b in breakdown_sorted:
+    for b in breakdown:
         tok = b["token"]
         amt = b["amount"]
         pr  = b["price_usd"] or 0.0
         val = b["usd_value"] or 0.0
-        lines.append(f"• *{tok}*: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
+        lines.append(f"• {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
 
     lines.append(f"\n*Σύνολο:* ${_format_amount(total)}")
     if _nonzero(unrealized):
         lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
 
-    # Προσθήκη γρήγορου snapshot από το runtime (μόνο ποσότητες)
+    # Προσθήκη γρήγορου snapshot (runtime μόνο ποσότητες)
     snap = get_wallet_balances_snapshot()
     if snap:
-        lines.append("\n_Quantities snapshot:_")
+        lines.append("\n_Quantities snapshot (runtime):_")
         for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
             lines.append(f"  – {sym}: {_format_amount(amt)}")
 
@@ -405,10 +406,16 @@ def _pairs_for_token_addr(addr: str):
         pairs = data.get("pairs") or []
     return pairs
 
+PRICE_ALIASES = {
+    "tcro": "cro",
+}
+
 def get_price_usd(symbol_or_addr: str):
     """Generic price by symbol or contract; cached."""
     if not symbol_or_addr: return None
     key = symbol_or_addr.strip().lower()
+    # aliases για σύμβολα χωρίς απευθείας τιμή
+    key = PRICE_ALIASES.get(key, key)
     now_ts = time.time()
     cached = PRICE_CACHE.get(key)
     if cached and (now_ts - cached[1] < PRICE_CACHE_TTL):
@@ -1024,6 +1031,115 @@ def sum_month_net_flows_and_realized():
     except Exception:
         pass
     return total_flow, total_real
+
+# ----------------------- Open positions from history (all days) -----------------------
+def rebuild_open_positions_from_history():
+    """
+    Διαβάζει ΟΛΑ τα transactions_*.json στο /app/data και ανασυνθέτει
+    τις ανοιχτές ποσότητες (positions) ανά asset (contract-first).
+    Γυρίζει dicts: pos_qty, pos_cost  (ό,τι θα είχαμε αν κάναμε cost-basis από την αρχή).
+    """
+    pos_qty  = defaultdict(float)
+    pos_cost = defaultdict(float)
+
+    def _update(pos_qty, pos_cost, token_key, signed_amount, price_usd):
+        qty = pos_qty[token_key]
+        cost= pos_cost[token_key]
+        if signed_amount > EPSILON:
+            buy_qty = signed_amount
+            pos_qty[token_key]  = qty + buy_qty
+            pos_cost[token_key] = cost + buy_qty * (price_usd or 0.0)
+        elif signed_amount < -EPSILON:
+            sell_qty_req = -signed_amount
+            if qty > EPSILON:
+                sell_qty = min(sell_qty_req, qty)
+                avg_cost = (cost/qty) if qty > EPSILON else (price_usd or 0.0)
+                pos_qty[token_key]  = qty - sell_qty
+                pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
+
+    try:
+        files = []
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+        # ταξινόμηση με χρονολογική σειρά
+        files.sort()
+        for fn in files:
+            data = read_json(os.path.join(DATA_DIR, fn), default=None)
+            if not isinstance(data, dict): continue
+            for e in data.get("entries", []):
+                addr = (e.get("token_addr") or "")
+                sym  = e.get("token") or "?"
+                key  = addr if (addr and addr.startswith("0x")) else ("CRO" if sym=="CRO" else (addr or sym))
+                amt  = float(e.get("amount") or 0.0)
+                pr   = float(e.get("price_usd") or 0.0)
+                _update(pos_qty, pos_cost, key, amt, pr)
+    except Exception as ex:
+        log.exception("rebuild_open_positions_from_history error: %s", ex)
+
+    # καθάρισμα σχεδόν μηδενικών
+    for k, v in list(pos_qty.items()):
+        if abs(v) < 1e-10:
+            pos_qty[k] = 0.0
+    return pos_qty, pos_cost
+
+
+def compute_holdings_usd_from_history_positions():
+    """
+    Χρησιμοποιεί τις *ανακατασκευασμένες* ανοιχτές ποσότητες από το ιστορικό
+    (άρα πιάνει και coins που δεν είχαν πρόσφατο tx στο current runtime).
+    Επιστρέφει (total, breakdown, unrealized) όπως το compute_holdings_usd().
+    """
+    pos_qty, pos_cost = rebuild_open_positions_from_history()
+
+    total = 0.0
+    breakdown = []
+    unrealized = 0.0
+
+    def _add_line(token_key, symbol_hint=None):
+        nonlocal total, unrealized
+        amt = max(0.0, float(pos_qty.get(token_key, 0.0)))
+        if amt <= EPSILON:
+            return
+        # symbol & price lookup
+        sym = symbol_hint or _token_meta.get(token_key, {}).get("symbol")
+        if not sym:
+            if token_key == "CRO": sym = "CRO"
+            elif isinstance(token_key, str) and token_key.startswith("0x"): sym = (token_key[:8])
+            else: sym = str(token_key)
+
+        # price: προτίμηση contract κλειδί
+        if token_key == "CRO":
+            price = get_price_usd("CRO") or 0.0
+        elif isinstance(token_key, str) and token_key.startswith("0x"):
+            price = get_price_usd(token_key) or 0.0
+        else:
+            price = get_price_usd(sym) or 0.0
+
+        val = amt * (price or 0.0)
+        total += val
+        breakdown.append({
+            "token": sym,
+            "token_addr": token_key if (isinstance(token_key,str) and token_key.startswith("0x")) else None,
+            "amount": amt,
+            "price_usd": price or 0.0,
+            "usd_value": val
+        })
+
+        cost = float(pos_cost.get(token_key, 0.0))
+        if amt > EPSILON and _nonzero(price):
+            unrealized += (amt * price - cost)
+
+    # CRO
+    _add_line("CRO", symbol_hint="CRO")
+    # όλα τα υπόλοιπα keys
+    for k in list(pos_qty.keys()):
+        if k == "CRO": continue
+        _add_line(k)
+
+    # ταξινόμηση κατά αξία
+    breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
+    return total, breakdown, unrealized
 
 # ----------------------- Per-asset summarize (today, clean) -----------------------
 def summarize_today_per_asset():
