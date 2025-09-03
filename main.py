@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py - Wallet Monitor για Cronos (Etherscan v2 Multichain) + Dexscreener
+main.py - Wallet Monitor για Cronos (Etherscan v2 Multichain) + Dexscreener + Web3 RPC
 - Auto-discovery με φίλτρα (liq/vol/change/age), auto-adopt pairs
 - PnL (realized & unrealized) + σωστό aggregation ανά asset (contract-first)
 - Intraday/EOD reports, mini-summary σε κάθε buy/sell
@@ -11,45 +11,8 @@ main.py - Wallet Monitor για Cronos (Etherscan v2 Multichain) + Dexscreener
   * 24h pump/dump για ΟΛΑ τα assets που κρατάς (interval 15’)
   * Guard μετά από κάθε buy: +pump/-dump/trailing από peak
 - Rate-limit & retry/backoff για 404/429
-- Χωρίς εξάρτηση από Cronoscan (προαιρετικό, απενεργοποιημένο by default)
-
-ENV που χρησιμοποιεί:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  WALLET_ADDRESS, ETHERSCAN_API
-  # Προαιρετικά (auto-discovery):
-  DISCOVER_ENABLED=true|false
-  DISCOVER_QUERY=cronos
-  DISCOVER_LIMIT=10
-  DISCOVER_POLL=120
-  DISCOVER_MIN_LIQ_USD=30000
-  DISCOVER_MIN_VOL24_USD=5000
-  DISCOVER_MIN_ABS_CHANGE_PCT=10
-  DISCOVER_MAX_PAIR_AGE_HOURS=24
-  DISCOVER_REQUIRE_WCRO=true|false
-  DISCOVER_BASE_WHITELIST= (comma symbols)
-  DISCOVER_BASE_BLACKLIST= (comma symbols)
-  # Reports:
-  TZ=Europe/Athens
-  INTRADAY_HOURS=3
-  EOD_HOUR=23
-  EOD_MINUTE=59
-  # Dex monitor thresholds:
-  PRICE_WINDOW=3
-  PRICE_MOVE_THRESHOLD=5
-  SPIKE_THRESHOLD=8
-  MIN_VOLUME_FOR_ALERT=0
-  # Alerts (24h wallet):
-  ALERTS_INTERVAL_MIN=15
-  DUMP_ALERT_24H_PCT=-15
-  PUMP_ALERT_24H_PCT=20
-  # Guard μετά από buy:
-  GUARD_WINDOW_MIN=60
-  GUARD_PUMP_PCT=20
-  GUARD_DROP_PCT=-12
-  GUARD_TRAIL_DROP_PCT=-8
-  # Optional seeds:
-  TOKENS=cronos/0x...,cronos/0x...
-  DEX_PAIRS=cronos/0x...,cronos/0x...
+- Χωρίς εξάρτηση από Cronoscan snapshot
+- **NEW**: Web3 RPC snapshot για να βλέπεις ΟΛΑ τα assets (ERC20 balanceOf + native CRO)
 """
 
 import os, sys, time, json, signal, threading, logging
@@ -66,6 +29,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID") or ""
 WALLET_ADDRESS     = (os.getenv("WALLET_ADDRESS") or "").lower()
 ETHERSCAN_API      = os.getenv("ETHERSCAN_API") or ""
+
+# Web3 RPC
+CRONOS_RPC_URL     = os.getenv("CRONOS_RPC_URL") or ""
+LOG_SCAN_BLOCKS    = int(os.getenv("LOG_SCAN_BLOCKS", "200000"))  # ~range πίσω
+LOG_SCAN_CHUNK     = int(os.getenv("LOG_SCAN_CHUNK", "5000"))     # chunk ανά κλήση logs
 
 # Optional seeds (still supported)
 TOKENS      = os.getenv("TOKENS", "")         # e.g. "cronos/0xabc,cronos/0xdef"
@@ -84,8 +52,6 @@ DISCOVER_ENABLED  = (os.getenv("DISCOVER_ENABLED","true").lower() in ("1","true"
 DISCOVER_QUERY    = os.getenv("DISCOVER_QUERY","cronos")
 DISCOVER_LIMIT    = int(os.getenv("DISCOVER_LIMIT","10"))
 DISCOVER_POLL     = int(os.getenv("DISCOVER_POLL","120"))
-
-# Discovery Filters (NEW)
 DISCOVER_MIN_LIQ_USD       = float(os.getenv("DISCOVER_MIN_LIQ_USD","30000"))
 DISCOVER_MIN_VOL24_USD     = float(os.getenv("DISCOVER_MIN_VOL24_USD","5000"))
 DISCOVER_MIN_ABS_CHANGE_PCT= float(os.getenv("DISCOVER_MIN_ABS_CHANGE_PCT","10"))
@@ -131,10 +97,10 @@ logging.basicConfig(
 log = logging.getLogger("wallet-monitor")
 
 # ----------------------- HTTP session -----------------------
+import requests
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent":"Mozilla/5.0 (X11; Linux x86_64)"})
 
-# simple rate-limiting & retry
 _last_req_ts = 0.0
 REQS_PER_SEC = 5
 MIN_GAP = 1.0 / REQS_PER_SEC
@@ -151,7 +117,6 @@ def safe_json(r):
 def safe_get(url, params=None, timeout=12, retries=3, backoff=1.5):
     global _last_req_ts
     for i in range(retries):
-        # rate-limit
         gap = time.time() - _last_req_ts
         if gap < MIN_GAP:
             time.sleep(MIN_GAP - gap)
@@ -163,7 +128,6 @@ def safe_get(url, params=None, timeout=12, retries=3, backoff=1.5):
             if resp.status_code in (404, 429, 502, 503):
                 time.sleep(backoff * (i+1))
                 continue
-            # other codes: break
             return resp
         except Exception:
             time.sleep(backoff * (i+1))
@@ -282,75 +246,9 @@ def send_telegram(message: str) -> bool:
         log.exception("send_telegram exception: %s", e)
         return False
 
-# ----------------------- Telegram commands (getUpdates) -----------------------
-_TELEGRAM_UPDATE_OFFSET = 0
-
-def _tg_get_updates(timeout=20):
-    """Long-poll Telegram getUpdates with offset."""
-    global _TELEGRAM_UPDATE_OFFSET
-    if not TELEGRAM_BOT_TOKEN:
-        return []
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {
-        "timeout": timeout,
-        "offset": _TELEGRAM_UPDATE_OFFSET + 1,
-        "allowed_updates": json.dumps(["message"])
-    }
-    r = safe_get(url, params=params, timeout=timeout+5, retries=2)
-    data = safe_json(r) or {}
-    results = data.get("result") or []
-    # advance offset
-    for upd in results:
-        upd_id = upd.get("update_id")
-        if isinstance(upd_id, int) and upd_id > _TELEGRAM_UPDATE_OFFSET:
-            _TELEGRAM_UPDATE_OFFSET = upd_id
-    return results
-
-def _norm_cmd(text: str) -> str:
-    """Normalizes the text to catch '/show wallet assets' variations."""
-    if not text:
-        return ""
-    t = text.strip().lower()
-    # unify variants
-    if t in ("/show wallet assets", "/show_wallet_assets", "/showwalletassets"):
-        return "/show_wallet_assets"
-    return t
-
-def _format_wallet_assets_message():
-    """
-    Δείχνει ΟΛΑ τα assets:
-    - Προτίμηση σε ανακατασκευή από ιστορικό (συμπεριλαμβάνει coins χωρίς πρόσφατο tx)
-    - Συντηρεί unrealized PnL σωστά (cost-basis από όλο το ιστορικό)
-    - Προσθέτει και γρήγορο runtime snapshot ποσοτήτων
-    """
-    total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
-    if not breakdown:
-        # fallback σε runtime αν για κάποιο λόγο δεν βρέθηκε ιστορικό
-        total, breakdown, unrealized = compute_holdings_usd()
-
-    if not breakdown:
-        return "📦 Δεν βρέθηκαν θετικά balances αυτή τη στιγμή."
-
-    lines = ["*💼 Wallet Assets (MTM):*"]
-    for b in breakdown:
-        tok = b["token"]
-        amt = b["amount"]
-        pr  = b["price_usd"] or 0.0
-        val = b["usd_value"] or 0.0
-        lines.append(f"• {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
-
-    lines.append(f"\n*Σύνολο:* ${_format_amount(total)}")
-    if _nonzero(unrealized):
-        lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
-
-    # Προσθήκη γρήγορου snapshot (runtime μόνο ποσότητες)
-    snap = get_wallet_balances_snapshot()
-    if snap:
-        lines.append("\n_Quantities snapshot (runtime):_")
-        for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
-            lines.append(f"  – {sym}: {_format_amount(amt)}")
-
-    return "\n".join(lines)
+# ----------------------- Price symbol aliases & history-derived price cache -----------------------
+PRICE_ALIASES = { "tcro": "cro" }  # tCRO -> CRO
+_HISTORY_LAST_PRICE = {}           # symbol/contract -> last non-zero price seen in history
 
 # ----------------------- ATH persistence -----------------------
 def load_ath():
@@ -369,9 +267,8 @@ def update_ath(key: str, live_price: float):
         save_ath()
         send_telegram(f"🏆 New ATH {key}: ${_format_price(live_price)}")
 
-# ----------------------- Price helpers -----------------------
+# ----------------------- Dex price helpers -----------------------
 def _pick_best_price(pairs):
-    """Pick best USD price by highest liquidity."""
     if not pairs: return None
     best = None
     best_liq = -1.0
@@ -390,7 +287,6 @@ def _pick_best_price(pairs):
     return best
 
 def _pairs_for_token_addr(addr: str):
-    # try /tokens/chain/addr → /tokens/addr → search
     url1 = f"{DEX_BASE_TOKENS}/cronos/{addr}"
     r = safe_get(url1, timeout=10)
     data = safe_json(r) or {}
@@ -406,106 +302,14 @@ def _pairs_for_token_addr(addr: str):
         pairs = data.get("pairs") or []
     return pairs
 
-PRICE_ALIASES = {
-    "tcro": "cro",
-}
-
-# --- Price symbol aliases (normalize symbols to something priced) ---
-PRICE_ALIASES = {
-    "tcro": "cro",   # tCRO -> CRO
-}
-
-# ----------------------- History maps: last non-zero price & contract map -----------------------
-def _build_history_maps():
-    """
-    Γεμίζει:
-      - _HISTORY_LAST_PRICE: τελευταία μη-μηδενική τιμή ανά contract/symbol
-      - symbol_to_contract: αν υπάρχει *μοναδικό* contract για ένα symbol
-    """
-    symbol_to_contract = {}
-    symbol_conflict = set()
-
-    files = []
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"):
-                files.append(fn)
-    except Exception as ex:
-        log.exception("listdir data error: %s", ex)
-
-    files.sort()  # παλιά -> νέα
-
-    for fn in files:
-        data = read_json(os.path.join(DATA_DIR, fn), default=None)
-        if not isinstance(data, dict): 
-            continue
-        for e in data.get("entries", []):
-            sym  = (e.get("token") or "").strip()
-            addr = (e.get("token_addr") or "").strip().lower()
-            p    = float(e.get("price_usd") or 0.0)
-
-            # last non-zero price per key
-            if p > 0:
-                if addr and addr.startswith("0x"):
-                    _HISTORY_LAST_PRICE[addr] = p
-                if sym:
-                    _HISTORY_LAST_PRICE[sym.upper()] = p
-
-            # symbol -> unique contract
-            if sym and addr and addr.startswith("0x"):
-                if sym in symbol_to_contract and symbol_to_contract[sym] != addr:
-                    symbol_conflict.add(sym)
-                else:
-                    symbol_to_contract.setdefault(sym, addr)
-
-    for s in symbol_conflict:
-        symbol_to_contract.pop(s, None)
-
-    return symbol_to_contract
-
-
-def _history_price_fallback(query_key: str, symbol_hint: str = None):
-    """
-    Δίνει τιμή από ιστορικό αν υπάρχει (μη-μηδενική).
-    Δοκιμάζει: exact, aliases (tCRO->CRO), symbol upper().
-    """
-    if not query_key:
-        return None
-    k = query_key.strip()
-    if not k:
-        return None
-
-    # δοκίμασε exact (contract)
-    if k.startswith("0x"):
-        p = _HISTORY_LAST_PRICE.get(k)
-        if p and p > 0:
-            return p
-
-    # δοκίμασε symbol aliases & upper
-    sym = symbol_hint or k
-    sym = (PRICE_ALIASES.get(sym.lower(), sym.lower())).upper()
-    p = _HISTORY_LAST_PRICE.get(sym)
-    if p and p > 0:
-        return p
-
-    # ειδικά για CRO
-    if sym == "CRO":
-        p = _HISTORY_LAST_PRICE.get("CRO")
-        if p and p > 0:
-            return p
-
-    return None
-
-# --- History-derived price cache (symbol/contract -> last non-zero seen) ---
-_HISTORY_LAST_PRICE = {}   # key: "CRO" or "0x..." or symbol upper()
-
 def get_price_usd(symbol_or_addr: str):
-    """Generic price by symbol or contract; cached."""
     if not symbol_or_addr: return None
     key = symbol_or_addr.strip().lower()
-    # aliases για σύμβολα χωρίς απευθείας τιμή
-    key = PRICE_ALIASES.get(key, key)
     now_ts = time.time()
+
+    # aliases
+    key = PRICE_ALIASES.get(key, key)
+
     cached = PRICE_CACHE.get(key)
     if cached and (now_ts - cached[1] < PRICE_CACHE_TTL):
         return cached[0]
@@ -513,7 +317,6 @@ def get_price_usd(symbol_or_addr: str):
     price = None
     try:
         if key in ("cro","wcro","w-cro","wrappedcro","wrapped cro"):
-            # search CRO/WCRO vs USDT
             r = safe_get(DEX_BASE_SEARCH, params={"q":"wcro usdt"}, timeout=10)
             data = safe_json(r) or {}
             price = _pick_best_price(data.get("pairs"))
@@ -524,24 +327,39 @@ def get_price_usd(symbol_or_addr: str):
         elif key.startswith("0x") and len(key)==42:
             price = _pick_best_price(_pairs_for_token_addr(key))
         else:
-            # symbol search and symbol+usdt
-            r = safe_get(DEX_BASE_SEARCH, params={"q":key}, timeout=10)
+            # multiple fallbacks for symbols
+            candidates = []
+            r = safe_get(DEX_BASE_SEARCH, params={"q": key}, timeout=10)
             data = safe_json(r) or {}
-            price = _pick_best_price(data.get("pairs"))
-            if not price and len(key)<=8:
-                r = safe_get(DEX_BASE_SEARCH, params={"q":f"{key} usdt"}, timeout=10)
+            candidates.append(_pick_best_price(data.get("pairs")))
+
+            if len(key) <= 12:
+                r = safe_get(DEX_BASE_SEARCH, params={"q": f"{key} usdt"}, timeout=10)
                 data = safe_json(r) or {}
-                price = _pick_best_price(data.get("pairs"))
+                candidates.append(_pick_best_price(data.get("pairs")))
+                r = safe_get(DEX_BASE_SEARCH, params={"q": f"{key} wcro"}, timeout=10)
+                data = safe_json(r) or {}
+                candidates.append(_pick_best_price(data.get("pairs")))
+
+            for c in candidates:
+                try:
+                    if c and float(c) > 0:
+                        price = float(c); break
+                except Exception:
+                    continue
     except Exception:
         price = None
+
+    # history fallback
+    if (price is None) or (not price) or (float(price) <= 0):
+        hist = _history_price_fallback(symbol_or_addr, symbol_hint=symbol_or_addr)
+        if hist and hist > 0:
+            price = float(hist)
 
     PRICE_CACHE[key] = (price, now_ts)
     return price
 
 def get_change_and_price_for_symbol_or_addr(sym_or_addr: str):
-    """
-    Return tuple (priceUsd, change24h, change2h) using best Cronos pair found.
-    """
     pairs = []
     if sym_or_addr.lower().startswith("0x") and len(sym_or_addr)==42:
         pairs = _pairs_for_token_addr(sym_or_addr)
@@ -549,26 +367,22 @@ def get_change_and_price_for_symbol_or_addr(sym_or_addr: str):
         r = safe_get(DEX_BASE_SEARCH, params={"q": sym_or_addr}, timeout=10)
         data = safe_json(r) or {}
         pairs = data.get("pairs") or []
-    # pick best
     best = None
     best_liq = -1.0
     for p in pairs:
         try:
-            if str(p.get("chainId","")).lower() != "cronos":
-                continue
+            if str(p.get("chainId","")).lower() != "cronos": continue
             liq = float((p.get("liquidity") or {}).get("usd") or 0)
             price = float(p.get("priceUsd") or 0)
             if price <= 0: continue
             if liq > best_liq:
-                best_liq = liq
-                best = p
+                best_liq = liq; best = p
         except Exception:
             continue
     if not best:
-        return (None, None, None, None)  # price, ch24, ch2h, ds_url
+        return (None, None, None, None)
     price = float(best.get("priceUsd") or 0)
-    ch24 = None
-    ch2h = None
+    ch24 = None; ch2h = None
     try:
         ch = best.get("priceChange") or {}
         if "h24" in ch: ch24 = float(ch.get("h24"))
@@ -661,7 +475,320 @@ def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float):
     _realized_pnl_today += realized
     return realized
 
-# ----------------------- Handlers -----------------------
+# ----------------------- History maps (prices & contract map) -----------------------
+def _build_history_maps():
+    symbol_to_contract = {}
+    symbol_conflict = set()
+    files = []
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception as ex:
+        log.exception("listdir data error: %s", ex)
+    files.sort()
+    for fn in files:
+        data = read_json(os.path.join(DATA_DIR, fn), default=None)
+        if not isinstance(data, dict): continue
+        for e in data.get("entries", []):
+            sym  = (e.get("token") or "").strip()
+            addr = (e.get("token_addr") or "").strip().lower()
+            p    = float(e.get("price_usd") or 0.0)
+            if p > 0:
+                if addr and addr.startswith("0x"):
+                    _HISTORY_LAST_PRICE[addr] = p
+                if sym:
+                    _HISTORY_LAST_PRICE[sym.upper()] = p
+            if sym and addr and addr.startswith("0x"):
+                if sym in symbol_to_contract and symbol_to_contract[sym] != addr:
+                    symbol_conflict.add(sym)
+                else:
+                    symbol_to_contract.setdefault(sym, addr)
+    for s in symbol_conflict:
+        symbol_to_contract.pop(s, None)
+    return symbol_to_contract
+
+def _history_price_fallback(query_key: str, symbol_hint: str = None):
+    if not query_key: return None
+    k = query_key.strip()
+    if not k: return None
+    if k.startswith("0x"):
+        p = _HISTORY_LAST_PRICE.get(k)
+        if p and p > 0: return p
+    sym = symbol_hint or k
+    sym = (PRICE_ALIASES.get(sym.lower(), sym.lower())).upper()
+    p = _HISTORY_LAST_PRICE.get(sym)
+    if p and p > 0: return p
+    if sym == "CRO":
+        p = _HISTORY_LAST_PRICE.get("CRO")
+        if p and p > 0: return p
+    return None
+
+# ----------------------- Web3 RPC (Cronos) -----------------------
+WEB3 = None
+ERC20_ABI_MIN = [
+    {"constant": True, "inputs": [{"name":"owner","type":"address"}], "name":"balanceOf","outputs":[{"name":"","type":"uint256"}], "type":"function"},
+    {"constant": True, "inputs": [], "name":"decimals","outputs":[{"name":"","type":"uint8"}], "type":"function"},
+    {"constant": True, "inputs": [], "name":"symbol","outputs":[{"name":"","type":"string"}], "type":"function"},
+]
+
+def rpc_init():
+    global WEB3
+    if not CRONOS_RPC_URL:
+        log.warning("CRONOS_RPC_URL not set; RPC discovery disabled.")
+        return False
+    try:
+        from web3 import Web3
+        WEB3 = Web3(Web3.HTTPProvider(CRONOS_RPC_URL, request_kwargs={"timeout": 15}))
+        ok = WEB3.is_connected()
+        if not ok:
+            log.warning("Web3 not connected.")
+        return ok
+    except Exception as e:
+        log.exception("web3 init error: %s", e)
+        return False
+
+def rpc_block_number():
+    try:
+        return WEB3.eth.block_number if WEB3 else None
+    except Exception:
+        return None
+
+def rpc_get_native_balance(addr: str):
+    try:
+        wei = WEB3.eth.get_balance(addr)
+        return float(wei) / (10**18)
+    except Exception:
+        return 0.0
+
+_rpc_sym_cache = {}
+_rpc_dec_cache = {}
+
+def rpc_get_symbol_decimals(contract: str):
+    if contract in _rpc_sym_cache and contract in _rpc_dec_cache:
+        return _rpc_sym_cache[contract], _rpc_dec_cache[contract]
+    try:
+        c = WEB3.eth.contract(address=WEB3.to_checksum_address(contract), abi=ERC20_ABI_MIN)
+        sym = c.functions.symbol().call()
+        dec = int(c.functions.decimals().call())
+        _rpc_sym_cache[contract] = sym
+        _rpc_dec_cache[contract] = dec
+        return sym, dec
+    except Exception:
+        # fallback
+        _rpc_sym_cache[contract] = contract[:8].upper()
+        _rpc_dec_cache[contract] = 18
+        return _rpc_sym_cache[contract], _rpc_dec_cache[contract]
+
+def rpc_get_erc20_balance(contract: str, owner: str):
+    try:
+        c = WEB3.eth.contract(address=WEB3.to_checksum_address(contract), abi=ERC20_ABI_MIN)
+        bal = c.functions.balanceOf(WEB3.to_checksum_address(owner)).call()
+        _, dec = rpc_get_symbol_decimals(contract)
+        return float(bal) / (10**dec)
+    except Exception:
+        return 0.0
+
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"  # ERC20 Transfer
+
+def rpc_discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: int):
+    """
+    Σαρώνει Transfer logs to/from 'owner' στα τελευταία N blocks
+    και επιστρέφει σύνολο από ERC20 contracts που τον αφορούν.
+    """
+    if not WEB3: return set()
+    latest = rpc_block_number()
+    if not latest: return set()
+    start = max(1, latest - max(1, blocks_back))
+    found = set()
+    try:
+        owner_topic = "0x" + "0"*24 + owner.lower().replace("0x","")
+        for from_block in range(start, latest+1, chunk):
+            to_block = min(latest, from_block + chunk - 1)
+            # logs where owner is sender (topic1) OR recipient (topic2)
+            for topics in [[TRANSFER_TOPIC, owner_topic], [TRANSFER_TOPIC, None, owner_topic]]:
+                try:
+                    logs = WEB3.eth.get_logs({
+                        "fromBlock": from_block,
+                        "toBlock": to_block,
+                        "topics": topics
+                    })
+                    for lg in logs:
+                        addr = lg.get("address")
+                        if addr:
+                            found.add(addr.lower())
+                except Exception:
+                    # ignore chunk errors, continue
+                    continue
+    except Exception as e:
+        log.debug("rpc_discover_token_contracts_by_logs error: %s", e)
+    return found
+
+# ----------------------- RPC-powered assets snapshot -----------------------
+def gather_all_known_token_contracts():
+    """
+    Ενώνει συμβόλαια από:
+    - runtime _token_meta
+    - ιστορικό (contract-first mapping)
+    - Etherscan tokentx (latest)
+    - RPC logs (last LOG_SCAN_BLOCKS)
+    - TOKENS seeds από .env
+    """
+    known = set()
+
+    # runtime
+    for k in list(_token_meta.keys()):
+        if isinstance(k,str) and k.startswith("0x"):
+            known.add(k.lower())
+
+    # history
+    symbol_to_contract = _build_history_maps()
+    for addr in symbol_to_contract.values():
+        if addr and addr.startswith("0x"):
+            known.add(addr.lower())
+
+    # etherscan latest tokentx
+    try:
+        toks = fetch_latest_token_txs(limit=100)
+        for t in toks:
+            addr = (t.get("contractAddress") or "").lower()
+            if addr.startswith("0x"): known.add(addr)
+    except Exception:
+        pass
+
+    # RPC logs
+    try:
+        rpc_ok = rpc_init()
+        if rpc_ok:
+            rpc_found = rpc_discover_token_contracts_by_logs(WALLET_ADDRESS, LOG_SCAN_BLOCKS, LOG_SCAN_CHUNK)
+            known |= set(rpc_found or [])
+    except Exception:
+        pass
+
+    # Seeds from .env
+    for item in [x.strip().lower() for x in TOKENS.split(",") if x.strip()]:
+        if item.startswith("cronos/"):
+            _, addr = item.split("/",1)
+            if addr.startswith("0x"):
+                known.add(addr)
+
+    return known
+
+def compute_holdings_usd_via_rpc():
+    """
+    Snapshot *όλων* των assets από RPC:
+    - Native CRO (eth_getBalance)
+    - Όλα τα ERC20 που βρέθηκαν από gather_all_known_token_contracts()
+    - Τιμές από Dexscreener (contract) με fallbacks ιστορικού
+    """
+    total = 0.0
+    breakdown = []
+    unrealized = 0.0
+
+    # Make sure history maps are ready (for price fallback)
+    _ = _build_history_maps()
+
+    # CRO
+    cro_amt = 0.0
+    if rpc_init():
+        try:
+            cro_amt = rpc_get_native_balance(WALLET_ADDRESS)
+        except Exception:
+            cro_amt = 0.0
+    if cro_amt > EPSILON:
+        cro_price = get_price_usd("CRO") or 0.0
+        cro_val = cro_amt * cro_price
+        total += cro_val
+        breakdown.append({"token":"CRO","token_addr":None,"amount":cro_amt,"price_usd":cro_price,"usd_value":cro_val})
+        # Unrealized για CRO (αν έχεις cost-basis)
+        rem_qty = _position_qty.get("CRO",0.0)
+        rem_cost= _position_cost.get("CRO",0.0)
+        if rem_qty > EPSILON and _nonzero(cro_price):
+            unrealized += (cro_amt*cro_price - rem_cost)
+
+    # ERC20s
+    contracts = gather_all_known_token_contracts()
+    for addr in sorted(list(contracts)):
+        try:
+            bal = rpc_get_erc20_balance(addr, WALLET_ADDRESS)
+            if bal <= EPSILON:
+                continue
+            sym, dec = rpc_get_symbol_decimals(addr)
+            pr = get_price_usd(addr) or 0.0
+            val = bal * pr
+            total += val
+            breakdown.append({"token": sym, "token_addr": addr, "amount": bal, "price_usd": pr, "usd_value": val})
+
+            # Unrealized (cost-basis) αν υπάρχει state για αυτό το key
+            rem_qty = _position_qty.get(addr, 0.0)
+            rem_cost= _position_cost.get(addr, 0.0)
+            if rem_qty > EPSILON and _nonzero(pr):
+                unrealized += (bal*pr - rem_cost)
+        except Exception:
+            continue
+
+    breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
+    return total, breakdown, unrealized
+
+# ----------------------- Telegram commands (getUpdates) -----------------------
+_TELEGRAM_UPDATE_OFFSET = 0
+
+def _tg_get_updates(timeout=20):
+    global _TELEGRAM_UPDATE_OFFSET
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {
+        "timeout": timeout,
+        "offset": _TELEGRAM_UPDATE_OFFSET + 1,
+        "allowed_updates": json.dumps(["message"])
+    }
+    r = safe_get(url, params=params, timeout=timeout+5, retries=2)
+    data = safe_json(r) or {}
+    results = data.get("result") or []
+    for upd in results:
+        upd_id = upd.get("update_id")
+        if isinstance(upd_id, int) and upd_id > _TELEGRAM_UPDATE_OFFSET:
+            _TELEGRAM_UPDATE_OFFSET = upd_id
+    return results
+
+def _norm_cmd(text: str) -> str:
+    if not text: return ""
+    t = text.strip().lower()
+    if t in ("/show wallet assets", "/show_wallet_assets", "/showwalletassets"):
+        return "/show_wallet_assets"
+    return t
+
+def _format_wallet_assets_message():
+    """
+    Δείχνει ΟΛΑ τα assets με RPC snapshot (και fallbacks σε history/runtime).
+    """
+    total, breakdown, unrealized = compute_holdings_usd_via_rpc()
+    # fallback αν κάτι πήγε στραβά με RPC
+    if not breakdown:
+        total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+    if not breakdown:
+        total, breakdown, unrealized = compute_holdings_usd()
+
+    if not breakdown:
+        return "📦 Δεν βρέθηκαν assets αυτή τη στιγμή."
+
+    lines = ["*💼 Wallet Assets (MTM):*"]
+    for b in breakdown:
+        tok = b["token"]; amt=b["amount"]; pr=b["price_usd"] or 0.0; val=b["usd_value"] or 0.0
+        lines.append(f"• {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
+    lines.append(f"\n*Σύνολο:* ${_format_amount(total)}")
+    if _nonzero(unrealized):
+        lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
+
+    # runtime snapshot quantities (debug)
+    snap = get_wallet_balances_snapshot()
+    if snap:
+        lines.append("\n_Quantities snapshot (runtime):_")
+        for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
+            lines.append(f"  – {sym}: {_format_amount(amt)}")
+    return "\n".join(lines)
+
 def handle_native_tx(tx: dict):
     h = tx.get("hash")
     if not h or h in _seen_tx_hashes: return
@@ -711,10 +838,8 @@ def handle_native_tx(tx: dict):
     _append_ledger(entry)
 
 def _mini_summary_line(token_key, symbol_shown):
-    # open qty & avg & unreal (live)
     open_qty  = _position_qty.get(token_key,0.0)
     open_cost = _position_cost.get(token_key,0.0)
-    live = None
     if token_key=="CRO":
         live = get_price_usd("CRO") or 0.0
     elif isinstance(token_key,str) and token_key.startswith("0x"):
@@ -753,23 +878,19 @@ def handle_erc20_tx(t: dict):
     dt = datetime.fromtimestamp(ts) if ts>0 else now_dt()
     sign = +1 if to==WALLET_ADDRESS else -1
 
-    # prefer contract-based price
     if token_addr and token_addr.startswith("0x") and len(token_addr)==42:
         price = get_price_usd(token_addr) or 0.0
     else:
         price = get_price_usd(symbol) or 0.0
     usd_value = sign * amount * (price or 0.0)
 
-    # update balances & meta
     key = token_addr if token_addr else symbol
     _token_balances[key] += sign * amount
-    # clamp near zero to zero
     if abs(_token_balances[key]) < 1e-10: _token_balances[key] = 0.0
     _token_meta[key] = {"symbol": symbol, "decimals": decimals}
 
     realized = _update_cost_basis(key, sign*amount, (price or 0.0))
 
-    # ATH update
     try:
         if _nonzero(price):
             ath_key = token_addr if token_addr else symbol
@@ -777,7 +898,6 @@ def handle_erc20_tx(t: dict):
     except Exception:
         pass
 
-    # send TX line
     link = CRONOS_TX.format(txhash=h)
     direction = "IN" if sign>0 else "OUT"
     send_telegram(
@@ -788,14 +908,12 @@ def handle_erc20_tx(t: dict):
         f"USD value: ${_format_amount(usd_value)}"
     )
 
-    # mini summary (open/avg/unreal)
     if sign>0:
         send_telegram(f"• BUY {symbol} {_format_amount(amount)} @ live ${_format_price(price)}")
     else:
         send_telegram(f"• SELL {symbol} {_format_amount(-amount)} @ live ${_format_price(price)}")
     _mini_summary_line(key, symbol)
 
-    # guard logic for buys
     if sign>0 and _nonzero(price):
         _guard[key] = {"entry": float(price), "peak": float(price), "start_ts": time.time()}
 
@@ -812,7 +930,6 @@ def handle_erc20_tx(t: dict):
     _append_ledger(entry)
 
 # ----------------------- Wallet monitor loop -----------------------
-
 def wallet_monitor_loop():
     log.info("Wallet monitor starting; loading initial recent txs...")
     initial = fetch_latest_wallet_txs(limit=50)
@@ -828,7 +945,6 @@ def wallet_monitor_loop():
 
     last_tokentx_seen = set()
     while not shutdown_event.is_set():
-        # native
         try:
             txs = fetch_latest_wallet_txs(limit=25)
             for tx in reversed(txs):
@@ -839,7 +955,6 @@ def wallet_monitor_loop():
         except Exception as e:
             log.exception("wallet native loop error: %s", e)
 
-        # erc20
         try:
             toks = fetch_latest_token_txs(limit=60)
             for t in reversed(toks):
@@ -860,8 +975,8 @@ def wallet_monitor_loop():
 def slug(chain: str, pair_address: str) -> str:
     return f"{chain}/{pair_address}".lower()
 
-def fetch_pair(slug_str: str):
-    url = f"{DEX_BASE_PAIRS}/{slug_str}"
+def fetch_pair(slg_str: str):
+    url = f"{DEX_BASE_PAIRS}/{slg_str}"
     r = safe_get(url, timeout=12)
     return safe_json(r)
 
@@ -869,8 +984,7 @@ def fetch_token_pairs(chain: str, token_address: str):
     url = f"{DEX_BASE_TOKENS}/{chain}/{token_address}"
     r = safe_get(url, timeout=12)
     data = safe_json(r) or {}
-    pairs = data.get("pairs") or []
-    return pairs
+    return data.get("pairs") or []
 
 def fetch_search(query: str):
     r = safe_get(DEX_BASE_SEARCH, params={"q": query}, timeout=15)
@@ -1000,13 +1114,11 @@ def monitor_tracked_pairs_loop():
             time.sleep(1)
 
 def discovery_loop():
-    # seed from DEX_PAIRS
     seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
     for s in seeds:
         if s.startswith("cronos/"):
             ensure_tracking_pair("cronos", s.split("/",1)[1])
 
-    # seed from TOKENS -> top pair
     token_items = [t.strip().lower() for t in (TOKENS or "").split(",") if t.strip()]
     for t in token_items:
         if not t.startswith("cronos/"): continue
@@ -1043,16 +1155,12 @@ def discovery_loop():
 
 # ----------------------- Wallet snapshot (runtime only) -----------------------
 def get_wallet_balances_snapshot():
-    """
-    Χωρίς Cronoscan: χρησιμοποιούμε ΜΟΝΟ τα runtime balances (_token_balances)
-    και αγνοούμε μηδενικά/αρνητικά. Επιστρέφει dict {symbol: amount}.
-    """
     balances = {}
-    # CRO
     cro_amt = float(_token_balances.get("CRO",0.0))
     if cro_amt > EPSILON:
         balances["CRO"] = balances.get("CRO",0.0) + cro_amt
-    # ERC20
+    for k, v in list(_token_balances.items()()):
+        pass
     for k, v in list(_token_balances.items()):
         if k=="CRO": continue
         amt = float(v)
@@ -1062,18 +1170,11 @@ def get_wallet_balances_snapshot():
         balances[sym] = balances.get(sym,0.0) + amt
     return balances
 
-# ----------------------- Compute holdings / MTM -----------------------
+# ----------------------- Compute holdings / MTM (history-based) -----------------------
 def compute_holdings_usd():
-    """
-    Υπολογίζει MTM για ΟΛΑ τα assets με τρέχον θετικό balance.
-    Επιστρέφει: total, breakdown(list of {token,token_addr,amount,price_usd,usd_value}), unrealized_sum
-    Unrealized: μόνο για ανοιχτές θέσεις (open qty>0) και price>0, με cost-basis.
-    """
     total = 0.0
     breakdown = []
     unrealized = 0.0
-
-    # CRO
     cro_amt = max(0.0, _token_balances.get("CRO",0.0))
     if cro_amt > EPSILON:
         cro_price = get_price_usd("CRO") or 0.0
@@ -1084,8 +1185,6 @@ def compute_holdings_usd():
         rem_cost= _position_cost.get("CRO",0.0)
         if rem_qty > EPSILON and _nonzero(cro_price):
             unrealized += (cro_amt*cro_price - rem_cost)
-
-    # Tokens
     for addr, amt in list(_token_balances.items()):
         if addr=="CRO": continue
         amt = max(0.0, float(amt))
@@ -1105,28 +1204,11 @@ def compute_holdings_usd():
             unrealized += (amt*price - rem_cost)
     return total, breakdown, unrealized
 
-# ----------------------- Month aggregates -----------------------
-def sum_month_net_flows_and_realized():
-    pref = month_prefix()
-    total_flow = 0.0
-    total_real = 0.0
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json") and pref in fn:
-                data = read_json(os.path.join(DATA_DIR, fn), default=None)
-                if isinstance(data, dict):
-                    total_flow += float(data.get("net_usd_flow", 0.0))
-                    total_real += float(data.get("realized_pnl", 0.0))
-    except Exception:
-        pass
-    return total_flow, total_real
-
-# ----------------------- Open positions from history (all days) -----------------------
+# ----------------------- History-based open positions & MTM -----------------------
 def rebuild_open_positions_from_history():
     pos_qty  = defaultdict(float)
     pos_cost = defaultdict(float)
-
-    symbol_to_contract = _build_history_maps()  # <- χρησιμοποιεί τα αρχεία
+    symbol_to_contract = _build_history_maps()
 
     def _update(pos_qty, pos_cost, token_key, signed_amount, price_usd):
         qty = pos_qty[token_key]; cost = pos_cost[token_key]
@@ -1157,18 +1239,13 @@ def rebuild_open_positions_from_history():
             addr_raw = (e.get("token_addr") or "").strip().lower()
             amt  = float(e.get("amount") or 0.0)
             pr   = float(e.get("price_usd") or 0.0)
-
             symU = sym_raw.upper() if sym_raw else sym_raw
-            if symU == "TCRO":  # unify tCRO -> CRO
-                symU = "CRO"
-
-            # κλειδί: contract > (unique contract map) > symbol
+            if symU == "TCRO": symU = "CRO"
             if addr_raw and addr_raw.startswith("0x"):
                 key = addr_raw
             else:
                 mapped = symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
                 key = mapped if (mapped and mapped.startswith("0x")) else ("CRO" if symU=="CRO" else symU)
-
             _update(pos_qty, pos_cost, key, amt, pr)
 
     for k, v in list(pos_qty.items()):
@@ -1178,10 +1255,7 @@ def rebuild_open_positions_from_history():
 
 def compute_holdings_usd_from_history_positions():
     pos_qty, pos_cost = rebuild_open_positions_from_history()
-
-    total = 0.0
-    breakdown = []
-    unrealized = 0.0
+    total = 0.0; breakdown = []; unrealized = 0.0
 
     def _sym_for_key(key):
         if key == "CRO": return "CRO"
@@ -1196,15 +1270,12 @@ def compute_holdings_usd_from_history_positions():
         elif isinstance(key, str) and key.startswith("0x"):
             p = get_price_usd(key)
         else:
-            # aliases εδώ
             sym_l = PRICE_ALIASES.get(sym_hint.lower(), sym_hint.lower())
             p = get_price_usd(sym_l)
-        # history fallback αν 0/None
         if (p is None) or (not p) or (float(p) <= 0):
             p = _history_price_fallback(key if isinstance(key,str) and key.startswith("0x") else sym_hint, symbol_hint=sym_hint) or 0.0
         return float(p or 0.0)
 
-    # CRO
     if pos_qty.get("CRO", 0.0) > EPSILON:
         amt = pos_qty["CRO"]; p = _price_for("CRO", "CRO"); v = amt*p
         total += v
@@ -1212,7 +1283,6 @@ def compute_holdings_usd_from_history_positions():
         cost = pos_cost.get("CRO", 0.0)
         if amt>EPSILON and _nonzero(p): unrealized += (amt*p - cost)
 
-    # others
     for key, amt in pos_qty.items():
         if key == "CRO": continue
         amt = max(0.0, float(amt))
@@ -1235,124 +1305,7 @@ def compute_holdings_usd_from_history_positions():
     breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
     return total, breakdown, unrealized
 
-    def _add_line(token_key, symbol_hint=None):
-        nonlocal total, unrealized
-        amt = max(0.0, float(pos_qty.get(token_key, 0.0)))
-        if amt <= EPSILON:
-            return
-        # symbol & price lookup
-        sym = symbol_hint or _token_meta.get(token_key, {}).get("symbol")
-        if not sym:
-            if token_key == "CRO": sym = "CRO"
-            elif isinstance(token_key, str) and token_key.startswith("0x"): sym = (token_key[:8])
-            else: sym = str(token_key)
-
-        # price: προτίμηση contract κλειδί
-        if token_key == "CRO":
-            price = get_price_usd("CRO") or 0.0
-        elif isinstance(token_key, str) and token_key.startswith("0x"):
-            price = get_price_usd(token_key) or 0.0
-        else:
-            price = get_price_usd(sym) or 0.0
-
-        val = amt * (price or 0.0)
-        total += val
-        breakdown.append({
-            "token": sym,
-            "token_addr": token_key if (isinstance(token_key,str) and token_key.startswith("0x")) else None,
-            "amount": amt,
-            "price_usd": price or 0.0,
-            "usd_value": val
-        })
-
-        cost = float(pos_cost.get(token_key, 0.0))
-        if amt > EPSILON and _nonzero(price):
-            unrealized += (amt * price - cost)
-
-    # CRO
-    _add_line("CRO", symbol_hint="CRO")
-    # όλα τα υπόλοιπα keys
-    for k in list(pos_qty.keys()):
-        if k == "CRO": continue
-        _add_line(k)
-
-    # ταξινόμηση κατά αξία
-    breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
-    return total, breakdown, unrealized
-
-# ----------------------- Per-asset summarize (today, clean) -----------------------
-def summarize_today_per_asset():
-    """
-    Contract-first aggregation:
-      - Group by token_addr if υπάρχει, αλλιώς by token symbol.
-      - Net flow, realized PnL, today net qty (μπορεί να είναι αρνητικό).
-      - Live price για unrealized ΜΟΝΟ αν currently open qty > 0 (global state).
-    """
-    path = data_file_for_today()
-    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
-    entries = data.get("entries", [])
-
-    agg = {}  # key -> dict
-    for e in entries:
-        addr = e.get("token_addr") or ""
-        sym  = e.get("token") or "?"
-        key  = addr if (addr and addr.startswith("0x")) else sym
-        rec = agg.get(key)
-        if not rec:
-            rec = {
-                "token_addr": addr if addr else None,
-                "symbol": sym,
-                "net_flow_today": 0.0,
-                "realized_today": 0.0,
-                "net_qty_today": 0.0,
-                "last_price_seen": 0.0
-            }
-            agg[key] = rec
-        rec["net_flow_today"] += float(e.get("usd_value") or 0.0)
-        rec["realized_today"] += float(e.get("realized_pnl") or 0.0)
-        rec["net_qty_today"]  += float(e.get("amount") or 0.0)
-        p = float(e.get("price_usd") or 0.0)
-        if p>0: rec["last_price_seen"] = p
-
-    # enrich with live price / unreal only for open qty now
-    result = []
-    for key, rec in agg.items():
-        addr = rec["token_addr"]
-        sym  = rec["symbol"]
-        # open qty now (global state)
-        gkey = addr if addr else (sym if sym=="CRO" else addr or sym)
-        open_qty_now = _position_qty.get(gkey, 0.0)
-        # live price (prefer contract)
-        price_now = None
-        if addr and addr.startswith("0x"):
-            price_now = get_price_usd(addr) or None
-        else:
-            price_now = get_price_usd(sym) or None
-        if price_now is None or price_now==0:
-            if rec["last_price_seen"]>0:
-                price_now = rec["last_price_seen"]
-            else:
-                price_now = 0.0
-        unreal = 0.0
-        if open_qty_now > EPSILON and _nonzero(price_now):
-            cost = _position_cost.get(gkey, 0.0)
-            # value now for open qty (not today's net)
-            # (αν θέλουμε ακριβές per-asset unreal: value_now - cost)
-            unreal = open_qty_now*price_now - cost
-        result.append({
-            "symbol": sym,
-            "token_addr": addr,
-            "net_flow_today": rec["net_flow_today"],
-            "realized_today": rec["realized_today"],
-            "net_qty_today": rec["net_qty_today"],
-            "price_now": price_now or 0.0,
-            "unreal_now": unreal
-        })
-    # order by abs(net_flow_today)
-    result.sort(key=lambda r: abs(r["net_flow_today"]), reverse=True)
-    return result
-
-# ----------------------- Report builder -----------------------
+# ----------------------- Reports -----------------------
 def build_day_report_text():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -1387,7 +1340,9 @@ def build_day_report_text():
     lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
     lines.append(f"*Realized PnL today:* ${_format_amount(realized_today)}")
 
-    holdings_total, breakdown, unrealized = compute_holdings_usd()
+    holdings_total, breakdown, unrealized = compute_holdings_usd_via_rpc()
+    if not breakdown:
+        holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
     lines.append(f"*Holdings (MTM) now:* ${_format_amount(holdings_total)}")
     if breakdown:
         for b in breakdown[:15]:
@@ -1397,61 +1352,28 @@ def build_day_report_text():
             lines.append(f"  …and {len(breakdown)-15} more.")
     lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
 
-    # per-asset today
-    per = summarize_today_per_asset()
-    if per:
-        lines.append("\n*Per-Asset Summary (Today):*")
-        LIMIT = 12
-        for rec in per[:LIMIT]:
-            tok = rec["symbol"]; flow=rec["net_flow_today"]; real=rec["realized_today"]
-            qty = rec["net_qty_today"]; pr=rec["price_now"]; un=rec["unreal_now"]
-            base = f"  • {tok}: flow ${_format_amount(flow)} | realized ${_format_amount(real)} | today qty {_format_amount(qty)} | price ${_format_price(pr)}"
-            if _nonzero(un):
-                base += f" | unreal ${_format_amount(un)}"
-            lines.append(base)
-        if len(per)>LIMIT:
-            lines.append(f"  …and {len(per)-LIMIT} more.")
-
     month_flow, month_real = sum_month_net_flows_and_realized()
     lines.append(f"\n*Month Net Flow:* ${_format_amount(month_flow)}")
     lines.append(f"*Month Realized PnL:* ${_format_amount(month_real)}")
     return "\n".join(lines)
 
-# ----------------------- Intraday & EOD reporters -----------------------
-def intraday_report_loop():
-    global _last_intraday_sent
-    time.sleep(5)
-    send_telegram("⏱ Intraday reporting enabled.")
-    while not shutdown_event.is_set():
-        try:
-            if time.time() - _last_intraday_sent >= INTRADAY_HOURS*3600:
-                txt = build_day_report_text()
-                send_telegram("🟡 *Intraday Update*\n" + txt)
-                _last_intraday_sent = time.time()
-        except Exception as e:
-            log.exception("Intraday error: %s", e)
-        for _ in range(30):
-            if shutdown_event.is_set(): break
-            time.sleep(1)
+# ----------------------- Month aggregates -----------------------
+def sum_month_net_flows_and_realized():
+    pref = month_prefix()
+    total_flow = 0.0
+    total_real = 0.0
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json") and pref in fn:
+                data = read_json(os.path.join(DATA_DIR, fn), default=None)
+                if isinstance(data, dict):
+                    total_flow += float(data.get("net_usd_flow", 0.0))
+                    total_real += float(data.get("realized_pnl", 0.0))
+    except Exception:
+        pass
+    return total_flow, total_real
 
-def end_of_day_scheduler_loop():
-    send_telegram(f"🕛 End-of-day scheduler active (at {EOD_HOUR:02d}:{EOD_MINUTE:02d} {TZ}).")
-    while not shutdown_event.is_set():
-        now = now_dt()
-        target = now.replace(hour=EOD_HOUR, minute=EOD_MINUTE, second=0, microsecond=0)
-        if now > target: target = target + timedelta(days=1)
-        wait_s = (target - now).total_seconds()
-        while wait_s > 0 and not shutdown_event.is_set():
-            s = min(wait_s, 30)
-            time.sleep(s); wait_s -= s
-        if shutdown_event.is_set(): break
-        try:
-            txt = build_day_report_text()
-            send_telegram("🟢 *End of Day Report*\n" + txt)
-        except Exception as e:
-            log.exception("EOD error: %s", e)
-
-# ----------------------- Reconciliation helper (basic pairing) -----------------------
+# ----------------------- Reconciliation helper -----------------------
 def reconcile_swaps_from_entries():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -1471,7 +1393,7 @@ def reconcile_swaps_from_entries():
         i += 1
     return swaps
 
-# ----------------------- Alerts Monitor (wallet 24h & risky recent) -----------------------
+# ----------------------- Alerts & Guard loops -----------------------
 def _cooldown_ok(key):
     last = _alert_last_sent.get(key, 0.0)
     if time.time() - last >= COOLDOWN_SEC:
@@ -1483,13 +1405,11 @@ def alerts_monitor_loop():
     send_telegram(f"🛰 Alerts monitor active every {ALERTS_INTERVAL_MIN}m. Wallet 24h dump/pump: {DUMP_ALERT_24H_PCT}/{PUMP_ALERT_24H_PCT}.")
     while not shutdown_event.is_set():
         try:
-            # Wallet coins (non-zero balances)
-            wallet_bal = get_wallet_balances_snapshot()  # {symbol: amount}
+            wallet_bal = get_wallet_balances_snapshot()
             for sym, amt in list(wallet_bal.items()):
                 if amt <= EPSILON: continue
                 price, ch24, ch2h, url = get_change_and_price_for_symbol_or_addr(sym)
-                if not price or price<=0: continue  # skip dead
-                # 24h dump/pump
+                if not price or price<=0: continue
                 if ch24 is not None:
                     key_p = f"24h_pump:{sym}"
                     key_d = f"24h_dump:{sym}"
@@ -1498,7 +1418,6 @@ def alerts_monitor_loop():
                     if ch24 <= DUMP_ALERT_24H_PCT and _cooldown_ok(key_d):
                         send_telegram(f"⚠️ Dump Alert {sym} 24h {ch24:.2f}%\nPrice ${_format_price(price)}\n{url}")
 
-            # Risky = today's recent buys (no env list constraint -> auto)
             data = read_json(data_file_for_today(), default={"entries":[]})
             seen = set()
             for e in data.get("entries", []):
@@ -1508,14 +1427,11 @@ def alerts_monitor_loop():
                     key = addr if (addr and addr.startswith("0x")) else sym
                     if key in seen: continue
                     seen.add(key)
-                    # prefer contract for accuracy
                     query = addr if (addr and addr.startswith("0x")) else sym
                     price, ch24, ch2h, url = get_change_and_price_for_symbol_or_addr(query)
                     if not price or price<=0: continue
-                    # try 2h first for recent buys
                     ch = ch2h if (ch2h is not None) else ch24
                     if ch is None: continue
-                    # thresholds: reuse wallet 24h defaults (simple)
                     key_base = f"risky:{key}"
                     if ch >= PUMP_ALERT_24H_PCT and _cooldown_ok(key_base+":pump"):
                         send_telegram(f"🚀 Pump (recent) {sym} {ch:.2f}%\nPrice ${_format_price(price)}\n{url}")
@@ -1529,7 +1445,6 @@ def alerts_monitor_loop():
             if shutdown_event.is_set(): break
             time.sleep(1)
 
-# ----------------------- Guard monitor (short-term after buy) -----------------------
 def guard_monitor_loop():
     send_telegram(f"🛡 Guard monitor active: {GUARD_WINDOW_MIN}m window, alert below {GUARD_DROP_PCT}% / above {GUARD_PUMP_PCT}% / trailing {GUARD_TRAIL_DROP_PCT}%.")
     while not shutdown_event.is_set():
@@ -1538,25 +1453,20 @@ def guard_monitor_loop():
             for key, st in list(_guard.items()):
                 if time.time() - st["start_ts"] > GUARD_WINDOW_MIN*60:
                     dead_keys.append(key); continue
-                # live price
                 if key=="CRO":
                     price = get_price_usd("CRO") or 0.0
-                elif key.startswith("0x"):
+                elif isinstance(key,str) and key.startswith("0x"):
                     price = get_price_usd(key) or 0.0
                 else:
                     meta = _token_meta.get(key,{})
                     sym = meta.get("symbol") or key
                     price = get_price_usd(sym) or 0.0
                 if not price or price<=0: continue
-                entry = st["entry"]
-                peak  = st["peak"]
-                # update peak
+                entry = st["entry"]; peak  = st["peak"]
                 if price > peak: st["peak"] = price; peak = price
-                # compute % from entry
                 pct_from_entry = (price-entry)/entry*100.0 if entry>0 else 0.0
                 trail_from_peak = (price-peak)/peak*100.0 if peak>0 else 0.0
                 sym = _token_meta.get(key,{}).get("symbol") or ("CRO" if key=="CRO" else key[:6])
-                # alerts
                 if pct_from_entry >= GUARD_PUMP_PCT and _cooldown_ok(f"guard:pump:{key}"):
                     send_telegram(f"🟢 GUARD Pump {sym} {pct_from_entry:.2f}% (entry ${_format_price(entry)} → ${_format_price(price)})")
                 if pct_from_entry <= GUARD_DROP_PCT and _cooldown_ok(f"guard:drop:{key}"):
@@ -1571,19 +1481,13 @@ def guard_monitor_loop():
             if shutdown_event.is_set(): break
             time.sleep(2)
 
+# ----------------------- Telegram command loop -----------------------
 def telegram_commands_loop():
-    """
-    Απλός long-poll command listener για το Telegram.
-    Δέχεται: '/show wallet assets' (ή '/show_wallet_assets' / '/showwalletassets')
-    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("Telegram commands disabled (no token/chat id).")
         return
-
     send_telegram("🧩 Telegram commands listener ενεργό. Δώσε */show wallet assets* για λίστα assets.")
-
     my_chat_id = str(TELEGRAM_CHAT_ID).strip()
-
     while not shutdown_event.is_set():
         try:
             updates = _tg_get_updates(timeout=20)
@@ -1592,24 +1496,19 @@ def telegram_commands_loop():
                 chat = (msg.get("chat") or {})
                 chat_id = str(chat.get("id") or "")
                 if not chat_id or chat_id != my_chat_id:
-                    # αγνόησε μηνύματα από άλλα chats
                     continue
-
                 text = msg.get("text") or ""
                 cmd = _norm_cmd(text)
-
                 if cmd == "/show_wallet_assets":
                     reply = _format_wallet_assets_message()
                     send_telegram(reply)
-                # (εδώ μπορείς να προσθέσεις και άλλα commands στο μέλλον)
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
-            # μικρή παύση πριν retry
             for _ in range(3):
                 if shutdown_event.is_set(): break
                 time.sleep(1)
 
-# ----------------------- Thread runner w/ restart -----------------------
+# ----------------------- Thread runner -----------------------
 def run_with_restart(fn, name, daemon=True):
     def runner():
         while not shutdown_event.is_set():
@@ -1636,6 +1535,8 @@ def main():
     log.info("TELEGRAM_BOT_TOKEN present: %s", bool(TELEGRAM_BOT_TOKEN))
     log.info("TELEGRAM_CHAT_ID: %s", TELEGRAM_CHAT_ID)
     log.info("ETHERSCAN_API present: %s", bool(ETHERSCAN_API))
+    log.info("CRONOS_RPC_URL set: %s", bool(CRONOS_RPC_URL))
+    log.info("LOG_SCAN_BLOCKS=%s LOG_SCAN_CHUNK=%s", LOG_SCAN_BLOCKS, LOG_SCAN_CHUNK)
     log.info("DEX_PAIRS: %s", DEX_PAIRS)
     log.info("DISCOVER_ENABLED: %s | DISCOVER_QUERY: %s", DISCOVER_ENABLED, DISCOVER_QUERY)
     log.info("TZ: %s | INTRADAY_HOURS: %s | EOD: %02d:%02d", TZ, INTRADAY_HOURS, EOD_HOUR, EOD_MINUTE)
