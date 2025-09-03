@@ -282,6 +282,75 @@ def send_telegram(message: str) -> bool:
         log.exception("send_telegram exception: %s", e)
         return False
 
+# ----------------------- Telegram commands (getUpdates) -----------------------
+_TELEGRAM_UPDATE_OFFSET = 0
+
+def _tg_get_updates(timeout=20):
+    """Long-poll Telegram getUpdates with offset."""
+    global _TELEGRAM_UPDATE_OFFSET
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {
+        "timeout": timeout,
+        "offset": _TELEGRAM_UPDATE_OFFSET + 1,
+        "allowed_updates": json.dumps(["message"])
+    }
+    r = safe_get(url, params=params, timeout=timeout+5, retries=2)
+    data = safe_json(r) or {}
+    results = data.get("result") or []
+    # advance offset
+    for upd in results:
+        upd_id = upd.get("update_id")
+        if isinstance(upd_id, int) and upd_id > _TELEGRAM_UPDATE_OFFSET:
+            _TELEGRAM_UPDATE_OFFSET = upd_id
+    return results
+
+def _norm_cmd(text: str) -> str:
+    """Normalizes the text to catch '/show wallet assets' variations."""
+    if not text:
+        return ""
+    t = text.strip().lower()
+    # unify variants
+    if t in ("/show wallet assets", "/show_wallet_assets", "/showwalletassets"):
+        return "/show_wallet_assets"
+    return t
+
+def _format_wallet_assets_message():
+    """
+    Δημιουργεί μήνυμα για τα assets σου:
+    - Balances ανά token
+    - Live price (USD)
+    - Value (USD)
+    - Σύνολο & Unrealized PnL (open positions)
+    """
+    total, breakdown, unrealized = compute_holdings_usd()
+    if not breakdown:
+        return "📦 Δεν βρέθηκαν θετικά balances αυτή τη στιγμή."
+
+    lines = ["*💼 Wallet Assets (MTM):*"]
+    # ταξινόμηση με βάση την αξία
+    breakdown_sorted = sorted(breakdown, key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
+    for b in breakdown_sorted:
+        tok = b["token"]
+        amt = b["amount"]
+        pr  = b["price_usd"] or 0.0
+        val = b["usd_value"] or 0.0
+        lines.append(f"• *{tok}*: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
+
+    lines.append(f"\n*Σύνολο:* ${_format_amount(total)}")
+    if _nonzero(unrealized):
+        lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
+
+    # Προσθήκη γρήγορου snapshot από το runtime (μόνο ποσότητες)
+    snap = get_wallet_balances_snapshot()
+    if snap:
+        lines.append("\n_Quantities snapshot:_")
+        for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
+            lines.append(f"  – {sym}: {_format_amount(amt)}")
+
+    return "\n".join(lines)
+
 # ----------------------- ATH persistence -----------------------
 def load_ath():
     global ATH
@@ -647,6 +716,7 @@ def handle_erc20_tx(t: dict):
     _append_ledger(entry)
 
 # ----------------------- Wallet monitor loop -----------------------
+
 def wallet_monitor_loop():
     log.info("Wallet monitor starting; loading initial recent txs...")
     initial = fetch_latest_wallet_txs(limit=50)
@@ -1246,6 +1316,44 @@ def guard_monitor_loop():
             if shutdown_event.is_set(): break
             time.sleep(2)
 
+def telegram_commands_loop():
+    """
+    Απλός long-poll command listener για το Telegram.
+    Δέχεται: '/show wallet assets' (ή '/show_wallet_assets' / '/showwalletassets')
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("Telegram commands disabled (no token/chat id).")
+        return
+
+    send_telegram("🧩 Telegram commands listener ενεργό. Δώσε */show wallet assets* για λίστα assets.")
+
+    my_chat_id = str(TELEGRAM_CHAT_ID).strip()
+
+    while not shutdown_event.is_set():
+        try:
+            updates = _tg_get_updates(timeout=20)
+            for upd in updates:
+                msg = (upd.get("message") or {})
+                chat = (msg.get("chat") or {})
+                chat_id = str(chat.get("id") or "")
+                if not chat_id or chat_id != my_chat_id:
+                    # αγνόησε μηνύματα από άλλα chats
+                    continue
+
+                text = msg.get("text") or ""
+                cmd = _norm_cmd(text)
+
+                if cmd == "/show_wallet_assets":
+                    reply = _format_wallet_assets_message()
+                    send_telegram(reply)
+                # (εδώ μπορείς να προσθέσεις και άλλα commands στο μέλλον)
+        except Exception as e:
+            log.exception("telegram_commands_loop error: %s", e)
+            # μικρή παύση πριν retry
+            for _ in range(3):
+                if shutdown_event.is_set(): break
+                time.sleep(1)
+
 # ----------------------- Thread runner w/ restart -----------------------
 def run_with_restart(fn, name, daemon=True):
     def runner():
@@ -1286,6 +1394,7 @@ def main():
     threads.append(run_with_restart(end_of_day_scheduler_loop, "eod_scheduler"))
     threads.append(run_with_restart(alerts_monitor_loop, "alerts_monitor"))
     threads.append(run_with_restart(guard_monitor_loop, "guard_monitor"))
+    threads.append(run_with_restart(telegram_commands_loop, "telegram_commands"))
 
     try:
         while not shutdown_event.is_set():
