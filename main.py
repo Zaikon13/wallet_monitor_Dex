@@ -1355,6 +1355,45 @@ def build_day_report_text():
     lines.append(f"\n*Month Net Flow:* ${_format_amount(month_flow)}")
     lines.append(f"*Month Realized PnL:* ${_format_amount(month_real)}")
     return "\n".join(lines)
+def intraday_report_loop():
+    """Στέλνει περιοδικά ενδιάμεσο report (ανά INTRADAY_HOURS)."""
+    global _last_intraday_sent
+    time.sleep(5)
+    send_telegram("⏱ Intraday reporting enabled.")
+    while not shutdown_event.is_set():
+        try:
+            if time.time() - _last_intraday_sent >= INTRADAY_HOURS * 3600:
+                txt = build_day_report_text()
+                send_telegram("🟡 *Intraday Update*\n" + txt)
+                _last_intraday_sent = time.time()
+        except Exception as e:
+            log.exception("Intraday error: %s", e)
+        for _ in range(30):
+            if shutdown_event.is_set():
+                break
+            time.sleep(1)
+
+
+def end_of_day_scheduler_loop():
+    """Στέλνει ημερήσιο report στη συγκεκριμένη ώρα (EOD_HOUR:EOD_MINUTE, TZ)."""
+    send_telegram(f"🕛 End-of-day scheduler active (at {EOD_HOUR:02d}:{EOD_MINUTE:02d} {TZ}).")
+    while not shutdown_event.is_set():
+        now = now_dt()
+        target = now.replace(hour=EOD_HOUR, minute=EOD_MINUTE, second=0, microsecond=0)
+        if now > target:
+            target = target + timedelta(days=1)
+        wait_s = (target - now).total_seconds()
+        while wait_s > 0 and not shutdown_event.is_set():
+            s = min(wait_s, 30)
+            time.sleep(s)
+            wait_s -= s
+        if shutdown_event.is_set():
+            break
+        try:
+            txt = build_day_report_text()
+            send_telegram("🟢 *End of Day Report*\n" + txt)
+        except Exception as e:
+            log.exception("EOD error: %s", e)
 
 # ----------------------- Month aggregates -----------------------
 def sum_month_net_flows_and_realized():
