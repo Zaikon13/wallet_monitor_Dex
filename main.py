@@ -1689,7 +1689,7 @@ def telegram_commands_loop():
 
                 cmd = _norm_cmd(text)
 
-                                elif cmd == "/rescan":
+                elif cmd == "/rescan":
                     try:
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
