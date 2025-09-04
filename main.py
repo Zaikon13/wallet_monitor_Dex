@@ -1649,7 +1649,7 @@ def guard_monitor_loop():
                     dead_keys.append(key); continue
                 if key=="CRO":
                     price = get_price_usd("CRO") or 0.0
-            elif isinstance(key,str) and key.startswith("0x"):
+                elif isinstance(key,str) and key.startswith("0x"):
                     price = get_price_usd(key) or 0.0
                 else:
                     meta = _token_meta.get(key,{})
@@ -1689,7 +1689,19 @@ def telegram_commands_loop():
 
                 cmd = _norm_cmd(text)
 
-            elif cmd == "/rescan":
+                if cmd == "/show_wallet_assets":
+                    # Προαιρετικό: γρήγορο rescan για φρέσκα contracts
+                    try:
+                        rpc_discover_wallet_tokens(
+                            window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
+                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000"))
+                        )
+                    except Exception:
+                        pass
+                    reply = _format_wallet_assets_message()
+                    send_telegram(reply)
+
+                elif cmd == "/rescan":
                     try:
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
@@ -1706,17 +1718,17 @@ def telegram_commands_loop():
                     except Exception as e:
                         send_telegram(f"❌ Rescan error: {e}")
 
-            elif cmd == "/show_wallet_assets":
-                    # Προαιρετικό: γρήγορο rescan για φρέσκα contracts
+                elif cmd == "/diag":
                     try:
-                        rpc_discover_wallet_tokens(
-                            window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
-                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000"))
-                        )
-                    except Exception:
-                        pass
-                    reply = _format_wallet_assets_message()
-                    send_telegram(reply)
+                        send_telegram(diag_report_text())
+                    except Exception as e:
+                        send_telegram(f"❌ Diag error: {e}")
+
+                # (πρόσθεσε εδώ άλλα cmd branches αν έχεις)
+
+        except Exception as e:
+            log.exception("telegram_commands_loop error: %s", e)
+        time.sleep(2)
 
 # ----------------------- Thread runner -----------------------
 def run_with_restart(fn, name, daemon=True):
