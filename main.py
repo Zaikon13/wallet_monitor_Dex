@@ -1649,7 +1649,7 @@ def guard_monitor_loop():
                     dead_keys.append(key); continue
                 if key=="CRO":
                     price = get_price_usd("CRO") or 0.0
-                elif isinstance(key,str) and key.startswith("0x"):
+            elif isinstance(key,str) and key.startswith("0x"):
                     price = get_price_usd(key) or 0.0
                 else:
                     meta = _token_meta.get(key,{})
@@ -1689,7 +1689,7 @@ def telegram_commands_loop():
 
                 cmd = _norm_cmd(text)
 
-                elif cmd == "/rescan":
+            elif cmd == "/rescan":
                     try:
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
@@ -1706,7 +1706,7 @@ def telegram_commands_loop():
                     except Exception as e:
                         send_telegram(f"❌ Rescan error: {e}")
 
-                elif cmd == "/show_wallet_assets":
+            elif cmd == "/show_wallet_assets":
                     # Προαιρετικό: γρήγορο rescan για φρέσκα contracts
                     try:
                         rpc_discover_wallet_tokens(
