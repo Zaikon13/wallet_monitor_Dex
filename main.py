@@ -526,11 +526,70 @@ def _history_price_fallback(query_key: str, symbol_hint: str = None):
 
 # ----------------------- Web3 RPC (Cronos) -----------------------
 WEB3 = None
+
+# Minimal ERC-20 ABI (με name/symbol/decimals/balanceOf)
 ERC20_ABI_MIN = [
-    {"constant": True, "inputs": [{"name":"owner","type":"address"}], "name":"balanceOf","outputs":[{"name":"","type":"uint256"}], "type":"function"},
-    {"constant": True, "inputs": [], "name":"decimals","outputs":[{"name":"","type":"uint8"}], "type":"function"},
-    {"constant": True, "inputs": [], "name":"symbol","outputs":[{"name":"","type":"string"}], "type":"function"},
+    {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+    {"constant": True, "inputs": [{"name":"owner","type":"address"}], "name":"balanceOf", "outputs":[{"name":"","type":"uint256"}], "type":"function"},
 ]
+
+# Keccak(topic0) του Transfer(address,address,uint256)
+TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+def _to_checksum(addr: str):
+    try:
+        from web3 import Web3
+        return Web3.to_checksum_address(addr)
+    except Exception:
+        return addr
+
+def _topic_address(addr: str) -> str:
+    """
+    Επιστρέφει το 32-byte topic-encoded address (left-padded με μηδενικά).
+    """
+    a = addr.lower().replace("0x","")
+    return "0x" + ("0"*24) + a  # 24*'0' (12 bytes) + 20-byte address = 32 bytes
+
+def rpc_call_erc20_meta(w3, token_addr: str):
+    """
+    Φέρνει symbol/decimals/name με safe fallbacks.
+    """
+    try:
+        c = w3.eth.contract(address=_to_checksum(token_addr), abi=ERC20_ABI_MIN)
+        try:
+            sym = c.functions.symbol().call()
+            if isinstance(sym, bytes):
+                sym = sym.decode("utf-8","ignore").strip()
+        except Exception:
+            sym = token_addr[:8].upper()
+        try:
+            dec = int(c.functions.decimals().call())
+        except Exception:
+            dec = 18
+        try:
+            nm = c.functions.name().call()
+            if isinstance(nm, bytes):
+                nm = nm.decode("utf-8","ignore").strip()
+        except Exception:
+            nm = sym
+        return {"symbol": sym or token_addr[:8].upper(), "decimals": dec, "name": nm or sym}
+    except Exception:
+        return {"symbol": token_addr[:8].upper(), "decimals": 18, "name": token_addr[:8].upper()}
+
+def rpc_erc20_balance_of(w3, token_addr: str, wallet: str, decimals: int = None) -> float:
+    try:
+        c = w3.eth.contract(address=_to_checksum(token_addr), abi=ERC20_ABI_MIN)
+        raw = c.functions.balanceOf(_to_checksum(wallet)).call()
+        if decimals is None:
+            try:
+                decimals = int(c.functions.decimals().call())
+            except Exception:
+                decimals = 18
+        return float(raw) / (10**decimals)
+    except Exception:
+        return 0.0
 
 def rpc_init():
     global WEB3
@@ -623,6 +682,79 @@ def rpc_discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: in
     except Exception as e:
         log.debug("rpc_discover_token_contracts_by_logs error: %s", e)
     return found
+
+def rpc_discover_wallet_tokens(window_blocks: int = None, chunk: int = None):
+    """
+    Σαρώνει ERC-20 Transfer logs (from/to WALLET_ADDRESS) στα τελευταία N blocks,
+    βρίσκει contracts, και ενημερώνει _token_balances/_token_meta ΜΟΝΟ για θετικά balances.
+    """
+    window_blocks = window_blocks or int(os.getenv("LOG_SCAN_BLOCKS", "120000"))
+    chunk = chunk or int(os.getenv("LOG_SCAN_CHUNK", "5000"))
+
+    if not rpc_init():
+        log.warning("rpc_discover_wallet_tokens: RPC not connected.")
+        return 0
+
+    from web3 import Web3
+    w3 = WEB3
+    try:
+        head = rpc_block_number()
+        if head is None:
+            raise RuntimeError("no block number")
+    except Exception as e:
+        log.warning("rpc_discover_wallet_tokens: cannot get block number: %s", e)
+        return 0
+
+    start = max(0, head - window_blocks)
+    wallet_cs = _to_checksum(WALLET_ADDRESS)
+    topic_wallet = _topic_address(wallet_cs)
+
+    contracts = set()
+
+    def _scan(from_topic, to_topic):
+        nonlocal contracts
+        frm = start
+        while frm <= head:
+            to = min(head, frm + chunk - 1)
+            try:
+                logs = w3.eth.get_logs({
+                    "fromBlock": frm,
+                    "toBlock": to,
+                    "topics": [TRANSFER_TOPIC0, from_topic, to_topic]
+                })
+                for lg in logs:
+                    addr = (lg.get("address") or "").lower()
+                    if addr.startswith("0x"):
+                        contracts.add(addr)
+            except Exception:
+                # μικρή ανάσα σε error/ratelimit
+                time.sleep(0.2)
+            frm = to + 1
+
+    # from = wallet
+    _scan(topic_wallet, None)
+    # to = wallet
+    _scan(None, topic_wallet)
+
+    if not contracts:
+        log.info("rpc_discover_wallet_tokens: no contracts discovered in last %s blocks.", window_blocks)
+        return 0
+
+    found_positive = 0
+    for addr in sorted(contracts):
+        try:
+            meta = rpc_call_erc20_meta(w3, addr)
+            bal  = rpc_erc20_balance_of(w3, addr, WALLET_ADDRESS, decimals=meta.get("decimals"))
+            if bal > EPSILON:
+                _token_balances[addr] = bal  # per-contract key
+                _token_meta[addr]     = {"symbol": meta.get("symbol") or addr[:8].upper(),
+                                         "decimals": meta.get("decimals") or 18}
+                found_positive += 1
+        except Exception:
+            continue
+
+    log.info("rpc_discover_wallet_tokens: positive-balance tokens discovered: %s", found_positive)
+    return found_positive
 
 # ----------------------- RPC-powered assets snapshot -----------------------
 def gather_all_known_token_contracts():
@@ -753,10 +885,15 @@ def _tg_get_updates(timeout=20):
     return results
 
 def _norm_cmd(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     t = text.strip().lower()
     if t in ("/show wallet assets", "/show_wallet_assets", "/showwalletassets"):
         return "/show_wallet_assets"
+    if t in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
+        return "/rescan"
+    if t in ("/diag",):
+        return "/diag"
     return t
 
 def _format_wallet_assets_message():
@@ -1521,30 +1658,52 @@ def guard_monitor_loop():
 
 # ----------------------- Telegram command loop -----------------------
 def telegram_commands_loop():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.info("Telegram commands disabled (no token/chat id).")
-        return
-    send_telegram("🧩 Telegram commands listener ενεργό. Δώσε */show wallet assets* για λίστα assets.")
-    my_chat_id = str(TELEGRAM_CHAT_ID).strip()
+    send_telegram("🧩 Telegram commands listener ενεργό...")
     while not shutdown_event.is_set():
         try:
             updates = _tg_get_updates(timeout=20)
             for upd in updates:
-                msg = (upd.get("message") or {})
-                chat = (msg.get("chat") or {})
-                chat_id = str(chat.get("id") or "")
-                if not chat_id or chat_id != my_chat_id:
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                if not text:
                     continue
-                text = msg.get("text") or ""
+
                 cmd = _norm_cmd(text)
+
                 if cmd == "/show_wallet_assets":
+                    # Προαιρετικό: μικρό rescan πριν το report (για να πιάσουμε νεο-εμφανισμένα tokens)
+                    try:
+                        rpc_discover_wallet_tokens(
+                            window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
+                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000"))
+                        )
+                    except Exception:
+                        pass
+                    # Χρησιμοποίησε το υπάρχον formatter σου
                     reply = _format_wallet_assets_message()
                     send_telegram(reply)
+
+                elif cmd == "/rescan":
+                    try:
+                        n = rpc_discover_wallet_tokens(
+                            window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
+                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000"))
+                        )
+                        send_telegram(f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {n} tokens με θετικό balance.")
+                    except Exception as e:
+                        send_telegram(f"❌ Rescan error: {e}")
+
+                elif cmd == "/diag":
+                    try:
+                        send_telegram(diag_report_text())
+                    except Exception as e:
+                        send_telegram(f"❌ Diag error: {e}")
+
+                # (πρόσθεσε εδώ άλλα cmd branches αν έχεις)
+
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
-            for _ in range(3):
-                if shutdown_event.is_set(): break
-                time.sleep(1)
+        time.sleep(2)
 
 # ----------------------- Thread runner -----------------------
 def run_with_restart(fn, name, daemon=True):
@@ -1585,6 +1744,16 @@ def main():
         log.info("History maps initialized. Last-price cache: %s keys", len(_HISTORY_LAST_PRICE))
     except Exception as e:
         log.warning("History maps init failed: %s", e)
+
+    # Initial RPC discovery (best-effort)
+    try:
+        n = rpc_discover_wallet_tokens()
+        if n:
+            send_telegram(f"🔎 RPC discovery: βρέθηκαν {n} tokens με θετικό balance.")
+        else:
+            send_telegram("🔎 RPC discovery: δεν βρέθηκαν tokens (ή RPC αργεί).")
+    except Exception as e:
+        log.warning("initial rpc discovery failed: %s", e)
 
     threads = []
     threads.append(run_with_restart(wallet_monitor_loop, "wallet_monitor"))
