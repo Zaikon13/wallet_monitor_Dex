@@ -906,14 +906,27 @@ def _tg_get_updates(timeout=20):
 def _norm_cmd(text: str) -> str:
     if not text:
         return ""
-    t = text.strip().lower()
-    if t in ("/show wallet assets", "/show_wallet_assets", "/showwalletassets"):
+    # Πάρε μόνο την 1η λέξη, π.χ. "/show_wallet_assets@MyBot arg"
+    first = text.strip().split()[0]
+    # Πέτα το suffix τύπου @BotName
+    base = first.split("@", 1)[0].lower()
+
+    # Aliases → canonical
+    if base in ("/show_wallet_assets", "/showwalletassets", "/show", "/showassets", "/show_wallet"):
         return "/show_wallet_assets"
-    if t in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
+    if base in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
         return "/rescan"
-    if t in ("/diag",):
+    if base in ("/diag", "/status"):
         return "/diag"
-    return t
+    if base in ("/help",):
+        return "/help"
+
+    # Ειδική περίπτωση: "/show wallet assets" (με κενά)
+    t = text.strip().lower()
+    if t in ("/show wallet assets",):
+        return "/show_wallet_assets"
+
+    return base
 
 def _format_wallet_assets_message():
     """
@@ -1687,10 +1700,12 @@ def telegram_commands_loop():
                 if not text:
                     continue
 
+                # 👉 Αγκύρα: εδώ κανονικοποιούμε την εντολή
                 cmd = _norm_cmd(text)
 
+                # 👉 ΕΔΩ μπαίνει το if/elif για /show_wallet_assets
                 if cmd == "/show_wallet_assets":
-                    # Προαιρετικό: γρήγορο rescan για φρέσκα contracts
+                    # Σιωπηλό, γρήγορο rescan πριν το report (δεν στέλνουμε μήνυμα εδώ)
                     try:
                         rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
@@ -1701,13 +1716,13 @@ def telegram_commands_loop():
                     reply = _format_wallet_assets_message()
                     send_telegram(reply)
 
+                # 👉 ΚΑΙ εδώ το elif για /rescan (ίδιο level με το if)
                 elif cmd == "/rescan":
                     try:
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
                             chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000"))
                         )
-                        # Δείξε και τι βρέθηκε μετά το rescan
                         total, breakdown, _ = compute_holdings_usd()
                         lines = [f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {n} tokens με θετικό balance.", "", "📦 Snapshot:"]
                         for b in breakdown[:15]:
@@ -1718,13 +1733,16 @@ def telegram_commands_loop():
                     except Exception as e:
                         send_telegram(f"❌ Rescan error: {e}")
 
+                # Παράδειγμα άλλης εντολής στο ΙΔΙΟ level
                 elif cmd == "/diag":
                     try:
                         send_telegram(diag_report_text())
                     except Exception as e:
                         send_telegram(f"❌ Diag error: {e}")
 
-                # (πρόσθεσε εδώ άλλα cmd branches αν έχεις)
+                # 👉 Εδώ πρόσθεσε οποιαδήποτε άλλα commands θες
+                # elif cmd == "/help":
+                #     send_telegram("...")
 
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
