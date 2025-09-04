@@ -1158,7 +1158,7 @@ def get_wallet_balances_snapshot():
     cro_amt = float(_token_balances.get("CRO",0.0))
     if cro_amt > EPSILON:
         balances["CRO"] = balances.get("CRO",0.0) + cro_amt
-    for k, v in list(_token_balances.items()()):
+    for k, v in list(_token_balances.items()):
         pass
     for k, v in list(_token_balances.items()):
         if k=="CRO": continue
