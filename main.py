@@ -906,22 +906,20 @@ def _tg_get_updates(timeout=20):
 def _norm_cmd(text: str) -> str:
     if not text:
         return ""
-    # Πάρε μόνο την 1η λέξη, π.χ. "/show_wallet_assets@MyBot arg"
     first = text.strip().split()[0]
-    # Πέτα το suffix τύπου @BotName
     base = first.split("@", 1)[0].lower()
 
-    # Aliases → canonical
     if base in ("/show_wallet_assets", "/showwalletassets", "/show", "/showassets", "/show_wallet"):
         return "/show_wallet_assets"
     if base in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
         return "/rescan"
     if base in ("/diag", "/status"):
         return "/diag"
-    if base in ("/help",):
-        return "/help"
+    # 👉 νέα εντολή
+    if base in ("/dailysum", "/daily_sum", "/day", "/sumday"):
+        return "/dailysum"
 
-    # Ειδική περίπτωση: "/show wallet assets" (με κενά)
+    # ειδική περίπτωση με κενά
     t = text.strip().lower()
     if t in ("/show wallet assets",):
         return "/show_wallet_assets"
@@ -1004,6 +1002,54 @@ def handle_native_tx(tx: dict):
         "from": frm, "to": to,
     }
     _append_ledger(entry)
+def _format_daily_sum_message():
+    """
+    Ανά asset απολογισμός ημέρας από το σημερινό ledger:
+    - realized_today (PnL)
+    - net_flow_today (USD in/out)
+    - net_qty_today (καθαρή ποσότητα που αγοράστηκε/πουλήθηκε σήμερα)
+    - price_now (live, αν υπάρχει)
+    - unreal_now (μόνο αν υπάρχει ανοικτή θέση τώρα)
+    """
+    per = summarize_today_per_asset()  # ήδη επιστρέφει ό,τι χρειάζεται
+    if not per:
+        return "🧾 Δεν υπάρχουν σημερινές κινήσεις."
+
+    # totals
+    tot_real = sum(float(r.get("realized_today", 0.0)) for r in per)
+    tot_flow = sum(float(r.get("net_flow_today", 0.0)) for r in per)
+    tot_unrl = sum(float(r.get("unreal_now", 0.0)) for r in per if r.get("unreal_now"))
+
+    # ταξινόμηση: πιο «σημαντικές» πρώτες (με βάση το απόλυτο realized/flow)
+    per_sorted = sorted(
+        per,
+        key=lambda r: (abs(float(r.get("realized_today",0.0))), abs(float(r.get("net_flow_today",0.0)))),
+        reverse=True
+    )
+
+    lines = [f"*🧾 Daily PnL (Today {ymd()}):*"]
+    for r in per_sorted:
+        tok = r.get("symbol") or "?"
+        flow = float(r.get("net_flow_today", 0.0))
+        real = float(r.get("realized_today", 0.0))
+        qty  = float(r.get("net_qty_today", 0.0))
+        pr   = float(r.get("price_now", 0.0) or 0.0)
+        un   = float(r.get("unreal_now", 0.0) or 0.0)
+
+        base = f"• {tok}: realized ${_format_amount(real)} | flow ${_format_amount(flow)} | qty {_format_amount(qty)}"
+        if _nonzero(pr):
+            base += f" | price ${_format_price(pr)}"
+        if _nonzero(un):
+            base += f" | unreal ${_format_amount(un)}"
+        lines.append(base)
+
+    lines.append("")
+    lines.append(f"*Σύνολο realized σήμερα:* ${_format_amount(tot_real)}")
+    lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(tot_flow)}")
+    if _nonzero(tot_unrl):
+        lines.append(f"*Σύνολο unreal (open τώρα):* ${_format_amount(tot_unrl)}")
+
+    return "\n".join(lines)
 
 def _mini_summary_line(token_key, symbol_shown):
     open_qty  = _position_qty.get(token_key,0.0)
@@ -1474,6 +1520,80 @@ def compute_holdings_usd_from_history_positions():
     return total, breakdown, unrealized
 
 # ----------------------- Reports -----------------------
+def summarize_today_per_asset():
+    """
+    Συγκεντρώνει τα entries της σημερινής ημέρας ανά token.
+    Επιστρέφει λίστα από dicts με:
+      - symbol
+      - token_addr
+      - net_flow_today (USD)
+      - realized_today (PnL)
+      - net_qty_today (καθαρή ποσότητα)
+      - price_now (live ή τελευταίο γνωστό)
+      - unreal_now (μόνο αν υπάρχει ανοικτή θέση τώρα)
+    """
+    path = data_file_for_today()
+    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
+    entries = data.get("entries", [])
+
+    agg = {}
+    for e in entries:
+        addr = e.get("token_addr") or ""
+        sym  = e.get("token") or "?"
+        key  = addr if addr.startswith("0x") else sym
+        rec = agg.get(key)
+        if not rec:
+            rec = {
+                "token_addr": addr if addr else None,
+                "symbol": sym,
+                "net_flow_today": 0.0,
+                "realized_today": 0.0,
+                "net_qty_today": 0.0,
+                "last_price_seen": 0.0,
+            }
+            agg[key] = rec
+        rec["net_flow_today"] += float(e.get("usd_value") or 0.0)
+        rec["realized_today"] += float(e.get("realized_pnl") or 0.0)
+        rec["net_qty_today"]  += float(e.get("amount") or 0.0)
+        p = float(e.get("price_usd") or 0.0)
+        if p > 0:
+            rec["last_price_seen"] = p
+
+    result = []
+    for key, rec in agg.items():
+        addr = rec["token_addr"]
+        sym  = rec["symbol"]
+
+        # current open qty από τα global positions
+        gkey = addr if addr else sym
+        open_qty_now = _position_qty.get(gkey, 0.0)
+
+        # live price
+        if addr and addr.startswith("0x"):
+            price_now = get_price_usd(addr) or rec["last_price_seen"]
+        else:
+            price_now = get_price_usd(sym) or rec["last_price_seen"]
+
+        # unreal
+        unreal = 0.0
+        if open_qty_now > EPSILON and _nonzero(price_now):
+            cost = _position_cost.get(gkey, 0.0)
+            unreal = open_qty_now * price_now - cost
+
+        result.append({
+            "symbol": sym,
+            "token_addr": addr,
+            "net_flow_today": rec["net_flow_today"],
+            "realized_today": rec["realized_today"],
+            "net_qty_today": rec["net_qty_today"],
+            "price_now": price_now or 0.0,
+            "unreal_now": unreal,
+        })
+
+    # ταξινόμηση: assets με το μεγαλύτερο flow first
+    result.sort(key=lambda r: abs(r["net_flow_today"]), reverse=True)
+    return result
+
 def build_day_report_text():
     path = data_file_for_today()
     data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
@@ -1747,6 +1867,17 @@ def telegram_commands_loop():
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
         time.sleep(2)
+                elif cmd == "/dailysum":
+                    try:
+                        # optional: γρήγορο refresh για τρέχουσες τιμές πριν το summary
+                        # (δεν στέλνουμε μήνυμα εδώ)
+                        rpc_discover_wallet_tokens(
+                            window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
+                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000"))
+                        )
+                    except Exception:
+                        pass
+                    send_telegram(_format_daily_sum_message())
 
 # ----------------------- Thread runner -----------------------
 def run_with_restart(fn, name, daemon=True):
