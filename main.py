@@ -1887,6 +1887,17 @@ def telegram_commands_loop():
                         pass
                     send_telegram(_format_daily_sum_message())
 
+                elif cmd == "/showdaily":
+                    try:
+                        # προαιρετικά: γρήγορο RPC rescan για τρέχουσες ποσότητες/τιμές
+                        rpc_discover_wallet_tokens(
+                            window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
+                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000"))
+                        )
+                    except Exception:
+                        pass
+                    send_telegram(build_day_report_text())
+
                 elif cmd == "/rescan":
                     try:
                         n = rpc_discover_wallet_tokens(
