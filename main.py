@@ -1867,7 +1867,7 @@ def telegram_commands_loop():
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
         time.sleep(2)
-                elif cmd == "/dailysum":
+               elif cmd == "/dailysum":
                     try:
                         # optional: γρήγορο refresh για τρέχουσες τιμές πριν το summary
                         # (δεν στέλνουμε μήνυμα εδώ)
