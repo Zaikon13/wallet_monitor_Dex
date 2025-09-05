@@ -1004,61 +1004,86 @@ def compute_holdings_usd_from_history_positions():
 # ----------------------- Per-asset summarize (today) -----------------------
 def summarize_today_per_asset():
     """
-    Συγκεντρώνει τα σημερινά entries ανά asset:
-    - symbol, token_addr
-    - net_flow_today (USD)
-    - realized_today (PnL)
-    - net_qty_today (ποσότητα)
-    - price_now (live ή τελευταίο γνωστό)
-    - unreal_now (αν υπάρχει ανοικτή θέση τώρα)
+    Συγκεντρώνει ΟΛΕΣ τις σημερινές συναλλαγές ανά token.
+    Επιστρέφει λίστα από dicts με:
+      - symbol
+      - token_addr
+      - buy_qty, sell_qty, net_qty_today
+      - net_flow_today (USD)
+      - realized_today (PnL)
+      - txs (αναλυτικά)
+      - price_now (live)
+      - unreal_now (open PnL)
     """
     path = data_file_for_today()
-    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
+    data = read_json(path, default={"date": ymd(), "entries": []})
     entries = data.get("entries", [])
 
     agg = {}
     for e in entries:
-        addr = e.get("token_addr") or ""
-        sym  = e.get("token") or "?"
-        key  = addr if (addr and addr.startswith("0x")) else sym
+        sym = (e.get("token") or "?").upper()
+        if sym == "TCRO": sym = "CRO"   # alias
+        addr = (e.get("token_addr") or "").lower()
+        key = addr if addr.startswith("0x") else sym
+
         rec = agg.get(key)
         if not rec:
-            rec = {"token_addr": addr if addr else None, "symbol": sym,
-                   "net_flow_today": 0.0, "realized_today": 0.0,
-                   "net_qty_today": 0.0, "last_price_seen": 0.0}
+            rec = {
+                "symbol": sym,
+                "token_addr": addr if addr else None,
+                "buy_qty": 0.0,
+                "sell_qty": 0.0,
+                "net_qty_today": 0.0,
+                "net_flow_today": 0.0,
+                "realized_today": 0.0,
+                "txs": [],
+                "last_price_seen": 0.0
+            }
             agg[key] = rec
-        rec["net_flow_today"] += float(e.get("usd_value") or 0.0)
-        rec["realized_today"] += float(e.get("realized_pnl") or 0.0)
-        rec["net_qty_today"]  += float(e.get("amount") or 0.0)
-        p = float(e.get("price_usd") or 0.0)
-        if p > 0: rec["last_price_seen"] = p
+
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        prc = float(e.get("price_usd") or 0.0)
+        rp  = float(e.get("realized_pnl") or 0.0)
+        tm  = (e.get("time","")[-8:]) or ""
+        direction = "IN" if amt>0 else "OUT"
+
+        # Συναλλαγή
+        rec["txs"].append({
+            "time": tm, "dir": direction, "amount": amt,
+            "price": prc, "usd": usd, "realized": rp
+        })
+
+        # Aggregates
+        if amt > 0: rec["buy_qty"] += amt
+        if amt < 0: rec["sell_qty"] += -amt
+        rec["net_qty_today"]  += amt
+        rec["net_flow_today"] += usd
+        rec["realized_today"] += rp
+        if prc > 0: rec["last_price_seen"] = prc
 
     result = []
     for key, rec in agg.items():
-        addr = rec["token_addr"]; sym = rec["symbol"]
-        gkey = addr if addr else sym
-        open_qty_now = _position_qty.get(gkey, 0.0)
-
-        # live price (contract-first)
-        if addr and addr.startswith("0x"):
-            price_now = get_price_usd(addr) or rec["last_price_seen"]
+        # Ζωντανή τιμή
+        if rec["token_addr"]:
+            price_now = get_price_usd(rec["token_addr"]) or rec["last_price_seen"]
+            gkey = rec["token_addr"]
         else:
-            price_now = get_price_usd(sym) or rec["last_price_seen"]
+            price_now = get_price_usd(rec["symbol"]) or rec["last_price_seen"]
+            gkey = rec["symbol"]
 
-        unreal = 0.0
+        # Open qty από global positions
+        open_qty_now = _position_qty.get(gkey, 0.0)
+        open_cost_now= _position_cost.get(gkey, 0.0)
+        unreal_now = 0.0
         if open_qty_now > EPSILON and _nonzero(price_now):
-            cost = _position_cost.get(gkey, 0.0)
-            unreal = open_qty_now * price_now - cost
+            unreal_now = open_qty_now*price_now - open_cost_now
 
-        result.append({
-            "symbol": sym, "token_addr": addr,
-            "net_flow_today": rec["net_flow_today"],
-            "realized_today": rec["realized_today"],
-            "net_qty_today": rec["net_qty_today"],
-            "price_now": price_now or 0.0,
-            "unreal_now": unreal,
-        })
+        rec["price_now"] = price_now or 0.0
+        rec["unreal_now"] = unreal_now
+        result.append(rec)
 
+    # Ταξινόμηση με βάση μεγαλύτερο flow
     result.sort(key=lambda r: abs(r["net_flow_today"]), reverse=True)
     return result
 
