@@ -1079,42 +1079,61 @@ def sum_month_net_flows_and_realized():
     return total_flow, total_real
 
 def build_day_report_text():
+    """
+    Full Daily Report:
+      1) Today's Transactions (χρονολογικά)
+      2) Holdings (MTM) now
+      3) Per-Asset Detail (συναλλαγές ανά asset + σύνοψη ανά asset)
+      4) Σύνολα ημέρας + Σύνολα μήνα
+    """
+    date_str = ymd()
     path = data_file_for_today()
-    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
+    data = read_json(path, default={"date": date_str, "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
     entries = data.get("entries", [])
     net_flow = float(data.get("net_usd_flow", 0.0))
-    realized_today = float(data.get("realized_pnl", 0.0))
+    realized_today_total = float(data.get("realized_pnl", 0.0))
 
+    # --- 1) Transactions (chrono) ---
     lines = [f"*📒 Daily Report* ({data.get('date')})"]
     if not entries:
         lines.append("_No transactions today._")
     else:
+        # Ταξινόμηση χρονολογικά (αν δεν είναι ήδη)
+        def _ts_of(e):
+            try:
+                return datetime.strptime(e.get("time","")[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return now_dt()
+        entries_sorted = sorted(entries, key=_ts_of)
+
         lines.append("*Transactions:*")
-        MAX_LINES = 20
-        for e in entries[-MAX_LINES:]:
+        MAX_TX_LINES = 60  # καπάκι ασφαλείας για Telegram
+        cut = max(0, len(entries_sorted) - MAX_TX_LINES)
+        shown = entries_sorted[-MAX_TX_LINES:] if cut>0 else entries_sorted
+        for e in shown:
             tok = e.get("token") or "?"
-            amt = e.get("amount") or 0
-            usd = e.get("usd_value") or 0
+            amt = float(e.get("amount") or 0)
+            usd = float(e.get("usd_value") or 0)
             tm  = (e.get("time","")[-8:]) or ""
-            direction = "IN" if float(amt)>0 else "OUT"
-            unit_price = e.get("price_usd") or 0.0
-            pnl_line = ""
-            rp = float(e.get("realized_pnl",0.0) or 0.0)
-            if abs(rp) > 1e-9: pnl_line = f"  PnL: ${_format_amount(rp)}"
+            direction = "IN" if amt>0 else "OUT"
+            unit_price = float(e.get("price_usd") or 0.0)
+            rp = float(e.get("realized_pnl", 0.0) or 0.0)
+            pnl_line = f"  PnL: ${_format_amount(rp)}" if _nonzero(rp) else ""
             lines.append(
                 f"• {tm} — {direction} {tok} {_format_amount(amt)}  "
                 f"@ ${_format_price(unit_price)}  "
                 f"(${_format_amount(usd)}){pnl_line}"
             )
-        if len(entries) > MAX_LINES:
-            lines.append(f"_…and {len(entries)-MAX_LINES} earlier txs._")
+        if cut>0:
+            lines.append(f"_…and {cut} earlier txs._")
 
-    lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
-    lines.append(f"*Realized PnL today:* ${_format_amount(realized_today)}")
-
+    # --- 2) Holdings (MTM) now ---
     holdings_total, breakdown, unrealized = compute_holdings_usd_via_rpc()
     if not breakdown:
         holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+
+    lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
+    lines.append(f"*Realized PnL today:* ${_format_amount(realized_today_total)}")
     lines.append(f"*Holdings (MTM) now:* ${_format_amount(holdings_total)}")
     if breakdown:
         for b in breakdown[:15]:
@@ -1122,11 +1141,101 @@ def build_day_report_text():
             lines.append(f"  – {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
         if len(breakdown)>15:
             lines.append(f"  …and {len(breakdown)-15} more.")
-    lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
+    if _nonzero(unrealized):
+        lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
 
+    # --- 3) Per-Asset Detail (group by asset με ΟΛΕΣ τις σημερινές tx) ---
+    if entries:
+        # Ομαδοποίηση: key = contract (0x..) αν υπάρχει αλλιώς symbol
+        assets = {}
+        for e in entries:
+            addr = (e.get("token_addr") or "").lower()
+            sym  = e.get("token") or "?"
+            key  = addr if (addr.startswith("0x")) else sym
+            d = assets.get(key)
+            if not d:
+                d = {
+                    "symbol": sym,
+                    "token_addr": addr if addr else None,
+                    "txs": [],
+                    "buy_qty": 0.0,
+                    "sell_qty": 0.0,
+                    "net_qty": 0.0,
+                    "net_flow": 0.0,
+                    "realized_sum": 0.0,
+                    "last_price_seen": 0.0
+                }
+                assets[key] = d
+
+            amt = float(e.get("amount") or 0.0)
+            usd = float(e.get("usd_value") or 0.0)
+            prc = float(e.get("price_usd") or 0.0)
+            rp  = float(e.get("realized_pnl", 0.0) or 0.0)
+            tm  = (e.get("time","")[-8:]) or ""
+            direction = "IN" if amt>0 else "OUT"
+
+            d["txs"].append({
+                "time": tm, "dir": direction, "amount": amt,
+                "price": prc, "usd": usd, "realized": rp
+            })
+            if amt > 0: d["buy_qty"]  += amt
+            if amt < 0: d["sell_qty"] += -amt
+            d["net_qty"]  += amt
+            d["net_flow"] += usd
+            d["realized_sum"] += rp
+            if prc > 0: d["last_price_seen"] = prc
+
+        # Ταξινόμηση assets με βάση το απόλυτο net_flow της ημέρας
+        ordered = sorted(assets.values(), key=lambda r: abs(r["net_flow"]), reverse=True)
+
+        lines.append("\n*Per-Asset Detail (Today):*")
+        MAX_TX_PER_ASSET = 40  # καπάκι ασφαλείας ανά asset
+        for rec in ordered:
+            sym = rec["symbol"]
+            # Ζωντανή τιμή
+            if rec["token_addr"]:
+                price_now = get_price_usd(rec["token_addr"]) or rec["last_price_seen"]
+                gkey = rec["token_addr"]
+            else:
+                price_now = get_price_usd(sym) or rec["last_price_seen"]
+                gkey = sym
+            # Ανοικτή ποσότητα τώρα (από global positions)
+            open_qty_now = _position_qty.get(gkey, 0.0)
+            open_cost_now= _position_cost.get(gkey, 0.0)
+            unreal_now = 0.0
+            if open_qty_now>EPSILON and _nonzero(price_now):
+                unreal_now = open_qty_now*price_now - open_cost_now
+
+            lines.append(f"  • *{sym}*")
+            # Λίστα συναλλαγών για το συγκεκριμένο asset (χρονολογικά)
+            txs_sorted = sorted(rec["txs"], key=lambda z: z["time"])
+            if len(txs_sorted) > MAX_TX_PER_ASSET:
+                lines.append(f"    _…showing last {MAX_TX_PER_ASSET} of {len(txs_sorted)} txs_")
+                txs_sorted = txs_sorted[-MAX_TX_PER_ASSET:]
+
+            for tx in txs_sorted:
+                pnl_line = f"  PnL: ${_format_amount(tx['realized'])}" if _nonzero(tx["realized"]) else ""
+                lines.append(
+                    f"    – {tx['time']} — {tx['dir']} {_format_amount(tx['amount'])} "
+                    f"@ ${_format_price(tx['price'])}  (${_format_amount(tx['usd'])}){pnl_line}"
+                )
+
+            # Subtotals ανά asset
+            lines.append(
+                f"    ↳ buys {_format_amount(rec['buy_qty'])} | sells {_format_amount(rec['sell_qty'])} | "
+                f"net qty {_format_amount(rec['net_qty'])} | flow ${_format_amount(rec['net_flow'])}"
+            )
+            lines.append(
+                f"    ↳ realized today ${_format_amount(rec['realized_sum'])}"
+                + (f" | price ${_format_price(price_now)}" if _nonzero(price_now) else "")
+                + (f" | unreal now ${_format_amount(unreal_now)}" if _nonzero(unreal_now) else "")
+            )
+
+    # --- 4) Month aggregates ---
     month_flow, month_real = sum_month_net_flows_and_realized()
     lines.append(f"\n*Month Net Flow:* ${_format_amount(month_flow)}")
     lines.append(f"*Month Realized PnL:* ${_format_amount(month_real)}")
+
     return "\n".join(lines)
 
 # ======================= ΤΕΛΟΣ ΜΕΡΟΥΣ 1 =======================
