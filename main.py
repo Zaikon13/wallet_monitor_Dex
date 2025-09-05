@@ -909,14 +909,20 @@ def _norm_cmd(text: str) -> str:
     first = text.strip().split()[0]
     base = first.split("@", 1)[0].lower()
 
+    # show wallet assets
     if base in ("/show_wallet_assets", "/showwalletassets", "/show", "/showassets", "/show_wallet"):
         return "/show_wallet_assets"
+
+    # rescan
     if base in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
         return "/rescan"
+
+    # diag
     if base in ("/diag", "/status"):
         return "/diag"
-    # 👉 νέα εντολή
-    if base in ("/dailysum", "/daily_sum", "/day", "/sumday"):
+
+    # daily summary (νέα)
+    if base in ("/dailysum", "/daily_sum", "/showdaily", "/day", "/sumday", "/imerisio"):
         return "/dailysum"
 
     # ειδική περίπτωση με κενά
@@ -955,6 +961,49 @@ def _format_wallet_assets_message():
         for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
             lines.append(f"  – {sym}: {_format_amount(amt)}")
     return "\n".join(lines)
+
+def _format_daily_sum_message():
+    """
+    Daily per-asset PnL/flows για σήμερα.
+    """
+    per = summarize_today_per_asset()
+    if not per:
+        return "🧾 Δεν υπάρχουν σημερινές κινήσεις."
+
+    tot_real = sum(float(r.get("realized_today", 0.0)) for r in per)
+    tot_flow = sum(float(r.get("net_flow_today", 0.0)) for r in per)
+    tot_unrl = sum(float(r.get("unreal_now", 0.0) or 0.0) for r in per if r.get("unreal_now") is not None)
+
+    per_sorted = sorted(
+        per,
+        key=lambda r: (abs(float(r.get("realized_today", 0.0))), abs(float(r.get("net_flow_today", 0.0)))),
+        reverse=True
+    )
+
+    lines = [f"*🧾 Daily PnL (Today {ymd()}):*"]
+    for r in per_sorted:
+        tok = r.get("symbol") or "?"
+        flow = float(r.get("net_flow_today", 0.0))
+        real = float(r.get("realized_today", 0.0))
+        qty  = float(r.get("net_qty_today", 0.0))
+        pr   = float(r.get("price_now", 0.0) or 0.0)
+        un   = float(r.get("unreal_now", 0.0) or 0.0)
+
+        base = f"• {tok}: realized ${_format_amount(real)} | flow ${_format_amount(flow)} | qty {_format_amount(qty)}"
+        if _nonzero(pr):
+            base += f" | price ${_format_price(pr)}"
+        if _nonzero(un):
+            base += f" | unreal ${_format_amount(un)}"
+        lines.append(base)
+
+    lines.append("")
+    lines.append(f"*Σύνολο realized σήμερα:* ${_format_amount(tot_real)}")
+    lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(tot_flow)}")
+    if _nonzero(tot_unrl):
+        lines.append(f"*Σύνολο unreal (open τώρα):* ${_format_amount(tot_unrl)}")
+
+    return "\n".join(lines)
+
 def handle_native_tx(tx: dict):
     h = tx.get("hash")
     if not h or h in _seen_tx_hashes: return
@@ -1820,12 +1869,10 @@ def telegram_commands_loop():
                 if not text:
                     continue
 
-                # 👉 Αγκύρα: εδώ κανονικοποιούμε την εντολή
                 cmd = _norm_cmd(text)
 
-                # 👉 ΕΔΩ μπαίνει το if/elif για /show_wallet_assets
                 if cmd == "/show_wallet_assets":
-                    # Σιωπηλό, γρήγορο rescan πριν το report (δεν στέλνουμε μήνυμα εδώ)
+                    # Σιωπηλό, γρήγορο rescan πριν το report
                     try:
                         rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
@@ -1833,17 +1880,18 @@ def telegram_commands_loop():
                         )
                     except Exception:
                         pass
-                    reply = _format_wallet_assets_message()
-                    send_telegram(reply)
+                    send_telegram(_format_wallet_assets_message())
 
-                # 👉 ΚΑΙ εδώ το elif για /rescan (ίδιο level με το if)
                 elif cmd == "/rescan":
                     try:
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
                             chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000"))
                         )
-                        total, breakdown, _ = compute_holdings_usd()
+                        # snapshot μετά το rescan για ορατότητα
+                        total, breakdown, _ = compute_holdings_usd_via_rpc()
+                        if not breakdown:
+                            total, breakdown, _ = compute_holdings_usd_from_history_positions()
                         lines = [f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {n} tokens με θετικό balance.", "", "📦 Snapshot:"]
                         for b in breakdown[:15]:
                             lines.append(f"• {b['token']}: {_format_amount(b['amount'])}")
@@ -1853,24 +1901,9 @@ def telegram_commands_loop():
                     except Exception as e:
                         send_telegram(f"❌ Rescan error: {e}")
 
-                # Παράδειγμα άλλης εντολής στο ΙΔΙΟ level
-                elif cmd == "/diag":
-                    try:
-                        send_telegram(diag_report_text())
-                    except Exception as e:
-                        send_telegram(f"❌ Diag error: {e}")
-
-                # 👉 Εδώ πρόσθεσε οποιαδήποτε άλλα commands θες
-                # elif cmd == "/help":
-                #     send_telegram("...")
-
-        except Exception as e:
-            log.exception("telegram_commands_loop error: %s", e)
-        time.sleep(2)
                 elif cmd == "/dailysum":
                     try:
-                        # optional: γρήγορο refresh για τρέχουσες τιμές πριν το summary
-                        # (δεν στέλνουμε μήνυμα εδώ)
+                        # Γρήγορο refresh για live prices/open qty
                         rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
                             chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000"))
@@ -1878,6 +1911,18 @@ def telegram_commands_loop():
                     except Exception:
                         pass
                     send_telegram(_format_daily_sum_message())
+
+                elif cmd == "/diag":
+                    try:
+                        send_telegram(diag_report_text())
+                    except Exception as e:
+                        send_telegram(f"❌ Diag error: {e}")
+
+                # μπορείς να προσθέσεις κι άλλα εδώ (π.χ. /help)
+
+        except Exception as e:
+            log.exception("telegram_commands_loop error: %s", e)
+        time.sleep(2)
 
 # ----------------------- Thread runner -----------------------
 def run_with_restart(fn, name, daemon=True):
