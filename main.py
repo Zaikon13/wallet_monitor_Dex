@@ -1147,6 +1147,40 @@ def aggregate_per_asset(scope: str = "all"):
     # ταξινόμηση κατά |net_usd| φθίνουσα
     out.sort(key=lambda z: abs(float(z.get("net_usd", 0.0))), reverse=True)
     return out
+# ----------------------- FORMATTER: Totals per Asset -> Telegram -----------------------
+def format_per_asset_totals(scope: str = "all", limit: int = 40) -> str:
+    """
+    Επιστρέφει string έτοιμο για Telegram με συνολικά ανά asset:
+    IN qty/USD, OUT qty/USD, NET qty/USD, Realized PnL.
+    scope: all | month | today
+    """
+    data = aggregate_per_asset(scope)
+    if not data:
+        label = "σήμερα" if scope == "today" else ("τον μήνα" if scope == "month" else "όλο το ιστορικό")
+        return f"🧮 Δεν βρέθηκαν κινήσεις για {label}."
+
+    title = {"today": "Today", "month": "This Month", "all": "All Time"}[scope]
+    lines = [f"*📊 Totals per Asset — {title}:*"]
+
+    for i, r in enumerate(data[:limit], 1):
+        sym = r.get("symbol") or "?"
+        iq, oq = float(r["in_qty"]),  float(r["out_qty"])
+        iu, ou = float(r["in_usd"]),  float(r["out_usd"])
+        netq   = float(r["net_qty"])
+        netu   = float(r["net_usd"])
+        real   = float(r["realized"])
+        lines.append(
+            f"{i:>2}. *{sym}*  "
+            f"IN: {_format_amount(iq)} (${_format_amount(iu)}) | "
+            f"OUT: {_format_amount(oq)} (${_format_amount(ou)}) | "
+            f"NET: {_format_amount(netq)} (${_format_amount(netu)}) | "
+            f"Realized: ${_format_amount(real)}"
+        )
+
+    if len(data) > limit:
+        lines.append(f"_…and {len(data) - limit} more._")
+
+    return "\n".join(lines)
 
 # ----------------------- Per-asset summarize (today) -----------------------
 def summarize_today_per_asset():
@@ -1909,6 +1943,8 @@ def _norm_cmd(text: str) -> str:
     t = text.strip().lower()
     if t in ("/show wallet assets",):
         return "/show_wallet_assets"
+    if base in ("/totals", "/sumassets", "/perasset", "/assetsum"):
+        return "/totals"
     return base
 
 def _format_wallet_assets_message():
@@ -2094,7 +2130,26 @@ def telegram_commands_loop():
                         send_telegram(diag_report_text())
                     except Exception as e:
                         send_telegram(f"❌ Diag error: {e}")
+                elif cmd == "/totals":
+                    # Usage:
+                    #   /totals           -> all history
+                    #   /totals today     -> only today
+                    #   /totals month     -> current month
+                    # ελληνικά aliases: "σήμερα", "μήνα"
+                    txt = (text or "").strip().lower()
+                    scope = "all"
+                    if "today" in txt or "σήμερα" in txt:
+                        scope = "today"
+                    elif "month" in txt or "μήνα" in txt or "μηνα" in txt:
+                        scope = "month"
 
+                    try:
+                        # (προαιρετικά) ένα γρήγορο rescan για να ‘ναι up-to-date οι ποσότητες/τιμές αν θες:
+                        # rpc_discover_wallet_tokens(window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
+                        #                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000")))
+                        send_telegram(format_per_asset_totals(scope))
+                    except Exception as e:
+                        send_telegram(f"❌ totals error: {e}")
                 # άλλες εντολές εδώ...
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
