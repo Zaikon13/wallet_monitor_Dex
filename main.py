@@ -431,7 +431,9 @@ def _replay_today_cost_basis():
     data = read_json(data_file_for_today(), default=None)
     if not isinstance(data, dict): return
     for e in data.get("entries", []):
-        key = (e.get("token_addr") or (e.get("token") if e.get("token")=="CRO" else None)) or "CRO"
+        sym = (e.get("token") or "").strip()
+        addr = (e.get("token_addr") or "").strip().lower()
+        key = resolve_token_key(sym, addr)
         amt = float(e.get("amount") or 0.0)
         price = float(e.get("price_usd") or 0.0)
         realized = _update_cost_basis(key, amt, price)
@@ -1411,7 +1413,7 @@ def handle_erc20_tx(t: dict):
         price = get_price_usd(symbol) or 0.0
     usd_value = sign * amount * (price or 0.0)
 
-    key = token_addr if token_addr else symbol
+    key = resolve_token_key(symbol, token_addr)
     _token_balances[key] += sign * amount
     if abs(_token_balances[key]) < 1e-10: _token_balances[key] = 0.0
     _token_meta[key] = {"symbol": symbol, "decimals": decimals}
@@ -1447,7 +1449,7 @@ def handle_erc20_tx(t: dict):
     entry = {
         "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
         "txhash": h, "type":"erc20",
-        "token": symbol, "token_addr": token_addr or None,
+        "token": symbol, "token_addr": (key if isinstance(key, str) and key.startswith("0x") else (token_addr or None)),
         "amount": sign*amount,
         "price_usd": price or 0.0,
         "usd_value": usd_value,
