@@ -9,6 +9,7 @@ def test_imports():
     ]:
         importlib.import_module(mod)
 
+
 def test_main_has_entrypoint():
     import main
     assert hasattr(main, "main"), "Το main.py πρέπει να έχει συνάρτηση main()"
