@@ -1,0 +1,11 @@
+[flake8]
+max-line-length = 140
+extend-ignore = E203, E266, E501, E302, E305, E402, E221, E231, E401, E701
+per-file-ignores =
+    main.py: F401, F841, F824
+    utils/__init__.py: W391
+    telegram/__init__.py: W391
+    __init__.py: W391
+    core/tz.py: E401, E701
+    core/config.py: E302, E231
+    tests/test_smoke.py: E302
