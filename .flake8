@@ -1,5 +1,0 @@
-[flake8]
-max-line-length = 160
-ignore = E,W
-per-file-ignores =
-    main.py: F401,F821,F823,F824,F841
