@@ -24,12 +24,14 @@ jobs:
         pip install -r requirements.txt
         pip install pytest flake8
 
+    # 🚩 Χρησιμοποιεί ΡΗΤΑ το .flake8 του repo
     - name: Lint (flake8 with repo config)
       run: flake8 --config .flake8 .
 
     - name: Syntax check
       run: python -m py_compile main.py
 
+    # 🚩 Κλείνουμε auto-loading pytest plugins (διορθώνει το web3/eth_typing ImportError)
     - name: Pytest (smoke)
       env:
         PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
