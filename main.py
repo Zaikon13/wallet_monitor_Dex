@@ -503,7 +503,35 @@ def _build_history_maps():
     for s in symbol_conflict:
         symbol_to_contract.pop(s, None)
     return symbol_to_contract
+    
+# --- Global symbol→contract map & key resolver ---
+SYMBOL_TO_CONTRACT = {}
 
+def init_symbol_map():
+    """Κράτα σε global το history-based mapping για ενιαίο key σε όλο το σύστημα."""
+    global SYMBOL_TO_CONTRACT
+    SYMBOL_TO_CONTRACT = _build_history_maps()
+
+def resolve_token_key(sym: str | None, addr: str | None) -> str:
+    """
+    Ενιαίο κλειδί ανά asset:
+      1) Αν έχουμε contract (0x..), χρησιμοποιούμε ΠΑΝΤΑ αυτό.
+      2) CRO/TCRO → 'CRO'
+      3) Αλλιώς, προσπαθούμε να χαρτογραφήσουμε το symbol σε contract από ιστορικό.
+      4) Τελευταία λύση: καθαρό UPPER symbol.
+    """
+    a = (addr or "").strip().lower()
+    if a.startswith("0x"):
+        return a
+    s = (sym or "").strip().upper()
+    if s == "TCRO": s = "CRO"
+    if s == "CRO":
+        return "CRO"
+    mapped = SYMBOL_TO_CONTRACT.get(sym) or SYMBOL_TO_CONTRACT.get(s)
+    if mapped and mapped.startswith("0x"):
+        return mapped.lower()
+    return s or a
+    
 # ----------------------- Web3 RPC (Cronos) -----------------------
 WEB3 = None
 
@@ -2009,6 +2037,10 @@ def main():
         log.info("History maps initialized. Last-price cache: %s keys", len(_HISTORY_LAST_PRICE))
     except Exception as e:
         log.warning("History maps init failed: %s", e)
+    try:
+       init_symbol_map()
+    except Exception as e:
+        log.warning("init_symbol_map failed: %s", e)
 
     # Initial RPC discovery (best-effort)
     try:
