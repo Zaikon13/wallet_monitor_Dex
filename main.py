@@ -1943,8 +1943,14 @@ def _norm_cmd(text: str) -> str:
     t = text.strip().lower()
     if t in ("/show wallet assets",):
         return "/show_wallet_assets"
+        # --- Totals aliases ---
     if base in ("/totals", "/sumassets", "/perasset", "/assetsum"):
         return "/totals"
+    # compact aliases που έστειλες:
+    if base in ("/totalstoday", "/totals_today", "/totals-today"):
+        return "/totalstoday"
+    if base in ("/totalsmonth", "/totals_month", "/totals-month"):
+        return "/totalsmonth"
     return base
 
 def _format_wallet_assets_message():
@@ -2130,23 +2136,30 @@ def telegram_commands_loop():
                         send_telegram(diag_report_text())
                     except Exception as e:
                         send_telegram(f"❌ Diag error: {e}")
+
+                 elif cmd == "/totalstoday":
+                    try:
+                        send_telegram(format_per_asset_totals("today"))
+                    except Exception as e:
+                        send_telegram(f"❌ totals(today) error: {e}")
+
+                elif cmd == "/totalsmonth":
+                    try:
+                        send_telegram(format_per_asset_totals("month"))
+                    except Exception as e:
+                        send_telegram(f"❌ totals(month) error: {e}")
+
                 elif cmd == "/totals":
-                    # Usage:
-                    #   /totals           -> all history
-                    #   /totals today     -> only today
-                    #   /totals month     -> current month
-                    # ελληνικά aliases: "σήμερα", "μήνα"
+                    # Αν γράψεις σκέτο /totals ➜ all time
+                    # Αν γράψεις "/totals today" ή "σήμερα" ➜ today
+                    # Αν γράψεις "/totals month" ή "μήνα" ➜ month
                     txt = (text or "").strip().lower()
                     scope = "all"
                     if "today" in txt or "σήμερα" in txt:
                         scope = "today"
                     elif "month" in txt or "μήνα" in txt or "μηνα" in txt:
                         scope = "month"
-
                     try:
-                        # (προαιρετικά) ένα γρήγορο rescan για να ‘ναι up-to-date οι ποσότητες/τιμές αν θες:
-                        # rpc_discover_wallet_tokens(window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "40000")),
-                        #                            chunk=int(os.getenv("LOG_SCAN_CHUNK", "4000")))
                         send_telegram(format_per_asset_totals(scope))
                     except Exception as e:
                         send_telegram(f"❌ totals error: {e}")
