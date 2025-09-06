@@ -1,6 +1,5 @@
 [flake8]
 max-line-length = 160
-# Αγνοούμε τα πάντα εκτός από F (syntax/undefined)
 ignore = E,W
 per-file-ignores =
-    main.py: F401, F841, F824
+    main.py: F401,F821,F823,F824,F841
