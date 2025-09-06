@@ -31,6 +31,7 @@ from reports.aggregates import aggregate_per_asset
 from telegram.formatters import format_per_asset_totals
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import read_json, write_json, data_file_for_today, append_ledger
+from reports.ledger import update_cost_basis, replay_cost_basis_over_entries
 
 # ------------------------------------------------------------
 # Bootstrap
@@ -448,50 +449,6 @@ def fetch_latest_token_txs(limit=50):
 # ------------------------------------------------------------
 # Ledger helpers / cost-basis
 # ------------------------------------------------------------
-
-def _replay_today_cost_basis():
-    global _position_qty, _position_cost, _realized_pnl_today
-    _position_qty.clear()
-    _position_cost.clear()
-    _realized_pnl_today = 0.0
-    data = read_json(data_file_for_today(), default=None)
-    if not isinstance(data, dict):
-        return
-    for e in data.get("entries", []):
-        key = (e.get("token_addr") or (e.get("token") if e.get("token") == "CRO" else None)) or "CRO"
-        amt = float(e.get("amount") or 0.0)
-        price = float(e.get("price_usd") or 0.0)
-        realized = _update_cost_basis(key, amt, price)
-        e["realized_pnl"] = realized
-    try:
-        total_real = sum(float(e.get("realized_pnl", 0.0)) for e in data.get("entries", []))
-        data["realized_pnl"] = total_real
-        write_json(data_file_for_today(), data)
-    except Exception:
-        pass
-
-def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float):
-    global _realized_pnl_today
-    qty = _position_qty[token_key]
-    cost = _position_cost[token_key]
-    realized = 0.0
-    if signed_amount > EPSILON:
-        buy_qty = signed_amount
-        _position_qty[token_key] = qty + buy_qty
-        _position_cost[token_key] = cost + buy_qty * (price_usd or 0.0)
-    elif signed_amount < -EPSILON:
-        sell_qty_req = -signed_amount
-        if qty > EPSILON:
-            sell_qty = min(sell_qty_req, qty)
-            avg_cost = (cost / qty) if qty > EPSILON else (price_usd or 0.0)
-            realized = (price_usd - avg_cost) * sell_qty
-            _position_qty[token_key] = qty - sell_qty
-            _position_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
-        else:
-            realized = 0.0
-    _realized_pnl_today += realized
-    return realized
-
 # ------------------------------------------------------------
 # History maps (prices & symbol->contract)
 # ------------------------------------------------------------
@@ -1055,7 +1012,7 @@ def handle_native_tx(tx: dict):
     _token_balances["CRO"] += sign * amount_cro
     _token_meta["CRO"] = {"symbol": "CRO", "decimals": 18}
 
-    realized = _update_cost_basis("CRO", sign * amount_cro, price)
+    realized = update_cost_basis(_position_qty, _position_cost, "CRO", sign * amount_cro, price, eps=EPSILON)
 
     link = CRONOS_TX.format(txhash=h)
     send_telegram(
@@ -1122,7 +1079,7 @@ def handle_erc20_tx(t: dict):
         _token_balances[key] = 0.0
     _token_meta[key] = {"symbol": symbol, "decimals": decimals}
 
-    realized = _update_cost_basis(key, sign * amount, (price or 0.0))
+    realized = update_cost_basis(_position_qty, _position_cost, key, sign * amount, (price or 0.0), eps=EPSILON)
 
     try:
         if _nonzero(price):
@@ -1719,7 +1676,26 @@ def wallet_monitor_loop():
     except Exception:
         pass
 
-    _replay_today_cost_basis()
+        # Replay today's cost-basis from ledger (no globals inside logic)
+    try:
+        data = read_json(data_file_for_today(), default=None)
+        if isinstance(data, dict):
+            entries = data.get("entries", [])
+            pos_qty, pos_cost, total_real, updated_entries = replay_cost_basis_over_entries(entries, eps=EPSILON)
+
+            _position_qty.clear(); _position_qty.update(pos_qty)
+            _position_cost.clear(); _position_cost.update(pos_cost)
+
+            global _realized_pnl_today
+            _realized_pnl_today = float(total_real)
+
+            # persist updated realized per entry and total
+            data["entries"] = updated_entries
+            data["realized_pnl"] = float(total_real)
+            write_json(data_file_for_today(), data)
+    except Exception:
+        pass
+
     if WALLET_ADDRESS:
         send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}` (Cronos).")
 
