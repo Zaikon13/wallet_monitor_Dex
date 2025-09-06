@@ -21,7 +21,7 @@ import threading
 import logging
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
-
+from reports.ledger import update_cost_basis
 from dotenv import load_dotenv
 
 # externalized helpers
