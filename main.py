@@ -29,6 +29,7 @@ from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
 from reports.aggregates import aggregate_per_asset
 from telegram.formatters import format_per_asset_totals
+from reports.day_report import build_day_report_text as _compose_day_report
 
 # ------------------------------------------------------------
 # Bootstrap
@@ -995,82 +996,35 @@ def summarize_today_per_asset():
     result.sort(key=lambda r: abs(r["net_flow_today"]), reverse=True)
     return result
 # ------------------------------------------------------------
-# Month aggregates & day report text
+# Day report (wrapper that composes via reports/day_report.py)
 # ------------------------------------------------------------
-def sum_month_net_flows_and_realized():
-    pref = month_prefix()
-    total_flow = 0.0
-    total_real = 0.0
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json") and pref in fn:
-                data = read_json(os.path.join(DATA_DIR, fn), default=None)
-                if isinstance(data, dict):
-                    total_flow += float(data.get("net_usd_flow", 0.0))
-                    total_real += float(data.get("realized_pnl", 0.0))
-    except Exception:
-        pass
-    return total_flow, total_real
-
 def build_day_report_text():
+    """Διαβάζει τα σημερινά entries + υπολογίζει holdings και καλεί τον composer στο reports/day_report.py"""
     date_str = ymd()
     path = data_file_for_today()
-    data = read_json(path, default={"date": date_str, "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
+    data = read_json(
+        path,
+        default={"date": date_str, "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0},
+    )
     entries = data.get("entries", [])
     net_flow = float(data.get("net_usd_flow", 0.0))
     realized_today_total = float(data.get("realized_pnl", 0.0))
 
-    lines = [f"*📒 Daily Report* ({data.get('date')})"]
-    if not entries:
-        lines.append("_No transactions today._")
-    else:
-        def _ts_of(e):
-            try:
-                return datetime.strptime(e.get("time", "")[:19], "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return now_dt()
-        entries_sorted = sorted(entries, key=_ts_of)
-
-        lines.append("*Transactions:*")
-        MAX_TX_LINES = 60
-        cut = max(0, len(entries_sorted) - MAX_TX_LINES)
-        shown = entries_sorted[-MAX_TX_LINES:] if cut > 0 else entries_sorted
-        for e in shown:
-            tok = e.get("token") or "?"
-            amt = float(e.get("amount") or 0)
-            usd = float(e.get("usd_value") or 0)
-            tm = (e.get("time", "")[-8:]) or ""
-            direction = "IN" if amt > 0 else "OUT"
-            unit_price = float(e.get("price_usd") or 0.0)
-            rp = float(e.get("realized_pnl", 0.0) or 0.0)
-            pnl_line = f"  PnL: ${_format_amount(rp)}" if _nonzero(rp) else ""
-            lines.append(f"• {tm} — {direction} {tok} {_format_amount(amt)}  @ ${_format_price(unit_price)}  (${_format_amount(usd)}){pnl_line}")
-        if cut > 0:
-            lines.append(f"_…and {cut} earlier txs._")
-
+    # Προσπάθεια 1: live μέσω RPC, αλλιώς από ιστορικό
     holdings_total, breakdown, unrealized = compute_holdings_usd_via_rpc()
     if not breakdown:
         holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
 
-    lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
-    lines.append(f"*Realized PnL today:* ${_format_amount(realized_today_total)}")
-    lines.append(f"*Holdings (MTM) now:* ${_format_amount(holdings_total)}")
-    if breakdown:
-        for b in breakdown[:15]:
-            tok = b["token"]
-            amt = b["amount"]
-            pr = b["price_usd"]
-            val = b["usd_value"]
-            lines.append(f"  – {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
-        if len(breakdown) > 15:
-            lines.append(f"  …and {len(breakdown) - 15} more.")
-    if _nonzero(unrealized):
-        lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
-
-    month_flow, month_real = sum_month_net_flows_and_realized()
-    lines.append(f"\n*Month Net Flow:* ${_format_amount(month_flow)}")
-    lines.append(f"*Month Realized PnL:* ${_format_amount(month_real)}")
-    return "\n".join(lines)
+    return _compose_day_report(
+        date_str=date_str,
+        entries=entries,
+        net_flow=net_flow,
+        realized_today_total=realized_today_total,
+        holdings_total=holdings_total,
+        breakdown=breakdown,
+        unrealized=unrealized,
+        data_dir=DATA_DIR,
+    )
 
 # ------------------------------------------------------------
 # TX handlers (native/ERC20)
