@@ -1071,7 +1071,7 @@ def summarize_today_per_asset():
         sym = (e.get("token") or "?").upper()
         if sym == "TCRO": sym = "CRO"   # alias
         addr = (e.get("token_addr") or "").lower()
-        key = addr if addr.startswith("0x") else sym
+        key = resolve_token_key(sym, addr)
 
         rec = agg.get(key)
         if not rec:
