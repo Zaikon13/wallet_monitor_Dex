@@ -25,6 +25,9 @@ from datetime import datetime, timedelta
 import math
 import requests
 from dotenv import load_dotenv
+# externalized helpers
+from utils.http import safe_get, safe_json
+from telegram.api import send_telegram
 
 # ------------------------------------------------------------
 # Bootstrap
@@ -126,7 +129,6 @@ DEX_BASE_PAIRS   = "https://api.dexscreener.com/latest/dex/pairs"
 DEX_BASE_TOKENS  = "https://api.dexscreener.com/latest/dex/tokens"
 DEX_BASE_SEARCH  = "https://api.dexscreener.com/latest/dex/search"
 CRONOS_TX        = "https://cronoscan.com/tx/{txhash}"
-TELEGRAM_URL     = "https://api.telegram.org/bot{token}/sendMessage"
 DATA_DIR         = "/app/data"
 ATH_PATH         = os.path.join(DATA_DIR, "ath.json")
 
@@ -139,45 +141,6 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("wallet-monitor")
-
-# ------------------------------------------------------------
-# HTTP session (+rate limit)
-# ------------------------------------------------------------
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
-
-_last_req_ts = 0.0
-REQS_PER_SEC = 5
-MIN_GAP = 1.0 / REQS_PER_SEC
-
-def safe_json(r):
-    if r is None:
-        return None
-    if not getattr(r, "ok", False):
-        return None
-    try:
-        return r.json()
-    except Exception:
-        return None
-
-def safe_get(url, params=None, timeout=12, retries=3, backoff=1.5):
-    global _last_req_ts
-    for i in range(retries):
-        gap = time.time() - _last_req_ts
-        if gap < MIN_GAP:
-            time.sleep(MIN_GAP - gap)
-        try:
-            resp = SESSION.get(url, params=params, timeout=timeout)
-            _last_req_ts = time.time()
-            if resp.status_code == 200:
-                return resp
-            if resp.status_code in (404, 429, 502, 503):
-                time.sleep(backoff * (i + 1))
-                continue
-            return resp
-        except Exception:
-            time.sleep(backoff * (i + 1))
-    return None
 
 # ------------------------------------------------------------
 # Shutdown & Runtime state
@@ -263,23 +226,6 @@ def _nonzero(v, eps=1e-12):
     try:
         return abs(float(v)) > eps
     except Exception:
-        return False
-
-def send_telegram(message: str) -> bool:
-    try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("Telegram not configured.")
-            return False
-        url = TELEGRAM_URL.format(token=TELEGRAM_BOT_TOKEN)
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        r = safe_get(url, params=payload, timeout=12, retries=2)
-        if not r or r.status_code != 200:
-            if r:
-                log.warning("Telegram status %s: %s", r.status_code, r.text[:200])
-            return False
-        return True
-    except Exception as e:
-        log.exception("send_telegram exception: %s", e)
         return False
 
 # ------------------------------------------------------------
