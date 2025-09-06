@@ -9,9 +9,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Κλείνει ΟΛΑ τα auto-plugins του pytest (λύνει το web3/eth_typing import error)
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Show workspace (debug)
+      run: |
+        pwd
+        ls -la
+        echo "---- .flake8 ----"
+        if [ -f .flake8 ]; then cat .flake8; else echo "NO .flake8 FOUND"; fi
+        echo "-----------------"
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -24,17 +36,17 @@ jobs:
         pip install -r requirements.txt
         pip install pytest flake8
 
-    # 🚩 Χρησιμοποιεί ΡΗΤΑ το .flake8 του repo
+    # Χρησιμοποιεί ΡΗΤΑ το .flake8 του repo (με absolute path για να μην υπάρχει αμφιβολία)
     - name: Lint (flake8 with repo config)
-      run: flake8 --config .flake8 .
+      run: |
+        echo "Using flake8 config at $GITHUB_WORKSPACE/.flake8"
+        flake8 --config "$GITHUB_WORKSPACE/.flake8" .
 
     - name: Syntax check
       run: python -m py_compile main.py
 
-    # 🚩 Κλείνουμε auto-loading pytest plugins (διορθώνει το web3/eth_typing ImportError)
     - name: Pytest (smoke)
       env:
-        PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         TELEGRAM_BOT_TOKEN: ""
         TELEGRAM_CHAT_ID: ""
         WALLET_ADDRESS: "0x0000000000000000000000000000000000000000"
