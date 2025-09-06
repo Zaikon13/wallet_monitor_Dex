@@ -1623,7 +1623,8 @@ def wallet_monitor_loop():
     except Exception:
         pass
 
-    _replay_today_cost_basis()
+    seed_positions_from_history()
+    replay_today_on_top_of_seed()
     if WALLET_ADDRESS:
         send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}` (Cronos).")
 
