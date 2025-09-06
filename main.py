@@ -12,8 +12,6 @@ Features:
   /totals, /totalstoday, /totalsmonth
 """
 
-from __future__ import annotations
-
 import os
 import sys
 import time
@@ -26,34 +24,24 @@ from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
-# external helpers
+# externalized helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
-
-# reports modules
-from reports.ledger import (
-    read_json,
-    write_json,
-    data_file_for_today,
-    append_ledger,
-    replay_cost_basis_over_entries,
-    update_cost_basis,
-)
-from reports.aggregates import (
-    format_per_asset_totals,
-    build_day_report_text,
-)
+from reports.aggregates import aggregate_per_asset
+from telegram.formatters import format_per_asset_totals
+from reports.day_report import build_day_report_text as _compose_day_report
 
 # ------------------------------------------------------------
 # Bootstrap
 # ------------------------------------------------------------
 load_dotenv()
 
+# --- ENV Aliases (Railway -> code) ---
 def _alias_env(src: str, dst: str):
     if os.getenv(dst) is None and os.getenv(src) is not None:
         os.environ[dst] = os.getenv(src)
 
-# Railway env aliases (back-compat)
+# align naming mismatches seen on Railway
 _alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
 _alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
 
@@ -196,6 +184,22 @@ except Exception:
 # ------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------
+def read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def data_file_for_today():
+    return os.path.join(DATA_DIR, f"transactions_{ymd()}.json")
+
 def _format_amount(a):
     try:
         a = float(a)
@@ -226,6 +230,9 @@ def _nonzero(v, eps=1e-12):
     except Exception:
         return False
 
+# ------------------------------------------------------------
+# ATH persistence
+# ------------------------------------------------------------
 def load_ath():
     global ATH
     ATH = read_json(ATH_PATH, default={})
@@ -242,10 +249,7 @@ def update_ath(key: str, live_price: float):
     if prev is None or live_price > prev + 1e-12:
         ATH[key] = live_price
         save_ath()
-        try:
-            send_telegram(f"🏆 New ATH {key}: ${_format_price(live_price)}")
-        except Exception:
-            pass
+        send_telegram(f"🏆 New ATH {key}: ${_format_price(live_price)}")
 
 # ------------------------------------------------------------
 # Dexscreener pricing
@@ -456,6 +460,60 @@ def fetch_latest_token_txs(limit=50):
     return []
 
 # ------------------------------------------------------------
+# Ledger helpers / cost-basis
+# ------------------------------------------------------------
+def _append_ledger(entry: dict):
+    path = data_file_for_today()
+    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
+    data["entries"].append(entry)
+    data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
+    data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
+    write_json(path, data)
+
+def _replay_today_cost_basis():
+    global _position_qty, _position_cost, _realized_pnl_today
+    _position_qty.clear()
+    _position_cost.clear()
+    _realized_pnl_today = 0.0
+    data = read_json(data_file_for_today(), default=None)
+    if not isinstance(data, dict):
+        return
+    for e in data.get("entries", []):
+        key = (e.get("token_addr") or (e.get("token") if e.get("token") == "CRO" else None)) or "CRO"
+        amt = float(e.get("amount") or 0.0)
+        price = float(e.get("price_usd") or 0.0)
+        realized = _update_cost_basis(key, amt, price)
+        e["realized_pnl"] = realized
+    try:
+        total_real = sum(float(e.get("realized_pnl", 0.0)) for e in data.get("entries", []))
+        data["realized_pnl"] = total_real
+        write_json(data_file_for_today(), data)
+    except Exception:
+        pass
+
+def _update_cost_basis(token_key: str, signed_amount: float, price_usd: float):
+    global _realized_pnl_today
+    qty = _position_qty[token_key]
+    cost = _position_cost[token_key]
+    realized = 0.0
+    if signed_amount > EPSILON:
+        buy_qty = signed_amount
+        _position_qty[token_key] = qty + buy_qty
+        _position_cost[token_key] = cost + buy_qty * (price_usd or 0.0)
+    elif signed_amount < -EPSILON:
+        sell_qty_req = -signed_amount
+        if qty > EPSILON:
+            sell_qty = min(sell_qty_req, qty)
+            avg_cost = (cost / qty) if qty > EPSILON else (price_usd or 0.0)
+            realized = (price_usd - avg_cost) * sell_qty
+            _position_qty[token_key] = qty - sell_qty
+            _position_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
+        else:
+            realized = 0.0
+    _realized_pnl_today += realized
+    return realized
+
+# ------------------------------------------------------------
 # History maps (prices & symbol->contract)
 # ------------------------------------------------------------
 def _build_history_maps():
@@ -652,7 +710,9 @@ def rpc_discover_wallet_tokens(window_blocks: int = None, chunk: int = None):
     found_positive = 0
     for addr in sorted(contracts):
         try:
+            # meta
             sym, dec = rpc_get_symbol_decimals(addr)
+            # balance
             bal = rpc_get_erc20_balance(addr, WALLET_ADDRESS)
             if bal > EPSILON:
                 _token_balances[addr] = bal
@@ -759,55 +819,6 @@ def get_wallet_balances_snapshot():
             sym = "CRO"
         balances[sym] = balances.get(sym, 0.0) + amt
     return balances
-def rebuild_open_positions_from_history():
-    pos_qty = defaultdict(float)
-    pos_cost = defaultdict(float)
-    symbol_to_contract = _build_history_maps()
-
-    def _upd(token_key, signed_amount, price_usd):
-        qty = pos_qty[token_key]
-        cost = pos_cost[token_key]
-        if signed_amount > EPSILON:
-            pos_qty[token_key] = qty + signed_amount
-            pos_cost[token_key] = cost + signed_amount * (price_usd or 0.0)
-        elif signed_amount < -EPSILON and qty > EPSILON:
-            sell_qty = min(-signed_amount, qty)
-            avg_cost = (cost / qty) if qty > EPSILON else (price_usd or 0.0)
-            pos_qty[token_key] = qty - sell_qty
-            pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
-
-    files = []
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"):
-                files.append(fn)
-    except Exception as ex:
-        log.exception("listdir data error: %s", ex)
-
-    files.sort()
-    for fn in files:
-        data = read_json(os.path.join(DATA_DIR, fn), default=None)
-        if not isinstance(data, dict):
-            continue
-        for e in data.get("entries", []):
-            sym_raw = (e.get("token") or "").strip()
-            addr_raw = (e.get("token_addr") or "").strip().lower()
-            amt = float(e.get("amount") or 0.0)
-            pr = float(e.get("price_usd") or 0.0)
-            symU = sym_raw.upper() if sym_raw else sym_raw
-            if symU == "TCRO":
-                symU = "CRO"
-            if addr_raw and addr_raw.startswith("0x"):
-                key = addr_raw
-            else:
-                mapped = symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
-                key = mapped if (mapped and mapped.startswith("0x")) else ("CRO" if symU == "CRO" else symU)
-            _upd(key, amt, pr)
-
-    for k, v in list(pos_qty.items()):
-        if abs(v) < 1e-10:
-            pos_qty[k] = 0.0
-    return pos_qty, pos_cost
 
 def compute_holdings_usd_from_history_positions():
     pos_qty, pos_cost = rebuild_open_positions_from_history()
@@ -865,6 +876,159 @@ def compute_holdings_usd_from_history_positions():
     breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
     return total, breakdown, unrealized
 
+def rebuild_open_positions_from_history():
+    pos_qty = defaultdict(float)
+    pos_cost = defaultdict(float)
+    symbol_to_contract = _build_history_maps()
+
+    def _update(pos_qty, pos_cost, token_key, signed_amount, price_usd):
+        qty = pos_qty[token_key]
+        cost = pos_cost[token_key]
+        if signed_amount > EPSILON:
+            pos_qty[token_key] = qty + signed_amount
+            pos_cost[token_key] = cost + signed_amount * (price_usd or 0.0)
+        elif signed_amount < -EPSILON and qty > EPSILON:
+            sell_qty = min(-signed_amount, qty)
+            avg_cost = (cost / qty) if qty > EPSILON else (price_usd or 0.0)
+            pos_qty[token_key] = qty - sell_qty
+            pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
+
+    files = []
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception as ex:
+        log.exception("listdir data error: %s", ex)
+
+    files.sort()
+    for fn in files:
+        data = read_json(os.path.join(DATA_DIR, fn), default=None)
+        if not isinstance(data, dict):
+            continue
+        for e in data.get("entries", []):
+            sym_raw = (e.get("token") or "").strip()
+            addr_raw = (e.get("token_addr") or "").strip().lower()
+            amt = float(e.get("amount") or 0.0)
+            pr = float(e.get("price_usd") or 0.0)
+            symU = sym_raw.upper() if sym_raw else sym_raw
+            if symU == "TCRO":
+                symU = "CRO"
+            if addr_raw and addr_raw.startswith("0x"):
+                key = addr_raw
+            else:
+                mapped = symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
+                key = mapped if (mapped and mapped.startswith("0x")) else ("CRO" if symU == "CRO" else symU)
+            _update(pos_qty, pos_cost, key, amt, pr)
+
+    for k, v in list(pos_qty.items()):
+        if abs(v) < 1e-10:
+            pos_qty[k] = 0.0
+    return pos_qty, pos_cost
+
+# ------------------------------------------------------------
+# Per-asset summarize (today) — (παλιό σου section, μένει ως έχει)
+# ------------------------------------------------------------
+def summarize_today_per_asset():
+    path = data_file_for_today()
+    data = read_json(path, default={"date": ymd(), "entries": []})
+    entries = data.get("entries", [])
+
+    agg = {}
+    for e in entries:
+        sym = (e.get("token") or "?").upper()
+        if sym == "TCRO":
+            sym = "CRO"
+        addr = (e.get("token_addr") or "").lower()
+        key = addr if addr.startswith("0x") else sym
+
+        rec = agg.get(key)
+        if not rec:
+            rec = {
+                "symbol": sym,
+                "token_addr": addr if addr else None,
+                "buy_qty": 0.0,
+                "sell_qty": 0.0,
+                "net_qty_today": 0.0,
+                "net_flow_today": 0.0,
+                "realized_today": 0.0,
+                "txs": [],
+                "last_price_seen": 0.0,
+            }
+            agg[key] = rec
+
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        prc = float(e.get("price_usd") or 0.0)
+        rp = float(e.get("realized_pnl") or 0.0)
+        tm = (e.get("time", "")[-8:]) or ""
+        direction = "IN" if amt > 0 else "OUT"
+
+        rec["txs"].append({"time": tm, "dir": direction, "amount": amt, "price": prc, "usd": usd, "realized": rp})
+        if amt > 0:
+            rec["buy_qty"] += amt
+        if amt < 0:
+            rec["sell_qty"] += -amt
+        rec["net_qty_today"] += amt
+        rec["net_flow_today"] += usd
+        rec["realized_today"] += rp
+        if prc > 0:
+            rec["last_price_seen"] = prc
+
+    result = []
+    for key, rec in agg.items():
+        if rec["token_addr"]:
+            price_now = get_price_usd(rec["token_addr"]) or rec["last_price_seen"]
+            gkey = rec["token_addr"]
+        else:
+            price_now = get_price_usd(rec["symbol"]) or rec["last_price_seen"]
+            gkey = rec["symbol"]
+        open_qty_now = _position_qty.get(gkey, 0.0)
+        open_cost_now = _position_cost.get(gkey, 0.0)
+        unreal_now = 0.0
+        if open_qty_now > EPSILON and _nonzero(price_now):
+            unreal_now = open_qty_now * price_now - open_cost_now
+
+        rec["price_now"] = price_now or 0.0
+        rec["unreal_now"] = unreal_now
+        result.append(rec)
+
+    result.sort(key=lambda r: abs(r["net_flow_today"]), reverse=True)
+    return result
+# ------------------------------------------------------------
+# Month aggregates & day report text
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# Day report (wrapper that composes via reports/day_report.py)
+# ------------------------------------------------------------
+def build_day_report_text():
+    """Διαβάζει τα σημερινά entries + υπολογίζει holdings και καλεί τον composer στο reports/day_report.py"""
+    date_str = ymd()
+    path = data_file_for_today()
+    data = read_json(
+        path,
+        default={"date": date_str, "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0},
+    )
+    entries = data.get("entries", [])
+    net_flow = float(data.get("net_usd_flow", 0.0))
+    realized_today_total = float(data.get("realized_pnl", 0.0))
+
+    # Προσπάθεια 1: live μέσω RPC, αλλιώς από ιστορικό
+    holdings_total, breakdown, unrealized = compute_holdings_usd_via_rpc()
+    if not breakdown:
+        holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+
+    return _compose_day_report(
+        date_str=date_str,
+        entries=entries,
+        net_flow=net_flow,
+        realized_today_total=realized_today_total,
+        holdings_total=holdings_total,
+        breakdown=breakdown,
+        unrealized=unrealized,
+        data_dir=DATA_DIR,
+    )
+
 # ------------------------------------------------------------
 # TX handlers (native/ERC20)
 # ------------------------------------------------------------
@@ -915,7 +1079,7 @@ def handle_native_tx(tx: dict):
     _token_balances["CRO"] += sign * amount_cro
     _token_meta["CRO"] = {"symbol": "CRO", "decimals": 18}
 
-    realized = update_cost_basis(_position_qty, _position_cost, "CRO", sign * amount_cro, price, eps=EPSILON)
+    realized = _update_cost_basis("CRO", sign * amount_cro, price)
 
     link = CRONOS_TX.format(txhash=h)
     send_telegram(
@@ -939,7 +1103,7 @@ def handle_native_tx(tx: dict):
         "from": frm,
         "to": to,
     }
-    append_ledger(entry)
+    _append_ledger(entry)
 
 def handle_erc20_tx(t: dict):
     h = t.get("hash")
@@ -982,7 +1146,7 @@ def handle_erc20_tx(t: dict):
         _token_balances[key] = 0.0
     _token_meta[key] = {"symbol": symbol, "decimals": decimals}
 
-    realized = update_cost_basis(_position_qty, _position_cost, key, sign * amount, (price or 0.0), eps=EPSILON)
+    realized = _update_cost_basis(key, sign * amount, (price or 0.0))
 
     try:
         if _nonzero(price):
@@ -1023,7 +1187,7 @@ def handle_erc20_tx(t: dict):
         "from": frm,
         "to": to,
     }
-    append_ledger(entry)
+    _append_ledger(entry)
 
 # ------------------------------------------------------------
 # Dexscreener pair monitor + discovery
@@ -1357,7 +1521,7 @@ def _tg_get_updates(timeout=20):
     if not TELEGRAM_BOT_TOKEN:
         return []
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout, "offset": _TELEGRAM_UPDATE_OFFSET + 1, "allowed_updates": json.dumps(["message"]) }
+    params = {"timeout": timeout, "offset": _TELEGRAM_UPDATE_OFFSET + 1, "allowed_updates": json.dumps(["message"])}
     r = safe_get(url, params=params, timeout=timeout + 5, retries=2)
     data = safe_json(r) or {}
     results = data.get("result") or []
@@ -1420,8 +1584,42 @@ def _format_wallet_assets_message():
     return "\n".join(lines)
 
 def _format_daily_sum_message():
-    # Χρησιμοποιούμε το build_day_report_text για να μην υπάρξει διπλή λογική
-    return build_day_report_text()
+    per = summarize_today_per_asset()
+    if not per:
+        return "🧾 Δεν υπάρχουν σημερινές κινήσεις."
+
+    tot_real = sum(float(r.get("realized_today", 0.0)) for r in per)
+    tot_flow = sum(float(r.get("net_flow_today", 0.0)) for r in per)
+    tot_unrl = sum(float(r.get("unreal_now", 0.0) or 0.0) for r in per)
+
+    per_sorted = sorted(
+        per,
+        key=lambda r: (abs(float(r.get("realized_today", 0.0))), abs(float(r.get("net_flow_today", 0.0)))),
+        reverse=True,
+    )
+
+    lines = [f"*🧾 Daily PnL (Today {ymd()}):*"]
+    for r in per_sorted:
+        tok = r.get("symbol") or "?"
+        flow = float(r.get("net_flow_today", 0.0))
+        real = float(r.get("realized_today", 0.0))
+        qty = float(r.get("net_qty_today", 0.0))
+        pr = float(r.get("price_now", 0.0) or 0.0)
+        un = float(r.get("unreal_now", 0.0) or 0.0)
+        base = f"• {tok}: realized ${_format_amount(real)} | flow ${_format_amount(flow)} | qty {_format_amount(qty)}"
+        if _nonzero(pr):
+            base += f" | price ${_format_price(pr)}"
+        if _nonzero(un):
+            base += f" | unreal ${_format_amount(un)}"
+        lines.append(base)
+
+    lines.append("")
+    lines.append(f"*Σύνολο realized σήμερα:* ${_format_amount(tot_real)}")
+    lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(tot_flow)}")
+    if _nonzero(tot_unrl):
+        lines.append(f"*Σύνολο unreal (open τώρα):* ${_format_amount(tot_unrl)}")
+
+    return "\n".join(lines)
 
 def telegram_commands_loop():
     send_telegram("🧩 Telegram commands listener ενεργό...")
@@ -1504,6 +1702,7 @@ def telegram_commands_loop():
 
                 elif cmd == "/totalstoday":
                     try:
+                        # format_per_asset_totals είναι από telegram/formatters.py
                         send_telegram(format_per_asset_totals("today"))
                     except Exception as e:
                         send_telegram(f"❌ totals(today) error: {e}")
@@ -1544,14 +1743,7 @@ def wallet_monitor_loop():
     except Exception:
         pass
 
-    # Rebuild cost-basis from today's ledger entries (if any), keep runtime state in sync
-    today_data = read_json(data_file_for_today(), default={"date": ymd(), "entries": []})
-    entries = today_data.get("entries", [])
-    if entries:
-        _position_qty.clear()
-        _position_cost.clear()
-        _, _, _ = replay_cost_basis_over_entries(entries, eps=EPSILON)
-
+    _replay_today_cost_basis()
     if WALLET_ADDRESS:
         send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}` (Cronos).")
 
