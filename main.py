@@ -22,12 +22,13 @@ import logging
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 
-import math
-import requests
 from dotenv import load_dotenv
+
 # externalized helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
+from reports.aggregates import aggregate_per_asset
+from telegram.formatters import format_per_asset_totals
 
 # ------------------------------------------------------------
 # Bootstrap
@@ -925,115 +926,6 @@ def rebuild_open_positions_from_history():
     return pos_qty, pos_cost
 
 # ------------------------------------------------------------
-# Aggregations (ALL / MONTH / TODAY) & formatters
-# ------------------------------------------------------------
-def _load_entries_between(start_date=None, end_date=None):
-    files = []
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"):
-                files.append(fn)
-    except Exception:
-        pass
-    files.sort()
-    out = []
-    for fn in files:
-        path = os.path.join(DATA_DIR, fn)
-        data = read_json(path, default=None)
-        if not isinstance(data, dict):
-            continue
-        dstr = (data.get("date") or fn.replace("transactions_", "").replace(".json", "")).strip()
-        if start_date and dstr < start_date:
-            continue
-        if end_date and dstr > end_date:
-            continue
-        for e in data.get("entries", []):
-            out.append(e)
-    return out
-
-def aggregate_per_asset(scope: str = "all"):
-    if scope == "today":
-        start_date = end_date = ymd()
-    elif scope == "month":
-        mp = month_prefix()
-        start_date, end_date = mp + "-01", mp + "-31"
-    else:
-        start_date = end_date = None
-
-    entries = _load_entries_between(start_date, end_date)
-    agg = {}
-    for e in entries:
-        sym = (e.get("token") or "?").upper()
-        if sym == "TCRO":
-            sym = "CRO"
-        addr = (e.get("token_addr") or "").lower()
-        key = addr if (addr.startswith("0x")) else sym
-
-        rec = agg.get(key)
-        if not rec:
-            rec = {
-                "key": key,
-                "symbol": sym,
-                "token_addr": addr if addr.startswith("0x") else None,
-                "in_qty": 0.0,
-                "out_qty": 0.0,
-                "in_usd": 0.0,
-                "out_usd": 0.0,
-                "realized": 0.0,
-                "tx_count": 0,
-            }
-            agg[key] = rec
-
-        amt = float(e.get("amount") or 0.0)
-        usd = float(e.get("usd_value") or 0.0)
-        rp = float(e.get("realized_pnl") or 0.0)
-
-        rec["tx_count"] += 1
-        if amt > 0:
-            rec["in_qty"] += amt
-            rec["in_usd"] += usd
-        elif amt < 0:
-            rec["out_qty"] += -amt
-            rec["out_usd"] += -usd
-        rec["realized"] += rp
-
-    out = []
-    for r in agg.values():
-        r["net_qty"] = r["in_qty"] - r["out_qty"]
-        r["net_usd"] = r["in_usd"] - r["out_usd"]
-        out.append(r)
-
-    out.sort(key=lambda z: abs(float(z.get("net_usd", 0.0))), reverse=True)
-    return out
-
-def format_per_asset_totals(scope: str = "all", limit: int = 40) -> str:
-    data = aggregate_per_asset(scope)
-    if not data:
-        label = "σήμερα" if scope == "today" else ("τον μήνα" if scope == "month" else "όλο το ιστορικό")
-        return f"🧮 Δεν βρέθηκαν κινήσεις για {label}."
-
-    title = {"today": "Today", "month": "This Month", "all": "All Time"}[scope]
-    lines = [f"*📊 Totals per Asset — {title}:*"]
-    for i, r in enumerate(data[:limit], 1):
-        sym = r.get("symbol") or "?"
-        iq, oq = float(r["in_qty"]), float(r["out_qty"])
-        iu, ou = float(r["in_usd"]), float(r["out_usd"])
-        netq = float(r["net_qty"])
-        netu = float(r["net_usd"])
-        real = float(r["realized"])
-        txc = int(r.get("tx_count", 0))
-        lines.append(
-            f"{i:>2}. *{sym}*  "
-            f"IN: {_format_amount(iq)} (${_format_amount(iu)}) | "
-            f"OUT: {_format_amount(oq)} (${_format_amount(ou)}) | "
-            f"NET: {_format_amount(netq)} (${_format_amount(netu)}) | "
-            f"Realized: ${_format_amount(real)} | TXs: {txc}"
-        )
-    if len(data) > limit:
-        lines.append(f"_…and {len(data) - limit} more._")
-    return "\n".join(lines)
-
-# ------------------------------------------------------------
 # Per-asset summarize (today) — (παλιό σου section, μένει ως έχει)
 # ------------------------------------------------------------
 def summarize_today_per_asset():
@@ -1102,7 +994,6 @@ def summarize_today_per_asset():
 
     result.sort(key=lambda r: abs(r["net_flow_today"]), reverse=True)
     return result
-
 # ------------------------------------------------------------
 # Month aggregates & day report text
 # ------------------------------------------------------------
@@ -1673,7 +1564,7 @@ def _tg_get_updates(timeout=20):
     if not TELEGRAM_BOT_TOKEN:
         return []
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout, "offset": _TELEGRAM_UPDATE_OFFSET + 1, "allowed_updates": json.dumps(["message"]) }
+    params = {"timeout": timeout, "offset": _TELEGRAM_UPDATE_OFFSET + 1, "allowed_updates": json.dumps(["message"])}
     r = safe_get(url, params=params, timeout=timeout + 5, retries=2)
     data = safe_json(r) or {}
     results = data.get("result") or []
@@ -1854,6 +1745,7 @@ def telegram_commands_loop():
 
                 elif cmd == "/totalstoday":
                     try:
+                        # format_per_asset_totals είναι από telegram/formatters.py
                         send_telegram(format_per_asset_totals("today"))
                     except Exception as e:
                         send_telegram(f"❌ totals(today) error: {e}")
