@@ -179,17 +179,6 @@ except Exception:
     pass
 
 # ----------------------- Utils -----------------------
-def now_dt():
-    return datetime.now()
-
-def ymd(dt=None):
-    if dt is None: dt = now_dt()
-    return dt.strftime("%Y-%m-%d")
-
-def month_prefix(dt=None):
-    if dt is None: dt = now_dt()
-    return dt.strftime("%Y-%m")
-
 def data_file_for_today():
     return os.path.join(DATA_DIR, f"transactions_{ymd()}.json")
 
@@ -1307,7 +1296,7 @@ def handle_native_tx(tx: dict):
     frm = (tx.get("from") or "").lower()
     to  = (tx.get("to") or "").lower()
     ts  = int(tx.get("timeStamp") or 0)
-    dt  = datetime.fromtimestamp(ts) if ts>0 else now_dt()
+    dt  = datetime.fromtimestamp(ts, LOCAL_TZ) if ts>0 else now_dt()
 
     sign = +1 if to==WALLET_ADDRESS else (-1 if frm==WALLET_ADDRESS else 0)
     if sign==0 or abs(amount_cro)<=EPSILON: return
@@ -1360,7 +1349,7 @@ def handle_erc20_tx(t: dict):
         except Exception: amount = 0.0
 
     ts = int(t.get("timeStamp") or 0)
-    dt = datetime.fromtimestamp(ts) if ts>0 else now_dt()
+    dt = datetime.fromtimestamp(ts, LOCAL_TZ) if ts>0 else now_dt()
     sign = +1 if to==WALLET_ADDRESS else -1
 
     # Contract-first pricing
