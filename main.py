@@ -30,6 +30,7 @@ from telegram.api import send_telegram
 from reports.aggregates import aggregate_per_asset
 from telegram.formatters import format_per_asset_totals
 from reports.day_report import build_day_report_text as _compose_day_report
+from reports.ledger import read_json, write_json, data_file_for_today, append_ledger
 
 # ------------------------------------------------------------
 # Bootstrap
@@ -184,21 +185,6 @@ except Exception:
 # ------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------
-def read_json(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-def write_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-def data_file_for_today():
-    return os.path.join(DATA_DIR, f"transactions_{ymd()}.json")
 
 def _format_amount(a):
     try:
@@ -462,13 +448,6 @@ def fetch_latest_token_txs(limit=50):
 # ------------------------------------------------------------
 # Ledger helpers / cost-basis
 # ------------------------------------------------------------
-def _append_ledger(entry: dict):
-    path = data_file_for_today()
-    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
-    data["entries"].append(entry)
-    data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
-    data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
-    write_json(path, data)
 
 def _replay_today_cost_basis():
     global _position_qty, _position_cost, _realized_pnl_today
@@ -1100,7 +1079,7 @@ def handle_native_tx(tx: dict):
         "from": frm,
         "to": to,
     }
-    _append_ledger(entry)
+    append_ledger(entry, DATA_DIR)
 
 def handle_erc20_tx(t: dict):
     h = t.get("hash")
@@ -1184,7 +1163,7 @@ def handle_erc20_tx(t: dict):
         "from": frm,
         "to": to,
     }
-    _append_ledger(entry)
+    append_ledger(entry, DATA_DIR)
 
 # ------------------------------------------------------------
 # Dexscreener pair monitor + discovery
