@@ -17,9 +17,13 @@ from datetime import datetime, timedelta
 import math
 import requests
 from dotenv import load_dotenv
+from core.config import apply_env_aliases
+from core.tz import tz_init, LOCAL_TZ, now_dt, ymd, month_prefix
 
 load_dotenv()
 
+apply_env_aliases()          # κάνει map τα Railway env names
+tz_init(os.getenv("TZ","Europe/Athens"))  # κλειδώνει Europe/Athens σε ΟΛΟ το process
 # ----------------------- Config / ENV -----------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID") or ""
