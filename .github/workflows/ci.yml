@@ -25,8 +25,7 @@ jobs:
         pip install pytest flake8
 
     - name: Lint (flake8)
-      run: |
-        flake8 . --max-line-length=120 --exclude .git,__pycache__,.venv
+      run: flake8 .
 
     - name: Syntax check
       run: python -m py_compile main.py
