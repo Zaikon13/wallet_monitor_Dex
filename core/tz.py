@@ -1,23 +1,23 @@
-# sentinel/core/tz.py
-import os, time as _time
+# core/tz.py
+import os, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# Θα οριστικοποιηθεί με tz_init() στην εκκίνηση
 LOCAL_TZ = ZoneInfo(os.getenv("TZ", "Europe/Athens"))
 
-def init_tz(tz_str: str | None):
-    """
-    Θέτει OS TZ, κάνει tzset (όπου υποστηρίζεται) και ορίζει ZoneInfo.
-    """
-    global LOCAL_TZ
-    tz = tz_str or "Europe/Athens"
+def tz_init(tz_str: str | None = None):
+    """Κλειδώνει το timezone σε όλο το process (Europe/Athens by default)."""
+    tz = (tz_str or os.getenv("TZ") or "Europe/Athens").strip()
     os.environ["TZ"] = tz
     try:
-        if hasattr(_time, "tzset"):
-            _time.tzset()
+        if hasattr(time, "tzset"):
+            time.tzset()
     except Exception:
         pass
+    global LOCAL_TZ
     LOCAL_TZ = ZoneInfo(tz)
+    return LOCAL_TZ
 
 def now_dt():
     return datetime.now(LOCAL_TZ)
