@@ -945,6 +945,30 @@ def rebuild_open_positions_from_history():
 def compute_holdings_usd_from_history_positions():
     pos_qty, pos_cost = rebuild_open_positions_from_history()
     total = 0.0; breakdown = []; unrealized = 0.0
+    
+def seed_positions_from_history():
+    """Φόρτωσε ΟΛΑ τα ανοιχτά lots από *όλο* το ιστορικό στο _position_qty/_position_cost."""
+    global _position_qty, _position_cost
+    pos_qty, pos_cost = rebuild_open_positions_from_history()
+    _position_qty.clear(); _position_cost.clear()
+    _position_qty.update(pos_qty); _position_cost.update(pos_cost)
+
+def replay_today_on_top_of_seed():
+    """Ξαναπαίζει τις σημερινές entries ΠΑΝΩ στα seeded lots για να γραφτεί σωστά το realized σήμερα."""
+    path = data_file_for_today()
+    data = read_json(path, default=None)
+    if not isinstance(data, dict):
+        return
+    for e in data.get("entries", []):
+        key = (e.get("token_addr") or (e.get("token") if e.get("token")=="CRO" else None)) or "CRO"
+        amt = float(e.get("amount") or 0.0)
+        price = float(e.get("price_usd") or 0.0)
+        e["realized_pnl"] = _update_cost_basis(key, amt, price)
+    try:
+        data["realized_pnl"] = sum(float(x.get("realized_pnl", 0.0)) for x in data.get("entries", []))
+    except Exception:
+        pass
+    write_json(path, data)
 
     def _sym_for_key(key):
         if key == "CRO": return "CRO"
