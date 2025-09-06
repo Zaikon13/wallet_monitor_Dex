@@ -1047,6 +1047,106 @@ def replay_today_on_top_of_seed():
 
     breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
     return total, breakdown, unrealized
+# ----------------------- HISTORY LOADER (date-filter) -----------------------
+def _load_entries_between(start_date=None, end_date=None):
+    """
+    Διαβάζει ΟΛΑ τα transactions_YYYY-MM-DD.json από το DATA_DIR και
+    επιστρέφει entries φιλτραρισμένα ανά ημερομηνία (inclusive).
+    Αν δεν δοθεί φίλτρο → επιστρέφει όλα τα entries.
+    """
+    files = []
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception:
+        pass
+
+    files.sort()
+    out = []
+    for fn in files:
+        path = os.path.join(DATA_DIR, fn)
+        data = read_json(path, default=None)
+        if not isinstance(data, dict):
+            continue
+
+        # Προσπαθούμε να πάρουμε την ημερομηνία από το payload, αλλιώς από το όνομα αρχείου
+        dstr = (data.get("date") or fn.replace("transactions_", "").replace(".json", "")).strip()
+
+        # Φίλτρα ημερομηνίας (inclusive)
+        if start_date and dstr < start_date:
+            continue
+        if end_date and dstr > end_date:
+            continue
+
+        for e in data.get("entries", []):
+            out.append(e)
+
+    return out
+# ----------------------- TOTALS PER ASSET (ALL / MONTH / TODAY) -----------------------
+def aggregate_per_asset(scope: str = "all"):
+    """
+    Επιστρέφει λίστα από dicts με συγκεντρωτικά ανά asset:
+      in_qty, out_qty, in_usd, out_usd, net_qty, net_usd, realized, tx_count
+    scope ∈ {"all","month","today"}.
+    """
+    # 1) Υπολογισμός ημερομηνιακού φίλτρου
+    if scope == "today":
+        start_date = end_date = ymd()
+    elif scope == "month":
+        mp = month_prefix()
+        start_date, end_date = mp + "-01", mp + "-31"
+    else:
+        start_date = end_date = None  # όλο το ιστορικό
+
+    # 2) Φόρτωσε entries από όλα τα transactions_*.json
+    entries = _load_entries_between(start_date, end_date)
+
+    # 3) Συγκέντρωση ανά asset (contract-first, αλλιώς symbol)
+    agg = {}
+    for e in entries:
+        sym = (e.get("token") or "?").upper()
+        if sym == "TCRO":  # unify
+            sym = "CRO"
+        addr = (e.get("token_addr") or "").lower()
+        key  = addr if (addr.startswith("0x")) else sym
+
+        rec = agg.get(key)
+        if not rec:
+            rec = {
+                "key": key,
+                "symbol": sym,
+                "token_addr": addr if addr.startswith("0x") else None,
+                "in_qty": 0.0, "out_qty": 0.0,
+                "in_usd": 0.0, "out_usd": 0.0,
+                "realized": 0.0,
+                "tx_count": 0
+            }
+            agg[key] = rec
+
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        rp  = float(e.get("realized_pnl") or 0.0)
+
+        rec["tx_count"] += 1
+        if amt > 0:
+            rec["in_qty"] += amt
+            rec["in_usd"] += usd
+        elif amt < 0:
+            rec["out_qty"] += (-amt)
+            rec["out_usd"] += (-usd)
+        rec["realized"] += rp
+
+    # 4) Παράγωγα & ταξινόμηση
+    out = []
+    for r in agg.values():
+        r["net_qty"] = r["in_qty"] - r["out_qty"]
+        r["net_usd"] = r["in_usd"] - r["out_usd"]
+        out.append(r)
+
+    # ταξινόμηση κατά |net_usd| φθίνουσα
+    out.sort(key=lambda z: abs(float(z.get("net_usd", 0.0))), reverse=True)
+    return out
 
 # ----------------------- Per-asset summarize (today) -----------------------
 def summarize_today_per_asset():
