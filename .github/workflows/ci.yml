@@ -24,14 +24,15 @@ jobs:
         pip install -r requirements.txt
         pip install pytest flake8
 
-    - name: Lint (flake8)
-      run: flake8 .
+    - name: Lint (flake8 with repo config)
+      run: flake8 --config .flake8 .
 
     - name: Syntax check
       run: python -m py_compile main.py
 
     - name: Pytest (smoke)
       env:
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         TELEGRAM_BOT_TOKEN: ""
         TELEGRAM_CHAT_ID: ""
         WALLET_ADDRESS: "0x0000000000000000000000000000000000000000"
