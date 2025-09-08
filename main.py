@@ -1504,20 +1504,29 @@ def _norm_cmd(text: str) -> str:
         return ""
     first = text.strip().split()[0]
     base = first.split("@", 1)[0].lower()
+
     if base in ("/show_wallet_assets", "/showwalletassets", "/show", "/showassets", "/show_wallet"):
         return "/show_wallet_assets"
     if base in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
         return "/rescan"
     if base in ("/diag", "/status"):
         return "/diag"
-    if base in ("/dailysum", "/daily_sum", "/showdaily", "/day", "/sumday"):
+
+    # ✨ ΔΙΟΡΘΩΣΗ: ΔΕΝ βάζουμε το /showdaily εδώ
+    if base in ("/dailysum", "/daily_sum", "/day", "/sumday"):
         return "/dailysum"
+
+    # ✨ ΝΕΑ ΓΡΑΜΜΗ: ξεχωριστή χαρτογράφηση για showdaily
+    if base in ("/showdaily",):
+        return "/showdaily"
+
     if base in ("/totals", "/sumassets", "/perasset", "/assetsum"):
         return "/totals"
     if base in ("/totalstoday", "/totals_today", "/totals-today"):
         return "/totalstoday"
     if base in ("/totalsmonth", "/totals_month", "/totals-month"):
         return "/totalsmonth"
+
     t = text.strip().lower()
     if t in ("/show wallet assets",):
         return "/show_wallet_assets"
