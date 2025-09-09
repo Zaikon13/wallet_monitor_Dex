@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Cronos DeFi Sentinel - Wallet Monitor (Cronos chain) + Dexscreener + Web3 RPC
@@ -27,7 +27,6 @@ from dotenv import load_dotenv
 # externalized helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
-from reports.aggregates import aggregate_per_asset
 from telegram.formatters import format_per_asset_totals
 from reports.day_report import build_day_report_text as _compose_day_report
 # Ledger helpers
@@ -174,7 +173,6 @@ def _remember_token_event(key_tuple):
     _seen_token_events.add(key_tuple)
     _seen_token_events_q.append(key_tuple)
     if len(_seen_token_events_q) == _TOKEN_EVENT_LRU_MAX:
-        # pop left on overflow automatically; but ensure set stays in sync
         while len(_seen_token_events) > _TOKEN_EVENT_LRU_MAX:
             old = _seen_token_events_q.popleft()
             if old in _seen_token_events:
@@ -519,6 +517,7 @@ def _replay_today_cost_basis():
         write_json(path, data)
     except Exception:
         pass
+
 # ------------------------------------------------------------
 # History maps (prices & symbol->contract)
 # ------------------------------------------------------------
@@ -1030,7 +1029,8 @@ def handle_native_tx(tx: dict):
         "from": frm,
         "to": to,
     }
-    append_ledger(DATA_DIR, ymd(), entry)
+    # FIX: append_ledger now takes a single entry
+    append_ledger(entry)
 
 def handle_erc20_tx(t: dict):
     h = t.get("hash") or ""
@@ -1048,7 +1048,6 @@ def handle_erc20_tx(t: dict):
     event_key = (h, token_addr, frm, to, str(val_raw), str(decimals))
     if not _remember_token_event(event_key):
         return
-    # also mark the hash so it won't re-fire across future polls
     _remember_token_hash(h)
 
     if WALLET_ADDRESS not in (frm, to):
@@ -1119,7 +1118,8 @@ def handle_erc20_tx(t: dict):
         "from": frm,
         "to": to,
     }
-    append_ledger(DATA_DIR, ymd(), entry)
+    # FIX: append_ledger now takes a single entry
+    append_ledger(entry)
 
 # ------------------------------------------------------------
 # Dexscreener pair monitor + discovery
@@ -1691,7 +1691,7 @@ def telegram_commands_loop():
                     try:
                         lines = [
                             "*🔧 Diagnostics*",
-                            f"WALLET_ADDRESS: `{WALLET_ADDRESS}`",
+                            f"WALLET_ADDRESS: {WALLET_ADDRESS}",
                             f"CRONOS_RPC_URL set: {bool(CRONOS_RPC_URL)}",
                             f"Etherscan key: {bool(ETHERSCAN_API)}",
                             f"LOG_SCAN_BLOCKS={LOG_SCAN_BLOCKS} LOG_SCAN_CHUNK={LOG_SCAN_CHUNK}",
@@ -1749,7 +1749,7 @@ def wallet_monitor_loop():
 
     _replay_today_cost_basis()
     if WALLET_ADDRESS:
-        send_telegram(f"🚀 Wallet monitor started for `{WALLET_ADDRESS}` (Cronos).")
+        send_telegram(f"🚀 Wallet monitor started for {WALLET_ADDRESS} (Cronos).")
 
     while not shutdown_event.is_set():
         try:
