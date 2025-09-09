@@ -810,6 +810,7 @@ def get_wallet_balances_snapshot():
     cro_amt = float(_token_balances.get("CRO", 0.0))
     if cro_amt > EPSILON:
         balances["CRO"] = balances.get("CRO", 0.0) + cro_amt
+
     for k, v in list(_token_balances.items()):
         if k == "CRO":
             continue
@@ -818,8 +819,7 @@ def get_wallet_balances_snapshot():
             continue
         meta = _token_meta.get(k, {})
         sym = (meta.get("symbol") or (k[:8] if isinstance(k, str) else "?")).upper()
-        if sym == "TCRO":
-            sym = "CRO"
+        # ❗️ΜΗΝ κάνεις map TCRO -> CRO. Το κρατάμε ως TCRO (receipt) για να μην μπερδεύεται με το native CRO.
         balances[sym] = balances.get(sym, 0.0) + amt
     return balances
 
@@ -1560,15 +1560,50 @@ def _norm_cmd(text: str) -> str:
     if t in ("/show wallet assets",):
         return "/show_wallet_assets"
     return base
+  
+def compute_holdings_usd_via_rpc_with_receipts():
+    """
+    Wrapper για να χωρίσουμε receipts (π.χ. tCRO) από τα κανονικά holdings,
+    μόνο για το μήνυμα του /show_wallet_assets.
+    Δεν αλλάζει κανένα άλλο σημείο του κώδικα.
+    """
+    total, breakdown, unrealized = compute_holdings_usd_via_rpc()
+    receipts = []
+    kept = []
+    for b in (breakdown or []):
+        symU = (b.get("token") or "").upper()
+        if symU == "TCRO":
+            receipts.append({
+                "token": "tCRO (receipt)",
+                "token_addr": b.get("token_addr"),
+                "amount": b.get("amount", 0.0),
+                "price_usd": None,
+                "usd_value": None,
+            })
+        else:
+            kept.append(b)
+    return total, kept, unrealized, receipts
 
 def _format_wallet_assets_message():
-    total, breakdown, unrealized = compute_holdings_usd_via_rpc()
-    if not breakdown:
-        total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
-    if not breakdown:
-        total, breakdown, unrealized = (0.0, [], 0.0)
+    # Προσπαθούμε πρώτα με RPC (και receipts)
+    try:
+        total, breakdown, unrealized, receipts = compute_holdings_usd_via_rpc_with_receipts()
+    except Exception:
+        # Fallback σε παλιότερη υπογραφή
+        try:
+            total, breakdown, unrealized = compute_holdings_usd_via_rpc()
+            receipts = []
+        except Exception:
+            total, breakdown, unrealized, receipts = (0.0, [], 0.0, [])
 
-    if not breakdown:
+    # Αν δεν βγήκε τίποτα από RPC, δοκίμασε το ιστορικό
+    if not breakdown and not receipts:
+        try:
+            total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+        except Exception:
+            pass
+
+    if not breakdown and not receipts:
         return "📦 Δεν βρέθηκαν assets αυτή τη στιγμή."
 
     lines = ["*💼 Wallet Assets (MTM):*"]
@@ -1578,15 +1613,24 @@ def _format_wallet_assets_message():
         pr = b["price_usd"] or 0.0
         val = b["usd_value"] or 0.0
         lines.append(f"• {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
+
     lines.append(f"\n*Σύνολο:* ${_format_amount(total)}")
     if _nonzero(unrealized):
         lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
 
+    # ✨ Δείξε receipts (έξω από το σύνολο)
+    if receipts:
+        lines.append("\n*📎 Receipt / Staked tokens (εκτός συνόλου):*")
+        for r in receipts:
+            lines.append(f"• {r['token']}: {_format_amount(r['amount'])}")
+
+    # Runtime snapshot (χωρίς map TCRO->CRO)
     snap = get_wallet_balances_snapshot()
     if snap:
         lines.append("\n_Quantities snapshot (runtime):_")
         for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
             lines.append(f"  – {sym}: {_format_amount(amt)}")
+
     return "\n".join(lines)
 
 def _format_daily_sum_message():
