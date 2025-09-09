@@ -36,6 +36,14 @@ from reports.ledger import (
     update_cost_basis as ledger_update_cost_basis,
     replay_cost_basis_over_entries,
 )
+# --- Ledger API compatibility shim ---
+def _append_ledger(entry, date_str=None):
+    try:
+        # Δοκίμασε 1-argument έκδοση
+        return append_ledger(entry)
+    except TypeError:
+        # Fallback στη 3-argument έκδοση
+        return append_ledger(DATA_DIR, (date_str or ymd()), entry)
 
 # ------------------------------------------------------------
 # Bootstrap
@@ -1030,7 +1038,7 @@ def handle_native_tx(tx: dict):
         "from": frm,
         "to": to,
     }
-    append_ledger(DATA_DIR, ymd(), entry)
+    ._append_ledger(entry)
 
 def handle_erc20_tx(t: dict):
     h = t.get("hash") or ""
@@ -1119,7 +1127,7 @@ def handle_erc20_tx(t: dict):
         "from": frm,
         "to": to,
     }
-    append_ledger(DATA_DIR, ymd(), entry)
+    ._append_ledger(entry)
 
 # ------------------------------------------------------------
 # Dexscreener pair monitor + discovery
