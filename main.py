@@ -927,6 +927,73 @@ def compute_holdings_usd_from_history_positions():
 
     breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
     return total, breakdown, unrealized
+  
+def compute_holdings_merged_with_receipts():
+    """
+    Συνδυάζει:
+      - RPC holdings (native CRO + ό,τι ERC20 βρει)
+      - History positions (για tokens που δεν τα βρίσκει το RPC)
+    και βγάζει ξεχωριστά τα receipts (π.χ. tCRO).
+    Κλειδί ταύτισης: token_addr (0x...) αλλιώς symbol.
+    """
+    # 1) Πάρε RPC
+    try:
+        rpc_total, rpc_breakdown, rpc_unreal = compute_holdings_usd_via_rpc()
+    except Exception:
+        rpc_total, rpc_breakdown, rpc_unreal = (0.0, [], 0.0)
+
+    # 2) Πάρε history
+    try:
+        hist_total, hist_breakdown, hist_unreal = compute_holdings_usd_from_history_positions()
+    except Exception:
+        hist_total, hist_breakdown, hist_unreal = (0.0, [], 0.0)
+
+    # 3) Ξεχώρισε receipts από το RPC (π.χ. TCRO)
+    receipts = []
+    kept_rpc = []
+    for b in (rpc_breakdown or []):
+        symU = (b.get("token") or "").upper()
+        if symU == "TCRO":
+            receipts.append({
+                "token": "tCRO (receipt)",
+                "token_addr": b.get("token_addr"),
+                "amount": b.get("amount", 0.0),
+                "price_usd": None,
+                "usd_value": None,
+            })
+        else:
+            kept_rpc.append(b)
+
+    # 4) Φτιάξε index RPC (για να ΜΗΝ διπλομετρήσουμε ό,τι ήδη υπάρχει)
+    def _key(b):
+        addr = (b.get("token_addr") or "").lower()
+        if addr.startswith("0x"):
+            return f"addr:{addr}"
+        sym = (b.get("token") or "").upper()
+        return f"sym:{sym}"
+
+    rpc_index = { _key(b): b for b in kept_rpc }
+
+    # 5) Πρόσθεσε από history ΜΟΝΟ ό,τι λείπει από RPC
+    merged = list(kept_rpc)
+    for hb in (hist_breakdown or []):
+        k = _key(hb)
+        if k in rpc_index:
+            continue  # υπάρχει ήδη από RPC
+        merged.append(hb)
+
+    # 6) Υπολόγισε σύνολο/Unrealized ξανά πάνω στα merged
+    total = 0.0
+    unreal = 0.0
+    for b in merged:
+        total += float(b.get("usd_value") or 0.0)
+    # Unrealized: προτιμάμε RPC αν υπήρχε, αλλιώς του history
+    unreal = (rpc_unreal if (rpc_breakdown and abs(rpc_unreal) > 0) else hist_unreal)
+
+    # Ταξινόμηση κατά αξία
+    merged.sort(key=lambda b: float(b.get("usd_value") or 0.0), reverse=True)
+
+    return total, merged, unreal, receipts
 
 # ------------------------------------------------------------
 # Day report (uses reports/day_report.py)
@@ -1584,23 +1651,20 @@ def compute_holdings_usd_via_rpc_with_receipts():
     return total, kept, unrealized, receipts
 
 def _format_wallet_assets_message():
-    # Προσπαθούμε πρώτα με RPC (και receipts)
+    # Χρησιμοποιούμε merge (RPC + history) + receipts
     try:
-        total, breakdown, unrealized, receipts = compute_holdings_usd_via_rpc_with_receipts()
+        total, breakdown, unrealized, receipts = compute_holdings_merged_with_receipts()
     except Exception:
-        # Fallback σε παλιότερη υπογραφή
+        # Fallback όσο πιο ανθεκτικά γίνεται
         try:
             total, breakdown, unrealized = compute_holdings_usd_via_rpc()
             receipts = []
         except Exception:
-            total, breakdown, unrealized, receipts = (0.0, [], 0.0, [])
-
-    # Αν δεν βγήκε τίποτα από RPC, δοκίμασε το ιστορικό
-    if not breakdown and not receipts:
-        try:
-            total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
-        except Exception:
-            pass
+            try:
+                total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+                receipts = []
+            except Exception:
+                total, breakdown, unrealized, receipts = (0.0, [], 0.0, [])
 
     if not breakdown and not receipts:
         return "📦 Δεν βρέθηκαν assets αυτή τη στιγμή."
@@ -1617,13 +1681,11 @@ def _format_wallet_assets_message():
     if _nonzero(unrealized):
         lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
 
-    # ✨ Δείξε receipts (έξω από το σύνολο)
     if receipts:
         lines.append("\n*📎 Receipt / Staked tokens (εκτός συνόλου):*")
         for r in receipts:
             lines.append(f"• {r['token']}: {_format_amount(r['amount'])}")
 
-    # Runtime snapshot (χωρίς map TCRO->CRO)
     snap = get_wallet_balances_snapshot()
     if snap:
         lines.append("\n_Quantities snapshot (runtime):_")
