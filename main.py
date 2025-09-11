@@ -766,6 +766,7 @@ def compute_holdings_usd_via_rpc():
     unrealized = 0.0
     _ = _build_history_maps()
 
+    # 1) Native CRO
     cro_amt = 0.0
     if rpc_init():
         try:
@@ -782,7 +783,9 @@ def compute_holdings_usd_via_rpc():
         if rem_qty > EPSILON and _nonzero(cro_price):
             unrealized += (cro_amt * cro_price - rem_cost)
 
+    # 2) ERC20 από contracts
     contracts = gather_all_known_token_contracts()
+    seen_keys = set()
     for addr in sorted(list(contracts)):
         try:
             bal = rpc_get_erc20_balance(addr, WALLET_ADDRESS)
@@ -793,6 +796,7 @@ def compute_holdings_usd_via_rpc():
             val = bal * pr
             total += val
             breakdown.append({"token": sym, "token_addr": addr, "amount": bal, "price_usd": pr, "usd_value": val})
+            seen_keys.add(("addr", addr.lower()))
 
             rem_qty = _position_qty.get(addr, 0.0)
             rem_cost = _position_cost.get(addr, 0.0)
@@ -800,6 +804,57 @@ def compute_holdings_usd_via_rpc():
                 unrealized += (bal * pr - rem_cost)
         except Exception:
             continue
+
+    # 3) ✅ Fallback: ό,τι εμφανίζεται μόνο ως symbol (από runtime balances ή από ιστορικές θέσεις)
+    symbol_candidates = set()
+
+    # από runtime _token_balances/_token_meta
+    for k, v in list(_token_balances.items()):
+        if isinstance(k, str) and k.startswith("0x"):
+            continue
+        if float(v) <= EPSILON:
+            continue
+        sym = (_token_meta.get(k, {}).get("symbol") or (k if isinstance(k, str) else "")).upper()
+        if not sym:
+            continue
+        if ("sym", sym) in seen_keys:
+            continue
+        symbol_candidates.add(sym)
+
+    # από ιστορικές ανοιχτές θέσεις (αν υπάρχει σύμβολο-κλειδί)
+    for key, qty in list(_position_qty.items()):
+        if isinstance(key, str) and key.startswith("0x"):
+            continue
+        if float(qty) <= EPSILON:
+            continue
+        sym = str(key).upper()
+        if sym == "TCRO":
+            sym = "CRO"  # receipts δεν τα μετράμε εδώ ως CRO ποσότητα
+        if ("sym", sym) in seen_keys:
+            continue
+        symbol_candidates.add(sym)
+
+    # υπολόγισε τιμές/ποσότητες για symbols
+    for sym in sorted(symbol_candidates):
+        # Ποσότητα: προτεραιότητα runtime snapshot -> έπειτα ιστορικές θέσεις
+        amt = 0.0
+        if sym in _token_balances:
+            amt = float(_token_balances.get(sym, 0.0))
+        if amt <= EPSILON:
+            amt = float(_position_qty.get(sym, 0.0))
+        if amt <= EPSILON:
+            continue
+
+        pr = get_price_usd(sym) or _history_price_fallback(sym, symbol_hint=sym) or 0.0
+        val = amt * pr
+        total += val
+        breakdown.append({"token": sym, "token_addr": None, "amount": amt, "price_usd": pr, "usd_value": val})
+        seen_keys.add(("sym", sym))
+
+        rem_qty = _position_qty.get(sym, 0.0)
+        rem_cost = _position_cost.get(sym, 0.0)
+        if rem_qty > EPSILON and _nonzero(pr):
+            unrealized += (amt * pr - rem_cost)
 
     breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
     return total, breakdown, unrealized
