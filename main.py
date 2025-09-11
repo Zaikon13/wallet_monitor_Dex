@@ -1901,15 +1901,22 @@ def telegram_commands_loop():
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
                             chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000")),
                         )
-                        total, breakdown, _ = compute_holdings_usd_via_rpc()
-                        if not breakdown:
-                            total, breakdown, _ = (0.0, [], 0.0)
+                        total, breakdown, _, receipts = compute_holdings_merged_with_receipts()
                         lines = [f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {n} tokens με θετικό balance.", "", "📦 Snapshot:"]
-                        for b in breakdown[:15]:
+                        shown = 0
+                        for b in breakdown:
                             lines.append(f"• {b['token']}: {_format_amount(b['amount'])}")
-                        if len(breakdown) > 15:
-                            lines.append(f"… και {len(breakdown) - 15} ακόμα.")
-                        send_telegram("\n".join(lines))
+                            shown += 1
+                            if shown >= 15:
+                                break
+                        if receipts:
+                            lines.append("• (receipts)")
+                            for r in receipts:
+                                lines.append(f"  – {r['token']}: {_format_amount(r['amount'])}")
+                        extra = (len(breakdown) - shown)
+                       if extra > 0:
+                           lines.append(f"… και {extra} ακόμα.")
+                       send_telegram("\n".join(lines))
                     except Exception as e:
                         send_telegram(f"❌ Rescan error: {e}")
 
