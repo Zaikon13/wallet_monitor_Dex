@@ -598,13 +598,12 @@ def rpc_block_number():
 
 def rpc_get_native_balance(addr: str):
     try:
-        wei = WEB3.eth.get_balance(addr)
+        cs = _to_checksum(addr)  # ✅ Βάλε checksum address
+        wei = WEB3.eth.get_balance(cs)
         return float(wei) / (10 ** 18)
-    except Exception:
+    except Exception as e:
+        log.debug("rpc_get_native_balance error for %s: %s", addr, e)
         return 0.0
-
-_rpc_sym_cache = {}
-_rpc_dec_cache = {}
 
 def rpc_get_symbol_decimals(contract: str):
     if contract in _rpc_sym_cache and contract in _rpc_dec_cache:
