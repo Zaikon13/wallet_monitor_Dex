@@ -1634,40 +1634,106 @@ def _format_wallet_assets_message():
     return "\n".join(lines)
 
 def _format_daily_sum_message():
-    per = summarize_today_per_asset()
-    if not per:
-        return "🧾 Δεν υπάρχουν σημερινές κινήσεις."
+    """
+    Λεπτομερές /dailysum:
+      - Όλες οι σημερινές κινήσεις ανά asset με ώρα, κατεύθυνση, ποσότητα, τιμή, USD, realized ανά trade
+      - Υποσύνολο ανά asset (realized, net flow, buys/sells)
+      - Συνολικά totals στο τέλος
+    """
+    path = data_file_for_today()
+    data = read_json(path, default={"date": ymd(), "entries": []})
+    entries = data.get("entries", [])
 
-    tot_real = sum(float(r.get("realized_today", 0.0)) for r in per)
-    tot_flow = sum(float(r.get("net_flow_today", 0.0)) for r in per)
-    tot_unrl = sum(float(r.get("unreal_now", 0.0) or 0.0) for r in per)
+    if not entries:
+        return f"🧾 Δεν υπάρχουν σημερινές κινήσεις ({ymd()})."
 
-    per_sorted = sorted(
-        per,
-        key=lambda r: (abs(float(r.get("realized_today", 0.0))), abs(float(r.get("net_flow_today", 0.0)))),
-        reverse=True,
-    )
+    # Ομαδοποίηση ανά asset key (προτιμάμε contract 0x..., αλλιώς symbol)
+    by_asset = {}
+    for e in entries:
+        sym = (e.get("token") or "?").upper()
+        if sym == "TCRO":
+            sym = "CRO"  # το ledger ήδη το κάνει, κρατάμε συνέπεια
+        addr = (e.get("token_addr") or "").lower()
+        key = addr if (addr.startswith("0x")) else sym
+
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        prc = float(e.get("price_usd") or 0.0)
+        rp = float(e.get("realized_pnl") or 0.0)
+        tm = (e.get("time", "")[-8:]) or ""
+        side = "IN" if amt > 0 else "OUT" if amt < 0 else "FLAT"
+
+        rec = by_asset.get(key)
+        if not rec:
+            rec = {
+                "symbol": sym,
+                "token_addr": addr if addr else None,
+                "txs": [],
+                "in_qty": 0.0, "in_usd": 0.0, "buys": 0,
+                "out_qty": 0.0, "out_usd": 0.0, "sells": 0,
+                "realized": 0.0,
+            }
+            by_asset[key] = rec
+
+        rec["txs"].append({"time": tm, "side": side, "amount": amt, "price": prc, "usd": usd, "realized": rp})
+
+        if side == "IN":
+            rec["in_qty"] += amt
+            rec["in_usd"] += usd
+            rec["buys"] += 1
+        elif side == "OUT":
+            rec["out_qty"] += -amt  # θετικό ποσό για το σύνολο πωλήσεων
+            rec["out_usd"] += -usd  # θετικό USD για το σύνολο πωλήσεων
+            rec["sells"] += 1
+
+        rec["realized"] += rp
+
+    # Ταξινόμηση assets κατά απόλυτο net USD (σημαντικότερα πάνω)
+    def _net_usd(rec):
+        return (rec["in_usd"] - rec["out_usd"])
+    ordered = sorted(by_asset.values(), key=lambda r: abs(_net_usd(r)), reverse=True)
 
     lines = [f"*🧾 Daily PnL (Today {ymd()}):*"]
-    for r in per_sorted:
-        tok = r.get("symbol") or "?"
-        flow = float(r.get("net_flow_today", 0.0))
-        real = float(r.get("realized_today", 0.0))
-        qty = float(r.get("net_qty_today", 0.0))
-        pr = float(r.get("price_now", 0.0) or 0.0)
-        un = float(r.get("unreal_now", 0.0) or 0.0)
-        base = f"• {tok}: realized ${_format_amount(real)} | flow ${_format_amount(flow)} | qty {_format_amount(qty)}"
-        if _nonzero(pr):
-            base += f" | price ${_format_price(pr)}"
-        if _nonzero(un):
-            base += f" | unreal ${_format_amount(un)}"
-        lines.append(base)
 
+    total_realized = 0.0
+    total_net_flow = 0.0
+
+    for rec in ordered:
+        sym = rec["symbol"]
+        # ταξινόμηση συναλλαγών ανά ώρα
+        rec["txs"].sort(key=lambda t: t["time"])
+
+        lines.append(f"\n*{sym}*")
+        for t in rec["txs"]:
+            side = t["side"]
+            amt = t["amount"]
+            pr = t["price"]
+            usd = t["usd"]
+            rz = t["realized"]
+            tm = t["time"]
+            # εμφανίζουμε qty με πρόσημο, usd με πρόσημο, realized ανά trade
+            lines.append(
+                f"  {tm} • {side:<3} qty {_format_amount(amt)} @ ${_format_price(pr)} → USD {_format_amount(usd)}"
+                + (f" | realized {_format_amount(rz)}" if _nonzero(rz) else "")
+            )
+
+        net_qty = rec["in_qty"] - rec["out_qty"]
+        net_usd = rec["in_usd"] - rec["out_usd"]
+        total_realized += rec["realized"]
+        total_net_flow += net_usd
+
+        # Υποσύνολο ανά asset
+        lines.append(
+            f"  — summary: buys {rec['buys']}, sells {rec['sells']} | "
+            f"in_qty {_format_amount(rec['in_qty'])}, out_qty {_format_amount(rec['out_qty'])} | "
+            f"net_qty {_format_amount(net_qty)} | net_flow ${_format_amount(net_usd)} | "
+            f"realized ${_format_amount(rec['realized'])}"
+        )
+
+    # Συνολικά totals ημέρας
     lines.append("")
-    lines.append(f"*Σύνολο realized σήμερα:* ${_format_amount(tot_real)}")
-    lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(tot_flow)}")
-    if _nonzero(tot_unrl):
-        lines.append(f"*Σύνολο unreal (open τώρα):* ${_format_amount(tot_unrl)}")
+    lines.append(f"*Σύνολο realized σήμερα:* ${_format_amount(total_realized)}")
+    lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(total_net_flow)}")
 
     return "\n".join(lines)
 
