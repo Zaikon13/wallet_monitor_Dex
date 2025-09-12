@@ -8,8 +8,8 @@ Features:
 - Cost-basis PnL (realized & unrealized)
 - Intraday/EOD reports
 - Alerts (24h pump/dump) & Guard window after buys
-- Telegram commands: /show_wallet_assets, /dailysum, /rescan, /diag,
-  /totals, /totalstoday, /totalsmonth, /showdaily
+- Telegram commands:
+  /show_wallet_assets, /dailysum, /rescan, /diag, /totals, /totalstoday, /totalsmonth, /showdaily
 """
 
 import os
@@ -21,15 +21,12 @@ import threading
 import logging
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
-
 from dotenv import load_dotenv
 
 # externalized helpers
 from utils.http import safe_get, safe_json
-from telegram.api import send_telegram
-# from telegram.formatters import format_per_asset_totals  # << REMOVED (we implement below)
+from telegram.api import send_telegram           # system/broadcast msgs -> TELEGRAM_CHAT_ID
 from reports.day_report import build_day_report_text as _compose_day_report
-# Ledger helpers
 from reports.ledger import (
     append_ledger,
     update_cost_basis as ledger_update_cost_basis,
@@ -37,7 +34,7 @@ from reports.ledger import (
 )
 
 # ------------------------------------------------------------
-# Bootstrap
+# Bootstrap & TZ
 # ------------------------------------------------------------
 load_dotenv()
 
@@ -48,11 +45,9 @@ def _alias_env(src: str, dst: str):
 _alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
 _alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
 
-# --- TZ init (Europe/Athens by default) ---
-import time as _time
 from zoneinfo import ZoneInfo
-
 def _init_tz(tz_str: str | None):
+    import time as _time
     tz = tz_str or "Europe/Athens"
     os.environ["TZ"] = tz
     try:
@@ -148,18 +143,17 @@ logging.basicConfig(
 log = logging.getLogger("wallet-monitor")
 
 # ------------------------------------------------------------
-# Shutdown & Runtime state
+# Runtime state
 # ------------------------------------------------------------
 shutdown_event = threading.Event()
 
-_seen_tx_hashes   = set()     # native tx hashes
+_seen_tx_hashes   = set()
 _last_prices      = {}
 _price_history    = {}
 _last_pair_tx     = {}
 _tracked_pairs    = set()
 _known_pairs_meta = {}
 
-# --- NEW anti-spam LRU for token events/hashes ---
 _TOKEN_EVENT_LRU_MAX = 4000
 _TOKEN_HASH_LRU_MAX  = 2000
 _seen_token_events = set()
@@ -175,8 +169,7 @@ def _remember_token_event(key_tuple):
     if len(_seen_token_events_q) == _TOKEN_EVENT_LRU_MAX:
         while len(_seen_token_events) > _TOKEN_EVENT_LRU_MAX:
             old = _seen_token_events_q.popleft()
-            if old in _seen_token_events:
-                _seen_token_events.remove(old)
+            _seen_token_events.discard(old)
     return True
 
 def _remember_token_hash(h):
@@ -189,12 +182,10 @@ def _remember_token_hash(h):
     if len(_seen_token_hashes_q) == _TOKEN_HASH_LRU_MAX:
         while len(_seen_token_hashes) > _TOKEN_HASH_LRU_MAX:
             oldh = _seen_token_hashes_q.popleft()
-            if oldh in _seen_token_hashes:
-                _seen_token_hashes.remove(oldh)
+            _seen_token_hashes.discard(oldh)
     return True
-# ------------------------------------------------------------
 
-_token_balances = defaultdict(float)  # key: "CRO" or contract (0x..)
+_token_balances = defaultdict(float)  # key: "CRO" ή contract (0x..)
 _token_meta     = {}                  # key -> {"symbol","decimals"}
 
 _position_qty   = defaultdict(float)
@@ -207,8 +198,8 @@ _last_intraday_sent = 0.0
 PRICE_CACHE = {}
 PRICE_CACHE_TTL = 60
 
-ATH = {}    # key (contract or symbol) -> float
-_alert_last_sent = {}  # cooldown
+ATH = {}    # key (contract ή symbol) -> float
+_alert_last_sent = {}
 COOLDOWN_SEC = 60 * 30
 
 _guard = {}  # key -> {"entry":float,"peak":float,"start_ts":float}
@@ -394,13 +385,12 @@ def get_price_usd(symbol_or_addr: str):
             data = safe_json(r) or {}
             price = _pick_best_price(data.get("pairs"))
             if not price and len(key) <= 12:
-                r = safe_get(DEX_BASE_SEARCH, params={"q": f"{key} usdt"}, timeout=10)
-                data = safe_json(r) or {}
-                price = _pick_best_price(data.get("pairs"))
-                if not price:
-                    r = safe_get(DEX_BASE_SEARCH, params={"q": f"{key} wcro"}, timeout=10)
+                for q in (f"{key} usdt", f"{key} wcro"):
+                    r = safe_get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)
                     data = safe_json(r) or {}
                     price = _pick_best_price(data.get("pairs"))
+                    if price:
+                        break
     except Exception:
         price = None
 
@@ -450,6 +440,7 @@ def get_change_and_price_for_symbol_or_addr(sym_or_addr: str):
         pass
     ds_url = f"https://dexscreener.com/cronos/{best.get('pairAddress')}"
     return (price, ch24, ch2h, ds_url)
+
 # ------------------------------------------------------------
 # Etherscan fetchers
 # ------------------------------------------------------------
@@ -510,7 +501,6 @@ def _replay_today_cost_basis():
 
     total_realized = replay_cost_basis_over_entries(_position_qty, _position_cost, entries, eps=EPSILON)
     _realized_pnl_today = float(total_realized)
-
     try:
         data["realized_pnl"] = float(total_realized)
         write_json(path, data)
@@ -565,6 +555,8 @@ ERC20_ABI_MIN = [
 ]
 
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_rpc_sym_cache = {}
+_rpc_dec_cache = {}
 
 def _to_checksum(addr: str):
     try:
@@ -603,9 +595,6 @@ def rpc_get_native_balance(addr: str):
     except Exception as e:
         log.debug("rpc_get_native_balance error for %s: %s", addr, e)
         return 0.0
-
-_rpc_sym_cache = {}
-_rpc_dec_cache = {}
 
 def rpc_get_symbol_decimals(contract: str):
     if contract in _rpc_sym_cache and contract in _rpc_dec_cache:
@@ -691,8 +680,8 @@ def rpc_discover_wallet_tokens(window_blocks: int = None, chunk: int = None):
                     time.sleep(0.2)
                 frm = to + 1
 
-        _scan(topic_wallet, None)      # from = wallet
-        _scan(None, topic_wallet)      # to   = wallet
+        _scan(topic_wallet, None)      # from=wallet
+        _scan(None, topic_wallet)      # to=wallet
 
     except Exception as e:
         log.warning("rpc_discover_wallet_tokens (RPC phase) failed: %s", e)
@@ -730,7 +719,7 @@ def rpc_discover_wallet_tokens(window_blocks: int = None, chunk: int = None):
     return found_positive
 
 # ------------------------------------------------------------
-# Holdings / snapshots
+# Holdings / snapshots (RPC + History + Receipts)
 # ------------------------------------------------------------
 def gather_all_known_token_contracts():
     known = set()
@@ -762,10 +751,8 @@ def gather_all_known_token_contracts():
                 known.add(addr)
     return known
 
+# === Patch A: αντικατάσταση compute_holdings_usd_via_rpc (ολόκληρη) ===
 def compute_holdings_usd_via_rpc():
-    """
-    PATCH A: αντικατάσταση — RPC snapshot (CRO + ERC-20) με history price fallback.
-    """
     total = 0.0
     breakdown = []
     unrealized = 0.0
@@ -814,7 +801,6 @@ def get_wallet_balances_snapshot():
     cro_amt = float(_token_balances.get("CRO", 0.0))
     if cro_amt > EPSILON:
         balances["CRO"] = balances.get("CRO", 0.0) + cro_amt
-
     for k, v in list(_token_balances.items()):
         if k == "CRO":
             continue
@@ -823,7 +809,7 @@ def get_wallet_balances_snapshot():
             continue
         meta = _token_meta.get(k, {})
         sym = (meta.get("symbol") or (k[:8] if isinstance(k, str) else "?")).upper()
-        # κρατάμε τo tCRO ξεχωριστό ως receipt (ΔΕΝ το κάνουμε map σε CRO)
+        # κρατάμε TCRO ως TCRO για receipts
         balances[sym] = balances.get(sym, 0.0) + amt
     return balances
 
@@ -935,14 +921,16 @@ def compute_holdings_usd_from_history_positions():
 
 def compute_holdings_merged_with_receipts():
     """
-    Merge RPC holdings + History positions, και χωριστά receipts (π.χ. tCRO).
+    Merge:
+      - RPC holdings (native CRO + ό,τι ERC20 βρει)
+      - History positions (για tokens που δεν τα βρίσκει το RPC)
+    και ξεχωρίζει receipts (π.χ. tCRO).
     """
-    # RPC
     try:
         rpc_total, rpc_breakdown, rpc_unreal = compute_holdings_usd_via_rpc()
     except Exception:
         rpc_total, rpc_breakdown, rpc_unreal = (0.0, [], 0.0)
-    # History
+
     try:
         hist_total, hist_breakdown, hist_unreal = compute_holdings_usd_from_history_positions()
     except Exception:
@@ -982,7 +970,6 @@ def compute_holdings_merged_with_receipts():
     total = 0.0
     for b in merged:
         total += float(b.get("usd_value") or 0.0)
-
     unreal = (rpc_unreal if (rpc_breakdown and abs(rpc_unreal) > 0) else hist_unreal)
     merged.sort(key=lambda b: float(b.get("usd_value") or 0.0), reverse=True)
     return total, merged, unreal, receipts
@@ -998,6 +985,7 @@ def build_day_report_text():
     net_flow = float(data.get("net_usd_flow", 0.0))
     realized_today_total = float(data.get("realized_pnl", 0.0))
 
+    # επιμένουμε: αν RPC δώσει κάτι, αλλιώς history
     holdings_total, breakdown, unrealized = compute_holdings_usd_via_rpc()
     if not breakdown:
         holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
@@ -1198,119 +1186,9 @@ def fetch_search(query: str):
     data = safe_json(r) or {}
     return data.get("pairs") or []
 
-def ensure_tracking_pair(chain: str, pair_address: str, meta: dict = None):
-    s = slug(chain, pair_address)
-    if s in _tracked_pairs:
-        return
-    _tracked_pairs.add(s)
-    _last_prices[s] = None
-    _last_pair_tx[s] = None
-    _price_history[s] = deque(maxlen=PRICE_WINDOW)
-    if meta:
-        _known_pairs_meta[s] = meta
-    ds_link = f"https://dexscreener.com/{chain}/{pair_address}"
-    sym = None
-    if isinstance(meta, dict):
-        bt = meta.get("baseToken") or {}
-        sym = bt.get("symbol")
-    title = f"{sym} ({s})" if sym else s
-    send_telegram(f"🆕 Now monitoring pair: {title}\n{ds_link}")
-
-def update_price_history(slg, price):
-    hist = _price_history.get(slg)
-    if hist is None:
-        hist = deque(maxlen=PRICE_WINDOW)
-        _price_history[slg] = hist
-    hist.append(price)
-    _last_prices[slg] = price
-
-def detect_spike(slg):
-    hist = _price_history.get(slg)
-    if not hist or len(hist) < 2:
-        return None
-    first = hist[0]
-    last = hist[-1]
-    if not first:
-        return None
-    pct = (last - first) / first * 100.0
-    return pct if abs(pct) >= SPIKE_THRESHOLD else None
-
-_last_pair_alert = {}
-PAIR_ALERT_COOLDOWN = 60 * 10
-
-def _pair_cooldown_ok(key):
-    last = _last_pair_alert.get(key, 0.0)
-    now = time.time()
-    if now - last >= PAIR_ALERT_COOLDOWN:
-        _last_pair_alert[key] = now
-        return True
-    return False
-
-def monitor_tracked_pairs_loop():
-    if not _tracked_pairs:
-        log.info("No tracked pairs; monitor waits until discovery/seed adds some.")
-    else:
-        send_telegram(f"🚀 Dex monitor started: {', '.join(sorted(_tracked_pairs))}")
-
-    while not shutdown_event.is_set():
-        if not _tracked_pairs:
-            time.sleep(DEX_POLL)
-            continue
-        for s in list(_tracked_pairs):
-            try:
-                data = fetch_pair(s)
-                if not data:
-                    continue
-                pair = None
-                if isinstance(data.get("pair"), dict):
-                    pair = data["pair"]
-                elif isinstance(data.get("pairs"), list) and data["pairs"]:
-                    pair = data["pairs"][0]
-                if not pair:
-                    continue
-                try:
-                    price_val = float(pair.get("priceUsd") or 0)
-                except Exception:
-                    price_val = None
-                if price_val and price_val > 0:
-                    update_price_history(s, price_val)
-                    spike_pct = detect_spike(s)
-                    if spike_pct is not None:
-                        vol_h1 = None
-                        try:
-                            vol_h1 = float((pair.get("volume") or {}).get("h1") or 0)
-                        except Exception:
-                            vol_h1 = None
-                        if not (MIN_VOLUME_FOR_ALERT and vol_h1 and vol_h1 < MIN_VOLUME_FOR_ALERT):
-                            bt = pair.get("baseToken") or {}
-                            symbol = bt.get("symbol") or s
-                            if _pair_cooldown_ok(f"spike:{s}"):
-                                send_telegram(f"🚨 Spike on {symbol}: {spike_pct:.2f}%\nPrice: ${_format_price(price_val)}")
-                                _price_history[s].clear()
-                                _last_prices[s] = price_val
-                prev = _last_prices.get(s)
-                if prev and price_val and prev > 0:
-                    delta = (price_val - prev) / prev * 100.0
-                    if abs(delta) >= PRICE_MOVE_THRESHOLD and _pair_cooldown_ok(f"move:{s}"):
-                        bt = pair.get("baseToken") or {}
-                        symbol = bt.get("symbol") or s
-                        send_telegram(f"📈 Price move on {symbol}: {delta:.2f}%\nPrice: ${_format_price(price_val)} (prev ${_format_price(prev)})")
-                        _last_prices[s] = price_val
-                last_tx = (pair.get("lastTx") or {}).get("hash")
-                if last_tx:
-                    prev_tx = _last_pair_tx.get(s)
-                    if prev_tx != last_tx and _pair_cooldown_ok(f"trade:{s}"):
-                        _last_pair_tx[s] = last_tx
-                        bt = pair.get("baseToken") or {}
-                        symbol = bt.get("symbol") or s
-                        send_telegram(f"🔔 New trade on {symbol}\nTx: {CRONOS_TX.format(txhash=last_tx)}")
-            except Exception as e:
-                log.debug("pairs loop error %s: %s", s, e)
-        for _ in range(DEX_POLL):
-            if shutdown_event.is_set():
-                break
-            time.sleep(1)
-
+# ------------------------------------------------------------
+# Discovery loop
+# ------------------------------------------------------------
 def _pair_passes_filters(p):
     try:
         if str(p.get("chainId", "")).lower() != "cronos":
@@ -1349,6 +1227,7 @@ def _pair_passes_filters(p):
         return True
     except Exception:
         return False
+
 def discovery_loop():
     seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
     for s in seeds:
@@ -1410,6 +1289,7 @@ def alerts_monitor_loop():
     send_telegram(f"🛰 Alerts monitor every {ALERTS_INTERVAL_MIN}m. Wallet 24h dump/pump: {DUMP_ALERT_24H_PCT}/{PUMP_ALERT_24H_PCT}.")
     while not shutdown_event.is_set():
         try:
+            # Alerts for current holdings
             wallet_bal = get_wallet_balances_snapshot()
             for sym, amt in list(wallet_bal.items()):
                 if amt <= EPSILON:
@@ -1425,6 +1305,7 @@ def alerts_monitor_loop():
                     if ch24 <= DUMP_ALERT_24H_PCT and _cooldown_ok(key_d):
                         send_telegram(f"⚠️ Dump Alert {sym} 24h {ch24:.2f}%\nPrice ${_format_price(price)}\n{url}")
 
+            # Alerts for recent buys
             data = read_json(data_file_for_today(), default={"entries": []})
             seen = set()
             for e in data.get("entries", []):
@@ -1455,9 +1336,6 @@ def alerts_monitor_loop():
                 break
             time.sleep(1)
 
-# ------------------------------------------------------------
-# Guard loop
-# ------------------------------------------------------------
 def guard_monitor_loop():
     send_telegram(f"🛡 Guard monitor: {GUARD_WINDOW_MIN}m window, +{GUARD_PUMP_PCT}% / {GUARD_DROP_PCT}% / trailing {GUARD_TRAIL_DROP_PCT}%.")
     while not shutdown_event.is_set():
@@ -1501,7 +1379,7 @@ def guard_monitor_loop():
             time.sleep(2)
 
 # ------------------------------------------------------------
-# Today per-asset summary (for /dailysum) - already used by _format_daily_sum_message()
+# Today per-asset summary (for /dailysum)
 # ------------------------------------------------------------
 def summarize_today_per_asset():
     path = data_file_for_today()
@@ -1571,7 +1449,98 @@ def summarize_today_per_asset():
     return result
 
 # ------------------------------------------------------------
-# Telegram commands loop (final wiring + patches)
+# /totals (today|month|all) — χωρίς external formatter
+# ------------------------------------------------------------
+def _iter_history_entries(scope="all"):
+    files = []
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception:
+        pass
+    files.sort()
+    today = ymd()
+    monthp = month_prefix()
+    for fn in files:
+        if scope == "today" and not fn.startswith(f"transactions_{today}"):
+            continue
+        if scope == "month" and not fn.startswith(f"transactions_{monthp}"):
+            continue
+        data = read_json(os.path.join(DATA_DIR, fn), default={"entries": []})
+        for e in data.get("entries", []):
+            yield e
+
+def _totals_build(scope="all"):
+    per = defaultdict(lambda: {"in_qty":0.0,"in_usd":0.0,"out_qty":0.0,"out_usd":0.0,"realized":0.0})
+    for e in _iter_history_entries(scope):
+        sym = (e.get("token") or "?").upper()
+        if sym == "TCRO":
+            sym = "CRO"
+        addr = (e.get("token_addr") or "").lower()
+        key = addr if addr.startswith("0x") else sym
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        rp  = float(e.get("realized_pnl") or 0.0)
+        if amt > 0:
+            per[key]["in_qty"]  += amt
+            per[key]["in_usd"]  += usd
+        elif amt < 0:
+            per[key]["out_qty"] += -amt
+            per[key]["out_usd"] += -usd
+        per[key]["realized"] += rp
+        per[key]["symbol"] = sym
+        per[key]["token_addr"] = addr if addr else None
+    return per
+
+def _denom_usd_to_cro(usd_value: float) -> float:
+    cro_p = get_price_usd("CRO") or 0.0
+    if cro_p <= 0:
+        return 0.0
+    return usd_value / cro_p
+
+def format_per_asset_totals(scope="all", denom="USD"):
+    per = _totals_build(scope)
+    if not per:
+        return f"📊 Totals per Asset — {scope}:\n(κανένα δεδομένο)"
+
+    rows = []
+    for key, r in per.items():
+        net_qty = r["in_qty"] - r["out_qty"]
+        net_usd = r["in_usd"] - r["out_usd"]
+        realized = r["realized"]
+        symbol = r.get("symbol") or key
+        if denom.upper() == "CRO":
+            in_amt  = _denom_usd_to_cro(r["in_usd"])
+            out_amt = _denom_usd_to_cro(r["out_usd"])
+            net_amt = _denom_usd_to_cro(net_usd)
+            rz_amt  = _denom_usd_to_cro(realized)
+            rows.append((symbol, r["in_qty"], in_amt, r["out_qty"], out_amt, net_qty, net_amt, rz_amt, "CRO"))
+        else:
+            rows.append((symbol, r["in_qty"], r["in_usd"], r["out_qty"], r["out_usd"], net_qty, net_usd, realized, "USD"))
+
+    # sort by abs(net flow)
+    rows.sort(key=lambda x: abs(x[6]), reverse=True)
+
+    lines = [f"📊 Totals per Asset — {scope} ({denom.upper()}):"]
+    for i, row in enumerate(rows, 1):
+        sym, in_q, in_v, out_q, out_v, net_q, net_v, rz, unit = row
+        if unit == "USD":
+            lines.append(f" {i}. {sym}  IN: {_format_amount(in_q)} (${_format_amount(in_v)}) | "
+                         f"OUT: {_format_amount(out_q)} (${_format_amount(out_v)}) | "
+                         f"NET: {_format_amount(net_q)} (${_format_amount(net_v)}) | "
+                         f"Realized: ${_format_amount(rz)}")
+        else:
+            lines.append(f" {i}. {sym}  IN: {_format_amount(in_q)} ({_format_amount(in_v)} CRO) | "
+                         f"OUT: {_format_amount(out_q)} ({_format_amount(out_v)} CRO) | "
+                         f"NET: {_format_amount(net_q)} ({_format_amount(net_v)} CRO) | "
+                         f"Realized: {_format_amount(rz)} CRO")
+    return "\n".join(lines)
+
+# ------------------------------------------------------------
+# Telegram: long-poll command loop (reply-to-sender)
+# (Αν έχεις ήδη προσθέσει τα helpers _tg_delete_webhook / _tg_send_to / _tg_get_updates / _tg_sender_chat_id,
+#  ο παρακάτω βρόχος είναι έτοιμος.)
 # ------------------------------------------------------------
 def telegram_commands_loop():
     send_telegram("🧩 Telegram commands listener ενεργό...")
@@ -1579,10 +1548,11 @@ def telegram_commands_loop():
         try:
             updates = _tg_get_updates(timeout=20)
             for upd in updates:
-                msg = upd.get("message") or {}
+                msg = upd.get("message") or upd.get("edited_message") or {}
                 text = (msg.get("text") or "").strip()
                 if not text:
                     continue
+                chat_id = _tg_sender_chat_id(upd)
                 cmd = _norm_cmd(text)
 
                 if cmd == "/show_wallet_assets":
@@ -1593,7 +1563,7 @@ def telegram_commands_loop():
                         )
                     except Exception:
                         pass
-                    send_telegram(_format_wallet_assets_message())
+                    _tg_send_to(chat_id, _format_wallet_assets_message())
 
                 elif cmd == "/dailysum":
                     try:
@@ -1603,7 +1573,7 @@ def telegram_commands_loop():
                         )
                     except Exception:
                         pass
-                    send_telegram(_format_daily_sum_message())
+                    _tg_send_to(chat_id, _format_daily_sum_message())
 
                 elif cmd == "/showdaily":
                     try:
@@ -1613,19 +1583,15 @@ def telegram_commands_loop():
                         )
                     except Exception:
                         pass
-                    send_telegram(build_day_report_text())
+                    _tg_send_to(chat_id, build_day_report_text())
 
                 elif cmd == "/rescan":
                     try:
-                        # 1) εμπλουτισμός γνωστών συμβολαίων
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
                             chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000")),
                         )
-
-                        # 2) merged holdings (RPC + History) και receipts χωριστά
                         total, merged, _unreal, receipts = compute_holdings_merged_with_receipts()
-
                         pos_count = sum(1 for b in merged if float(b.get("amount") or 0.0) > EPSILON)
                         lines = [
                             f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {pos_count} tokens με θετικό balance.",
@@ -1640,9 +1606,9 @@ def telegram_commands_loop():
                                 lines.append(f"  – {r['token']}: {_format_amount(r['amount'])}")
                         if len(merged) > 20:
                             lines.append(f"… και {len(merged) - 20} ακόμα.")
-                        send_telegram("\n".join(lines))
+                        _tg_send_to(chat_id, "\n".join(lines))
                     except Exception as e:
-                        send_telegram(f"❌ Rescan error: {e}")
+                        _tg_send_to(chat_id, f"❌ Rescan error: {e}")
 
                 elif cmd == "/diag":
                     try:
@@ -1653,30 +1619,30 @@ def telegram_commands_loop():
                             f"Etherscan key: {bool(ETHERSCAN_API)}",
                             f"LOGSCANBLOCKS={LOG_SCAN_BLOCKS} LOGSCANCHUNK={LOG_SCAN_CHUNK}",
                             f"TZ={TZ} INTRADAYHOURS={INTRADAY_HOURS} EOD={EOD_HOUR:02d}:{EOD_MINUTE:02d}",
-                            f"Alerts every: {ALERTS_INTERVAL_MIN}m | Pump/Dump: {PUMP_ALERT_24H_PCT}/{DUMP_ALERT_24H_PCT}",
+                            f"Alerts every: {ALERTS_INTERVAL_MIN}m | Pump/Dump: {PUMP_ALERT_24H_PCT}/{PUMP_ALERT_24H_PCT}",
                             f"Tracked pairs: {len(_tracked_pairs)} | Known tokens: {len(_token_meta)}",
                             f"Positions: {len(_position_qty)} | Runtime balances: {len(_token_balances)}",
                             f"ATH keys: {len(ATH)}",
                         ]
-                        send_telegram("\n".join(lines))
+                        _tg_send_to(chat_id, "\n".join(lines))
                     except Exception as e:
-                        send_telegram(f"❌ Diag error: {e}")
+                        _tg_send_to(chat_id, f"❌ Diag error: {e}")
 
                 elif cmd == "/totalstoday":
                     try:
                         txt_lower = (text or "").lower()
                         denom = "CRO" if (" cro" in txt_lower or "σε cro" in txt_lower) else "USD"
-                        send_telegram(format_per_asset_totals("today", denom=denom))
+                        _tg_send_to(chat_id, format_per_asset_totals("today", denom=denom))
                     except Exception as e:
-                        send_telegram(f"❌ totals(today) error: {e}")
+                        _tg_send_to(chat_id, f"❌ totals(today) error: {e}")
 
                 elif cmd == "/totalsmonth":
                     try:
                         txt_lower = (text or "").lower()
                         denom = "CRO" if (" cro" in txt_lower or "σε cro" in txt_lower) else "USD"
-                        send_telegram(format_per_asset_totals("month", denom=denom))
+                        _tg_send_to(chat_id, format_per_asset_totals("month", denom=denom))
                     except Exception as e:
-                        send_telegram(f"❌ totals(month) error: {e}")
+                        _tg_send_to(chat_id, f"❌ totals(month) error: {e}")
 
                 elif cmd == "/totals":
                     txt_lower = (text or "").lower()
@@ -1687,16 +1653,16 @@ def telegram_commands_loop():
                         scope = "month"
                     denom = "CRO" if (" cro" in txt_lower or "σε cro" in txt_lower) else "USD"
                     try:
-                        send_telegram(format_per_asset_totals(scope, denom=denom))
+                        _tg_send_to(chat_id, format_per_asset_totals(scope, denom=denom))
                     except Exception as e:
-                        send_telegram(f"❌ totals error: {e}")
+                        _tg_send_to(chat_id, f"❌ totals error: {e}")
 
         except Exception as e:
             log.exception("telegram_commands_loop error: %s", e)
         time.sleep(2)
 
 # ------------------------------------------------------------
-# Wallet monitor loop & schedulers (final)
+# Wallet monitor loop & schedulers
 # ------------------------------------------------------------
 def wallet_monitor_loop():
     log.info("Wallet monitor starting; loading initial recent txs...")
@@ -1825,6 +1791,9 @@ def main():
             send_telegram("🔎 RPC discovery: δεν βρέθηκαν tokens (ή RPC αργεί).")
     except Exception as e:
         log.warning("initial rpc discovery failed: %s", e)
+
+    # Βεβαίωση ότι δεν υπάρχει webhook (long-poll)
+    _tg_delete_webhook()
 
     threads = []
     threads.append(run_with_restart(wallet_monitor_loop, "wallet_monitor"))
