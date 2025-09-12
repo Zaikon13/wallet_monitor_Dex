@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 # externalized helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
-from telegram.formatters import format_per_asset_totals
+#from telegram.formatters import format_per_asset_totals
 from reports.day_report import build_day_report_text as _compose_day_report
 # Ledger helpers
 from reports.ledger import (
@@ -1033,6 +1033,127 @@ def build_day_report_text():
         unrealized=unrealized,
         data_dir=DATA_DIR,
     )
+# ----------------------------
+# Totals (today|month|all), no external formatter, USD or CRO
+# ----------------------------
+def _iter_entries_for_scope(scope: str):
+    """
+    scope in {"today","month","all"}
+    Yields entries from /app/data/transactions_YYYY-MM-DD.json
+    """
+    files = []
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception:
+        pass
+    files.sort()
+    today_str = ymd()
+    month_str = month_prefix()
+
+    for fn in files:
+        full = os.path.join(DATA_DIR, fn)
+        data = read_json(full, default=None)
+        if not isinstance(data, dict):
+            continue
+        d = (data.get("date") or fn.removeprefix("transactions_").removesuffix(".json"))
+        if scope == "today" and d != today_str:
+            continue
+        if scope == "month" and not d.startswith(month_str):
+            continue
+        for e in data.get("entries", []):
+            yield e
+
+def _group_key_for_entry(e: dict):
+    sym = (e.get("token") or "?").upper()
+    if sym == "TCRO":
+        sym = "CRO"  # normalize
+    addr = (e.get("token_addr") or "").lower()
+    key = addr if (addr.startswith("0x")) else sym
+    return key, sym, (addr if addr else None)
+
+def format_per_asset_totals(scope: str = "all", denom: str = "USD") -> str:
+    """
+    Returns a text block with totals per asset in USD or CRO.
+    scope: "today" | "month" | "all"
+    denom: "USD" | "CRO"
+    """
+    scope = (scope or "all").lower()
+    if scope not in ("today","month","all"):
+        scope = "all"
+    denom = (denom or "USD").upper()
+    if denom not in ("USD","CRO"):
+        denom = "USD"
+
+    cro_price = float(get_price_usd("CRO") or 0.0)
+
+    agg = {}
+    for e in _iter_entries_for_scope(scope):
+        key, sym, addr = _group_key_for_entry(e)
+        rec = agg.get(key)
+        if not rec:
+            rec = {
+                "symbol": sym,
+                "token_addr": addr,
+                "in_qty": 0.0, "in_usd": 0.0,
+                "out_qty": 0.0, "out_usd": 0.0,
+                "realized": 0.0,
+            }
+            agg[key] = rec
+        amt = float(e.get("amount") or 0.0)
+        usd = float(e.get("usd_value") or 0.0)
+        realized = float(e.get("realized_pnl") or 0.0)
+
+        if amt > 0:
+            rec["in_qty"]  += amt
+            rec["in_usd"]  += usd
+        elif amt < 0:
+            rec["out_qty"] += -amt       # keep positive
+            rec["out_usd"] += -usd       # keep positive
+
+        rec["realized"] += realized
+
+    def _net_usd(r):
+        return r["in_usd"] - r["out_usd"]
+
+    rows = sorted(agg.values(), key=lambda r: abs(_net_usd(r)), reverse=True)
+
+    title_scope = {"today":"Today", "month":"Month", "all":"All"}[scope]
+    title = f"📊 Totals per Asset — {title_scope} ({denom})"
+    lines = [title + ":"]
+
+    idx = 1
+    for r in rows:
+        net_qty  = r["in_qty"] - r["out_qty"]
+        net_usd  = r["in_usd"] - r["out_usd"]
+        realized = r["realized"]
+
+        if denom == "CRO" and cro_price > 0:
+            to_cro = 1.0 / cro_price
+            in_v   = r["in_usd"]  * to_cro
+            out_v  = r["out_usd"] * to_cro
+            net_v  = net_usd      * to_cro
+            realized_v = realized * to_cro
+            unit = "CRO"
+        else:
+            in_v, out_v, net_v, realized_v = r["in_usd"], r["out_usd"], net_usd, realized
+            unit = "$"
+
+        sym = r["symbol"]
+        lines.append(
+            f" {idx}. {sym}  "
+            f"IN: {_format_amount(r['in_qty'])} ({unit}{_format_amount(in_v)}) | "
+            f"OUT: {_format_amount(r['out_qty'])} ({unit}{_format_amount(out_v)}) | "
+            f"NET: {_format_amount(net_qty)} ({unit}{_format_amount(net_v)}) | "
+            f"Realized: {unit}{_format_amount(realized_v)}"
+        )
+        idx += 1
+
+    if idx == 1:
+        return f"{title}\n(κανένα δεδομένο)"
+
+    return "\n".join(lines)
 
 # ------------------------------------------------------------
 # TX handlers (native/ERC20)
