@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 # externalized helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
-#from telegram.formatters import format_per_asset_totals
+# from telegram.formatters import format_per_asset_totals  # << REMOVED (we implement below)
 from reports.day_report import build_day_report_text as _compose_day_report
 # Ledger helpers
 from reports.ledger import (
@@ -450,7 +450,6 @@ def get_change_and_price_for_symbol_or_addr(sym_or_addr: str):
         pass
     ds_url = f"https://dexscreener.com/cronos/{best.get('pairAddress')}"
     return (price, ch24, ch2h, ds_url)
-
 # ------------------------------------------------------------
 # Etherscan fetchers
 # ------------------------------------------------------------
@@ -598,12 +597,15 @@ def rpc_block_number():
 
 def rpc_get_native_balance(addr: str):
     try:
-        cs = _to_checksum(addr)  # ✅ Βάλε checksum address
+        cs = _to_checksum(addr)
         wei = WEB3.eth.get_balance(cs)
         return float(wei) / (10 ** 18)
     except Exception as e:
         log.debug("rpc_get_native_balance error for %s: %s", addr, e)
         return 0.0
+
+_rpc_sym_cache = {}
+_rpc_dec_cache = {}
 
 def rpc_get_symbol_decimals(contract: str):
     if contract in _rpc_sym_cache and contract in _rpc_dec_cache:
@@ -760,21 +762,15 @@ def gather_all_known_token_contracts():
                 known.add(addr)
     return known
 
-# ------------------------ Patch A ---------------------------
 def compute_holdings_usd_via_rpc():
     """
-    ΝΕΑ (Patch A): Ισχυρό snapshot από RPC
-      - Native CRO με κανονική τιμή
-      - Όλα τα ERC-20 που ανακαλύπτουμε (χωρίς να χαθεί τίποτα)
-      - ΔΕΝ κάνουμε map TCRO -> CRO εδώ (κρατιέται ως receipt και θα φιλτραριστεί αλλού)
-      - Τιμές: Dexscreener με fallback στο ιστορικό
+    PATCH A: αντικατάσταση — RPC snapshot (CRO + ERC-20) με history price fallback.
     """
     total = 0.0
     breakdown = []
     unrealized = 0.0
     _ = _build_history_maps()
 
-    # Native CRO
     cro_amt = 0.0
     if rpc_init():
         try:
@@ -791,7 +787,6 @@ def compute_holdings_usd_via_rpc():
         if rem_qty > EPSILON and _nonzero(cro_price):
             unrealized += (cro_amt * cro_price - rem_cost)
 
-    # ERC-20
     contracts = gather_all_known_token_contracts()
     for addr in sorted(list(contracts)):
         try:
@@ -799,10 +794,7 @@ def compute_holdings_usd_via_rpc():
             if bal <= EPSILON:
                 continue
             sym, dec = rpc_get_symbol_decimals(addr)
-            pr = get_price_usd(addr) or 0.0  # προσπαθούμε με contract-addr πρώτα
-            if (not pr) or pr <= 0:
-                # fallback σε symbol/historic
-                pr = get_price_usd(sym) or (_history_price_fallback(addr, symbol_hint=sym) or 0.0)
+            pr = get_price_usd(addr) or 0.0
             val = bal * pr
             total += val
             breakdown.append({"token": sym, "token_addr": addr, "amount": bal, "price_usd": pr, "usd_value": val})
@@ -831,7 +823,7 @@ def get_wallet_balances_snapshot():
             continue
         meta = _token_meta.get(k, {})
         sym = (meta.get("symbol") or (k[:8] if isinstance(k, str) else "?")).upper()
-        # ❗️ΜΗΝ κάνεις map TCRO -> CRO. Το κρατάμε ως TCRO (receipt) για να μην μπερδεύεται με το native CRO.
+        # κρατάμε τo tCRO ξεχωριστό ως receipt (ΔΕΝ το κάνουμε map σε CRO)
         balances[sym] = balances.get(sym, 0.0) + amt
     return balances
 
@@ -940,28 +932,22 @@ def compute_holdings_usd_from_history_positions():
 
     breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
     return total, breakdown, unrealized
-  
+
 def compute_holdings_merged_with_receipts():
     """
-    Συνδυάζει:
-      - RPC holdings (native CRO + ό,τι ERC20 βρει)
-      - History positions (για tokens που δεν τα βρίσκει το RPC)
-    και βγάζει ξεχωριστά τα receipts (π.χ. tCRO).
-    Κλειδί ταύτισης: token_addr (0x...) αλλιώς symbol.
+    Merge RPC holdings + History positions, και χωριστά receipts (π.χ. tCRO).
     """
-    # 1) Πάρε RPC
+    # RPC
     try:
         rpc_total, rpc_breakdown, rpc_unreal = compute_holdings_usd_via_rpc()
     except Exception:
         rpc_total, rpc_breakdown, rpc_unreal = (0.0, [], 0.0)
-
-    # 2) Πάρε history
+    # History
     try:
         hist_total, hist_breakdown, hist_unreal = compute_holdings_usd_from_history_positions()
     except Exception:
         hist_total, hist_breakdown, hist_unreal = (0.0, [], 0.0)
 
-    # 3) Ξεχώρισε receipts από το RPC (π.χ. TCRO)
     receipts = []
     kept_rpc = []
     for b in (rpc_breakdown or []):
@@ -977,7 +963,6 @@ def compute_holdings_merged_with_receipts():
         else:
             kept_rpc.append(b)
 
-    # 4) Φτιάξε index RPC (για να ΜΗΝ διπλομετρήσουμε ό,τι ήδη υπάρχει)
     def _key(b):
         addr = (b.get("token_addr") or "").lower()
         if addr.startswith("0x"):
@@ -987,25 +972,19 @@ def compute_holdings_merged_with_receipts():
 
     rpc_index = { _key(b): b for b in kept_rpc }
 
-    # 5) Πρόσθεσε από history ΜΟΝΟ ό,τι λείπει από RPC
     merged = list(kept_rpc)
     for hb in (hist_breakdown or []):
         k = _key(hb)
         if k in rpc_index:
-            continue  # υπάρχει ήδη από RPC
+            continue
         merged.append(hb)
 
-    # 6) Υπολόγισε σύνολο/Unrealized ξανά πάνω στα merged
     total = 0.0
-    unreal = 0.0
     for b in merged:
         total += float(b.get("usd_value") or 0.0)
-    # Unrealized: προτιμάμε RPC αν υπήρχε, αλλιώς του history
+
     unreal = (rpc_unreal if (rpc_breakdown and abs(rpc_unreal) > 0) else hist_unreal)
-
-    # Ταξινόμηση κατά αξία
     merged.sort(key=lambda b: float(b.get("usd_value") or 0.0), reverse=True)
-
     return total, merged, unreal, receipts
 
 # ------------------------------------------------------------
@@ -1033,127 +1012,6 @@ def build_day_report_text():
         unrealized=unrealized,
         data_dir=DATA_DIR,
     )
-# ----------------------------
-# Totals (today|month|all), no external formatter, USD or CRO
-# ----------------------------
-def _iter_entries_for_scope(scope: str):
-    """
-    scope in {"today","month","all"}
-    Yields entries from /app/data/transactions_YYYY-MM-DD.json
-    """
-    files = []
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"):
-                files.append(fn)
-    except Exception:
-        pass
-    files.sort()
-    today_str = ymd()
-    month_str = month_prefix()
-
-    for fn in files:
-        full = os.path.join(DATA_DIR, fn)
-        data = read_json(full, default=None)
-        if not isinstance(data, dict):
-            continue
-        d = (data.get("date") or fn.removeprefix("transactions_").removesuffix(".json"))
-        if scope == "today" and d != today_str:
-            continue
-        if scope == "month" and not d.startswith(month_str):
-            continue
-        for e in data.get("entries", []):
-            yield e
-
-def _group_key_for_entry(e: dict):
-    sym = (e.get("token") or "?").upper()
-    if sym == "TCRO":
-        sym = "CRO"  # normalize
-    addr = (e.get("token_addr") or "").lower()
-    key = addr if (addr.startswith("0x")) else sym
-    return key, sym, (addr if addr else None)
-
-def format_per_asset_totals(scope: str = "all", denom: str = "USD") -> str:
-    """
-    Returns a text block with totals per asset in USD or CRO.
-    scope: "today" | "month" | "all"
-    denom: "USD" | "CRO"
-    """
-    scope = (scope or "all").lower()
-    if scope not in ("today","month","all"):
-        scope = "all"
-    denom = (denom or "USD").upper()
-    if denom not in ("USD","CRO"):
-        denom = "USD"
-
-    cro_price = float(get_price_usd("CRO") or 0.0)
-
-    agg = {}
-    for e in _iter_entries_for_scope(scope):
-        key, sym, addr = _group_key_for_entry(e)
-        rec = agg.get(key)
-        if not rec:
-            rec = {
-                "symbol": sym,
-                "token_addr": addr,
-                "in_qty": 0.0, "in_usd": 0.0,
-                "out_qty": 0.0, "out_usd": 0.0,
-                "realized": 0.0,
-            }
-            agg[key] = rec
-        amt = float(e.get("amount") or 0.0)
-        usd = float(e.get("usd_value") or 0.0)
-        realized = float(e.get("realized_pnl") or 0.0)
-
-        if amt > 0:
-            rec["in_qty"]  += amt
-            rec["in_usd"]  += usd
-        elif amt < 0:
-            rec["out_qty"] += -amt       # keep positive
-            rec["out_usd"] += -usd       # keep positive
-
-        rec["realized"] += realized
-
-    def _net_usd(r):
-        return r["in_usd"] - r["out_usd"]
-
-    rows = sorted(agg.values(), key=lambda r: abs(_net_usd(r)), reverse=True)
-
-    title_scope = {"today":"Today", "month":"Month", "all":"All"}[scope]
-    title = f"📊 Totals per Asset — {title_scope} ({denom})"
-    lines = [title + ":"]
-
-    idx = 1
-    for r in rows:
-        net_qty  = r["in_qty"] - r["out_qty"]
-        net_usd  = r["in_usd"] - r["out_usd"]
-        realized = r["realized"]
-
-        if denom == "CRO" and cro_price > 0:
-            to_cro = 1.0 / cro_price
-            in_v   = r["in_usd"]  * to_cro
-            out_v  = r["out_usd"] * to_cro
-            net_v  = net_usd      * to_cro
-            realized_v = realized * to_cro
-            unit = "CRO"
-        else:
-            in_v, out_v, net_v, realized_v = r["in_usd"], r["out_usd"], net_usd, realized
-            unit = "$"
-
-        sym = r["symbol"]
-        lines.append(
-            f" {idx}. {sym}  "
-            f"IN: {_format_amount(r['in_qty'])} ({unit}{_format_amount(in_v)}) | "
-            f"OUT: {_format_amount(r['out_qty'])} ({unit}{_format_amount(out_v)}) | "
-            f"NET: {_format_amount(net_qty)} ({unit}{_format_amount(net_v)}) | "
-            f"Realized: {unit}{_format_amount(realized_v)}"
-        )
-        idx += 1
-
-    if idx == 1:
-        return f"{title}\n(κανένα δεδομένο)"
-
-    return "\n".join(lines)
 
 # ------------------------------------------------------------
 # TX handlers (native/ERC20)
@@ -1229,7 +1087,6 @@ def handle_native_tx(tx: dict):
         "from": frm,
         "to": to,
     }
-    # FIX: append_ledger now takes a single entry
     append_ledger(entry)
 
 def handle_erc20_tx(t: dict):
@@ -1244,7 +1101,6 @@ def handle_erc20_tx(t: dict):
         decimals = 18
     val_raw = t.get("value", "0")
 
-    # ---- anti-spam keys ----
     event_key = (h, token_addr, frm, to, str(val_raw), str(decimals))
     if not _remember_token_event(event_key):
         return
@@ -1318,7 +1174,6 @@ def handle_erc20_tx(t: dict):
         "from": frm,
         "to": to,
     }
-    # FIX: append_ledger now takes a single entry
     append_ledger(entry)
 
 # ------------------------------------------------------------
@@ -1494,7 +1349,6 @@ def _pair_passes_filters(p):
         return True
     except Exception:
         return False
-
 def discovery_loop():
     seeds = [p.strip().lower() for p in (DEX_PAIRS or "").split(",") if p.strip()]
     for s in seeds:
@@ -1601,6 +1455,9 @@ def alerts_monitor_loop():
                 break
             time.sleep(1)
 
+# ------------------------------------------------------------
+# Guard loop
+# ------------------------------------------------------------
 def guard_monitor_loop():
     send_telegram(f"🛡 Guard monitor: {GUARD_WINDOW_MIN}m window, +{GUARD_PUMP_PCT}% / {GUARD_DROP_PCT}% / trailing {GUARD_TRAIL_DROP_PCT}%.")
     while not shutdown_event.is_set():
@@ -1644,7 +1501,7 @@ def guard_monitor_loop():
             time.sleep(2)
 
 # ------------------------------------------------------------
-# Today per-asset summary (for /dailysum)
+# Today per-asset summary (for /dailysum) - already used by _format_daily_sum_message()
 # ------------------------------------------------------------
 def summarize_today_per_asset():
     path = data_file_for_today()
@@ -1714,224 +1571,8 @@ def summarize_today_per_asset():
     return result
 
 # ------------------------------------------------------------
-# Telegram helpers & commands
+# Telegram commands loop (final wiring + patches)
 # ------------------------------------------------------------
-_TELEGRAM_UPDATE_OFFSET = 0
-
-def _tg_get_updates(timeout=20):
-    global _TELEGRAM_UPDATE_OFFSET
-    if not TELEGRAM_BOT_TOKEN:
-        return []
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout, "offset": _TELEGRAM_UPDATE_OFFSET + 1, "allowed_updates": json.dumps(["message"])}
-    r = safe_get(url, params=params, timeout=timeout + 5, retries=2)
-    data = safe_json(r) or {}
-    results = data.get("result") or []
-    for upd in results:
-        upd_id = upd.get("update_id")
-        if isinstance(upd_id, int) and upd_id > _TELEGRAM_UPDATE_OFFSET:
-            _TELEGRAM_UPDATE_OFFSET = upd_id
-    return results
-
-def _norm_cmd(text: str) -> str:
-    if not text:
-        return ""
-    first = text.strip().split()[0]
-    base = first.split("@", 1)[0].lower()
-
-    if base in ("/show_wallet_assets", "/showwalletassets", "/show", "/showassets", "/show_wallet"):
-        return "/show_wallet_assets"
-    if base in ("/rescan", "/rescan_wallet", "/rescanwallet", "/rescanassets"):
-        return "/rescan"
-    if base in ("/diag", "/status"):
-        return "/diag"
-    if base in ("/dailysum", "/daily_sum", "/day", "/sumday"):
-        return "/dailysum"
-    if base in ("/showdaily",):
-        return "/showdaily"
-    if base in ("/totals", "/sumassets", "/perasset", "/assetsum"):
-        return "/totals"
-    if base in ("/totalstoday", "/totals_today", "/totals-today"):
-        return "/totalstoday"
-    if base in ("/totalsmonth", "/totals_month", "/totals-month"):
-        return "/totalsmonth"
-
-    t = text.strip().lower()
-    if t in ("/show wallet assets",):
-        return "/show_wallet_assets"
-    return base
-  
-def compute_holdings_usd_via_rpc_with_receipts():
-    """
-    Wrapper για να χωρίσουμε receipts (π.χ. tCRO) από τα κανονικά holdings,
-    μόνο για το μήνυμα του /show_wallet_assets.
-    Δεν αλλάζει κανένα άλλο σημείο του κώδικα.
-    """
-    total, breakdown, unrealized = compute_holdings_usd_via_rpc()
-    receipts = []
-    kept = []
-    for b in (breakdown or []):
-        symU = (b.get("token") or "").upper()
-        if symU == "TCRO":
-            receipts.append({
-                "token": "tCRO (receipt)",
-                "token_addr": b.get("token_addr"),
-                "amount": b.get("amount", 0.0),
-                "price_usd": None,
-                "usd_value": None,
-            })
-        else:
-            kept.append(b)
-    return total, kept, unrealized, receipts
-
-def _format_wallet_assets_message():
-    # Χρησιμοποιούμε merge (RPC + history) + receipts
-    try:
-        total, breakdown, unrealized, receipts = compute_holdings_merged_with_receipts()
-    except Exception:
-        # Fallback όσο πιο ανθεκτικά γίνεται
-        try:
-            total, breakdown, unrealized = compute_holdings_usd_via_rpc()
-            receipts = []
-        except Exception:
-            try:
-                total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
-                receipts = []
-            except Exception:
-                total, breakdown, unrealized, receipts = (0.0, [], 0.0, [])
-
-    if not breakdown and not receipts:
-        return "📦 Δεν βρέθηκαν assets αυτή τη στιγμή."
-
-    lines = ["*💼 Wallet Assets (MTM):*"]
-    for b in breakdown:
-        tok = b["token"]
-        amt = b["amount"]
-        pr = b["price_usd"] or 0.0
-        val = b["usd_value"] or 0.0
-        lines.append(f"• {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
-
-    lines.append(f"\n*Σύνολο:* ${_format_amount(total)}")
-    if _nonzero(unrealized):
-        lines.append(f"*Unrealized PnL (open):* ${_format_amount(unrealized)}")
-
-    if receipts:
-        lines.append("\n*📎 Receipt / Staked tokens (εκτός συνόλου):*")
-        for r in receipts:
-            lines.append(f"• {r['token']}: {_format_amount(r['amount'])}")
-
-    snap = get_wallet_balances_snapshot()
-    if snap:
-        lines.append("\n_Quantities snapshot (runtime):_")
-        for sym, amt in sorted(snap.items(), key=lambda x: abs(x[1]), reverse=True):
-            lines.append(f"  – {sym}: {_format_amount(amt)}")
-
-    return "\n".join(lines)
-
-def _format_daily_sum_message():
-    """
-    Λεπτομερές /dailysum:
-      - Όλες οι σημερινές κινήσεις ανά asset με ώρα, κατεύθυνση, ποσότητα, τιμή, USD, realized ανά trade
-      - Υποσύνολο ανά asset (realized, net flow, buys/sells)
-      - Συνολικά totals στο τέλος
-    """
-    path = data_file_for_today()
-    data = read_json(path, default={"date": ymd(), "entries": []})
-    entries = data.get("entries", [])
-
-    if not entries:
-        return f"🧾 Δεν υπάρχουν σημερινές κινήσεις ({ymd()})."
-
-    # Ομαδοποίηση ανά asset key (προτιμάμε contract 0x..., αλλιώς symbol)
-    by_asset = {}
-    for e in entries:
-        sym = (e.get("token") or "?").upper()
-        if sym == "TCRO":
-            sym = "CRO"  # το ledger ήδη το κάνει, κρατάμε συνέπεια
-        addr = (e.get("token_addr") or "").lower()
-        key = addr if (addr.startswith("0x")) else sym
-
-        amt = float(e.get("amount") or 0.0)
-        usd = float(e.get("usd_value") or 0.0)
-        prc = float(e.get("price_usd") or 0.0)
-        rp = float(e.get("realized_pnl") or 0.0)
-        tm = (e.get("time", "")[-8:]) or ""
-        side = "IN" if amt > 0 else "OUT" if amt < 0 else "FLAT"
-
-        rec = by_asset.get(key)
-        if not rec:
-            rec = {
-                "symbol": sym,
-                "token_addr": addr if addr else None,
-                "txs": [],
-                "in_qty": 0.0, "in_usd": 0.0, "buys": 0,
-                "out_qty": 0.0, "out_usd": 0.0, "sells": 0,
-                "realized": 0.0,
-            }
-            by_asset[key] = rec
-
-        rec["txs"].append({"time": tm, "side": side, "amount": amt, "price": prc, "usd": usd, "realized": rp})
-
-        if side == "IN":
-            rec["in_qty"] += amt
-            rec["in_usd"] += usd
-            rec["buys"] += 1
-        elif side == "OUT":
-            rec["out_qty"] += -amt  # θετικό ποσό για το σύνολο πωλήσεων
-            rec["out_usd"] += -usd  # θετικό USD για το σύνολο πωλήσεων
-            rec["sells"] += 1
-
-        rec["realized"] += rp
-
-    # Ταξινόμηση assets κατά απόλυτο net USD (σημαντικότερα πάνω)
-    def _net_usd(rec):
-        return (rec["in_usd"] - rec["out_usd"])
-    ordered = sorted(by_asset.values(), key=lambda r: abs(_net_usd(r)), reverse=True)
-
-    lines = [f"*🧾 Daily PnL (Today {ymd()}):*"]
-
-    total_realized = 0.0
-    total_net_flow = 0.0
-
-    for rec in ordered:
-        sym = rec["symbol"]
-        # ταξινόμηση συναλλαγών ανά ώρα
-        rec["txs"].sort(key=lambda t: t["time"])
-
-        lines.append(f"\n*{sym}*")
-        for t in rec["txs"]:
-            side = t["side"]
-            amt = t["amount"]
-            pr = t["price"]
-            usd = t["usd"]
-            rz = t["realized"]
-            tm = t["time"]
-            # εμφανίζουμε qty με πρόσημο, usd με πρόσημο, realized ανά trade
-            lines.append(
-                f"  {tm} • {side:<3} qty {_format_amount(amt)} @ ${_format_price(pr)} → USD {_format_amount(usd)}"
-                + (f" | realized {_format_amount(rz)}" if _nonzero(rz) else "")
-            )
-
-        net_qty = rec["in_qty"] - rec["out_qty"]
-        net_usd = rec["in_usd"] - rec["out_usd"]
-        total_realized += rec["realized"]
-        total_net_flow += net_usd
-
-        # Υποσύνολο ανά asset
-        lines.append(
-            f"  — summary: buys {rec['buys']}, sells {rec['sells']} | "
-            f"in_qty {_format_amount(rec['in_qty'])}, out_qty {_format_amount(rec['out_qty'])} | "
-            f"net_qty {_format_amount(net_qty)} | net_flow ${_format_amount(net_usd)} | "
-            f"realized ${_format_amount(rec['realized'])}"
-        )
-
-    # Συνολικά totals ημέρας
-    lines.append("")
-    lines.append(f"*Σύνολο realized σήμερα:* ${_format_amount(total_realized)}")
-    lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(total_net_flow)}")
-
-    return "\n".join(lines)
-
 def telegram_commands_loop():
     send_telegram("🧩 Telegram commands listener ενεργό...")
     while not shutdown_event.is_set():
@@ -1976,18 +1617,29 @@ def telegram_commands_loop():
 
                 elif cmd == "/rescan":
                     try:
+                        # 1) εμπλουτισμός γνωστών συμβολαίων
                         n = rpc_discover_wallet_tokens(
                             window_blocks=int(os.getenv("LOG_SCAN_BLOCKS", "120000")),
                             chunk=int(os.getenv("LOG_SCAN_CHUNK", "5000")),
                         )
-                        total, breakdown, _ = compute_holdings_usd_via_rpc()
-                        if not breakdown:
-                            total, breakdown, _ = (0.0, [], 0.0)
-                        lines = [f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {n} tokens με θετικό balance.", "", "📦 Snapshot:"]
-                        for b in breakdown[:15]:
+
+                        # 2) merged holdings (RPC + History) και receipts χωριστά
+                        total, merged, _unreal, receipts = compute_holdings_merged_with_receipts()
+
+                        pos_count = sum(1 for b in merged if float(b.get("amount") or 0.0) > EPSILON)
+                        lines = [
+                            f"🔄 Rescan ολοκληρώθηκε. Βρέθηκαν {pos_count} tokens με θετικό balance.",
+                            "",
+                            "📦 Snapshot:",
+                        ]
+                        for b in merged[:20]:
                             lines.append(f"• {b['token']}: {_format_amount(b['amount'])}")
-                        if len(breakdown) > 15:
-                            lines.append(f"… και {len(breakdown) - 15} ακόμα.")
+                        if receipts:
+                            lines.append("• Receipts:")
+                            for r in receipts:
+                                lines.append(f"  – {r['token']}: {_format_amount(r['amount'])}")
+                        if len(merged) > 20:
+                            lines.append(f"… και {len(merged) - 20} ακόμα.")
                         send_telegram("\n".join(lines))
                     except Exception as e:
                         send_telegram(f"❌ Rescan error: {e}")
@@ -1996,11 +1648,11 @@ def telegram_commands_loop():
                     try:
                         lines = [
                             "*🔧 Diagnostics*",
-                            f"WALLET_ADDRESS: {WALLET_ADDRESS}",
-                            f"CRONOS_RPC_URL set: {bool(CRONOS_RPC_URL)}",
+                            f"WALLETADDRESS: {WALLET_ADDRESS}",
+                            f"CRONOSRPCURL set: {bool(CRONOS_RPC_URL)}",
                             f"Etherscan key: {bool(ETHERSCAN_API)}",
-                            f"LOG_SCAN_BLOCKS={LOG_SCAN_BLOCKS} LOG_SCAN_CHUNK={LOG_SCAN_CHUNK}",
-                            f"TZ={TZ} INTRADAY_HOURS={INTRADAY_HOURS} EOD={EOD_HOUR:02d}:{EOD_MINUTE:02d}",
+                            f"LOGSCANBLOCKS={LOG_SCAN_BLOCKS} LOGSCANCHUNK={LOG_SCAN_CHUNK}",
+                            f"TZ={TZ} INTRADAYHOURS={INTRADAY_HOURS} EOD={EOD_HOUR:02d}:{EOD_MINUTE:02d}",
                             f"Alerts every: {ALERTS_INTERVAL_MIN}m | Pump/Dump: {PUMP_ALERT_24H_PCT}/{DUMP_ALERT_24H_PCT}",
                             f"Tracked pairs: {len(_tracked_pairs)} | Known tokens: {len(_token_meta)}",
                             f"Positions: {len(_position_qty)} | Runtime balances: {len(_token_balances)}",
@@ -2012,25 +1664,30 @@ def telegram_commands_loop():
 
                 elif cmd == "/totalstoday":
                     try:
-                        send_telegram(format_per_asset_totals("today"))
+                        txt_lower = (text or "").lower()
+                        denom = "CRO" if (" cro" in txt_lower or "σε cro" in txt_lower) else "USD"
+                        send_telegram(format_per_asset_totals("today", denom=denom))
                     except Exception as e:
                         send_telegram(f"❌ totals(today) error: {e}")
 
                 elif cmd == "/totalsmonth":
                     try:
-                        send_telegram(format_per_asset_totals("month"))
+                        txt_lower = (text or "").lower()
+                        denom = "CRO" if (" cro" in txt_lower or "σε cro" in txt_lower) else "USD"
+                        send_telegram(format_per_asset_totals("month", denom=denom))
                     except Exception as e:
                         send_telegram(f"❌ totals(month) error: {e}")
 
                 elif cmd == "/totals":
-                    txt = (text or "").strip().lower()
+                    txt_lower = (text or "").lower()
                     scope = "all"
-                    if "today" in txt or "σήμερα" in txt:
+                    if "today" in txt_lower or "σήμερα" in txt_lower:
                         scope = "today"
-                    elif "month" in txt or "μήνα" in txt or "μηνα" in txt:
+                    elif "month" in txt_lower or "μήνα" in txt_lower or "μηνα" in txt_lower:
                         scope = "month"
+                    denom = "CRO" if (" cro" in txt_lower or "σε cro" in txt_lower) else "USD"
                     try:
-                        send_telegram(format_per_asset_totals(scope))
+                        send_telegram(format_per_asset_totals(scope, denom=denom))
                     except Exception as e:
                         send_telegram(f"❌ totals error: {e}")
 
@@ -2039,7 +1696,7 @@ def telegram_commands_loop():
         time.sleep(2)
 
 # ------------------------------------------------------------
-# Wallet monitor loop & schedulers
+# Wallet monitor loop & schedulers (final)
 # ------------------------------------------------------------
 def wallet_monitor_loop():
     log.info("Wallet monitor starting; loading initial recent txs...")
