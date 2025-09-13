@@ -1,65 +1,84 @@
-# telegram/api.py
-import os, time, random, logging, requests
+# -*- coding: utf-8 -*-
+"""
+Telegram API helper
+- MarkdownV2 escaping
+- Chunking for >4096 chars
+- Basic rate-limit handling (429 retry_after)
+"""
+import requests
+import time
+import logging
+from os import getenv
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID") or ""
-TG_MAX = 4096
+BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN") or ""
+CHAT_ID   = getenv("TELEGRAM_CHAT_ID") or ""
+API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+MAX_LEN   = 4096
 
 log = logging.getLogger("telegram")
 
-# χαρακτήρες που θέλουν escape στο MarkdownV2
-MDV2_ESC = r'_*[]()~`>#+-=|{}.!'
+_MD_CHARS = r'_[]()~`>#+-=|{}.!*'
 
-def escape_md(text: str) -> str:
-    """Escape κειμένου για Telegram MarkdownV2"""
-    return ''.join('\\' + c if c in MDV2_ESC else c for c in (text or ""))
+def escape_md(s: str) -> str:
+    if not s:
+        return s
+    out = []
+    for ch in s:
+        if ch in _MD_CHARS:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
 
-def _post(payload: dict) -> bool:
-    """Αποστολή μηνύματος στο Telegram με retries + backoff"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    backoff = 2
-    for attempt in range(6):
+
+def _post(text: str, parse_mode: str = "MarkdownV2"):
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    backoff = 1.0
+    for _ in range(5):
         try:
-            r = requests.post(url, json=payload, timeout=20)
-            if r.status_code == 200:
-                return True
+            r = requests.post(API_URL, json=payload, timeout=20)
             if r.status_code == 429:
                 try:
-                    ra = r.json().get("parameters", {}).get("retry_after", 1)
+                    retry_after = int(r.json().get("parameters", {}).get("retry_after", 1))
                 except Exception:
-                    ra = 1
-                log.warning("Rate-limited by Telegram, retrying after %ss", ra)
-                time.sleep(ra + random.uniform(0, 0.5))
+                    retry_after = 1
+                time.sleep(retry_after + 0.2)
                 continue
-            # άλλα HTTP errors → μικρό backoff
-            time.sleep(min(30, backoff + random.uniform(0, 1)))
-            backoff = min(30, backoff * 2)
+            if r.status_code >= 400:
+                log.warning("Telegram send failed %s: %s", r.status_code, r.text[:200])
+            return
         except Exception as e:
-            log.debug("telegram post error: %s", e)
-            time.sleep(min(30, backoff + random.uniform(0, 1)))
-            backoff = min(30, backoff * 2)
-    return False
+            log.debug("Telegram error: %s", e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
 
-def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
-    """Στέλνει μήνυμα στο Telegram (κόβει >4096 chars σε chunks)"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
 
-    chunks = []
-    s = text or ""
-    while s:
-        chunks.append(s[:TG_MAX])
-        s = s[TG_MAX:]
+def send_telegram(text: str):
+    """Escape MarkdownV2 + chunk >4096 into multiple messages."""
+    if not BOT_TOKEN or not CHAT_ID or not text:
+        return
+    esc = escape_md(text)
+    if len(esc) <= MAX_LEN:
+        _post(esc)
+        return
 
-    ok = True
-    for i, ch in enumerate(chunks, 1):
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": escape_md(ch) if parse_mode == "MarkdownV2" else ch,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        if len(chunks) > 1:
-            payload["text"] = f"{payload['text']}\n\n_{i}/{len(chunks)}_"
-        ok = _post(payload) and ok
-    return ok
+    start = 0
+    idx = 0
+    while start < len(esc):
+        end = min(len(esc), start + MAX_LEN)
+        nl = esc.rfind("\n", start, end)
+        if nl == -1 or nl <= start + 100:
+            nl = end
+        part = esc[start:nl]
+        idx += 1
+        header = f"_part {idx}_\n" if idx > 1 else ""
+        _post(header + part)
+        start = nl
+
+
+__all__ = ["send_telegram", "escape_md"]
