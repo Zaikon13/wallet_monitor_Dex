@@ -706,6 +706,7 @@ def compute_holdings_merged():
       total_usd, breakdown(list), unrealized_usd, receipts(list)
     - 'breakdown' excludes receipt symbols (e.g., TCRO) from MTM total
     - 'receipts' holds them separately (price usually 0)
+    - CRO line is ALWAYS present if any source (RPC/history/runtime) shows a positive qty
     """
     total_r, br_r, _unrl_r = compute_holdings_usd_via_rpc()
     total_h, br_h, _unrl_h = compute_holdings_usd_from_history_positions()
@@ -745,6 +746,60 @@ def compute_holdings_merged():
         _add(b)
     for b in br_r or []:
         _add(b)
+
+    # --- ensure CRO presence with multi-source fallback ---
+    def _cro_present_in(merged_map: dict) -> bool:
+        for v in merged_map.values():
+            if (v.get("token") or "").upper() == "CRO" and float(v.get("amount") or 0.0) > EPSILON:
+                return True
+        return False
+
+    def _try_append_cro(merged_map: dict):
+        # if no CRO line or CRO line has ~0 qty, attempt to fetch amount from multiple sources
+        cro_amt = 0.0
+
+        # 1) RPC
+        try:
+            if rpc_init():
+                cro_amt = float(rpc_get_native_balance(WALLET_ADDRESS) or 0.0)
+        except Exception:
+            cro_amt = 0.0
+
+        # 2) History (open qty)
+        if cro_amt <= EPSILON:
+            try:
+                pos_qty, _ = rebuild_open_positions_from_history()
+                cro_amt = max(cro_amt, float(pos_qty.get("CRO") or 0.0))
+            except Exception:
+                pass
+
+        # 3) Runtime snapshot
+        if cro_amt <= EPSILON:
+            try:
+                cro_amt = max(cro_amt, float(_token_balances.get("CRO") or 0.0))
+            except Exception:
+                pass
+
+        if cro_amt > EPSILON:
+            cro_price = get_price_usd("CRO") or 0.0
+            k = "CRO"
+            existing = merged_map.get(k)
+            if existing:
+                existing["amount"] = float(existing.get("amount") or 0.0) + cro_amt
+                if float(existing.get("price_usd") or 0.0) <= 0 and cro_price > 0:
+                    existing["price_usd"] = cro_price
+            else:
+                merged_map[k] = {
+                    "token": "CRO",
+                    "token_addr": None,
+                    "amount": cro_amt,
+                    "price_usd": cro_price or 0.0,
+                    "usd_value": 0.0,
+                }
+
+    # only attempt to force-add CRO if it’s not already present with qty>0
+    if not _cro_present_in(merged):
+        _try_append_cro(merged)
 
     receipts = []
     breakdown = []
