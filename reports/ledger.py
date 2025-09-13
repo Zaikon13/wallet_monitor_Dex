@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Iterable, Tuple, Any
+from typing import Dict, Iterable, Any
 
 # ------------------------------------------------------------
 # Config / Paths
@@ -37,6 +38,8 @@ LOCAL_TZ = ZoneInfo(TZ)
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Ledger write lock (thread-safe appends)
+_LEDGER_LOCK = threading.Lock()
 
 # ------------------------------------------------------------
 # Small utils
@@ -71,9 +74,11 @@ def data_file_for_today() -> str:
 
 
 def _normalize_symbol(sym: str | None) -> str:
+    """
+    ΜΟΝΟ uppercase/trim — ΔΕΝ κάνουμε πλέον alias TCRO→CRO.
+    Το receipt token (π.χ. TCRO) πρέπει να παραμείνει διακριτό σε όλο το pipeline.
+    """
     s = (sym or "").strip().upper()
-    if s == "TCRO":
-        return "CRO"
     return s or "?"
 
 
@@ -84,29 +89,37 @@ def _normalize_symbol(sym: str | None) -> str:
 def append_ledger(entry: Dict[str, Any]) -> None:
     """
     Προσθέτει entry στο σημερινό αρχείο και ενημερώνει net_usd_flow / realized_pnl.
+    Thread-safe με _LEDGER_LOCK.
     Το entry αναμένεται να περιέχει: amount, price_usd, usd_value, realized_pnl, token, token_addr, time, ...
     """
-    path = data_file_for_today()
-    payload = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
+    with _LEDGER_LOCK:
+        path = data_file_for_today()
+        payload = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
 
-    # κανονικοποίηση συμβόλου πριν γράψουμε
-    try:
-        if "token" in entry:
-            entry["token"] = _normalize_symbol(entry.get("token"))
-    except Exception:
-        pass
+        # κανονικοποίηση συμβόλου πριν γράψουμε (χωρίς alias TCRO→CRO)
+        try:
+            if "token" in entry:
+                entry["token"] = _normalize_symbol(entry.get("token"))
+        except Exception:
+            pass
 
-    payload["entries"].append(entry)
-    try:
-        payload["net_usd_flow"] = float(payload.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
-    except Exception:
-        pass
-    try:
-        payload["realized_pnl"] = float(payload.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
-    except Exception:
-        pass
+        if not isinstance(payload, dict):
+            payload = {"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0}
+        if "entries" not in payload or not isinstance(payload["entries"], list):
+            payload["entries"] = []
 
-    write_json(path, payload)
+        payload["entries"].append(entry)
+
+        try:
+            payload["net_usd_flow"] = float(payload.get("net_usd_flow", 0.0)) + float(entry.get("usd_value", 0.0))
+        except Exception:
+            pass
+        try:
+            payload["realized_pnl"] = float(payload.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl", 0.0))
+        except Exception:
+            pass
+
+        write_json(path, payload)
 
 
 # ------------------------------------------------------------
@@ -158,13 +171,13 @@ def update_cost_basis(
 def _key_from_entry(e: Dict[str, Any]) -> str:
     """
     Παράγει το token_key από ένα ledger entry.
-    Προτεραιότητα: token_addr (0x...) αλλιώς σύμβολο (TCRO->CRO).
+    Προτεραιότητα: token_addr (0x...) αλλιώς σύμβολο (ΧΩΡΙΣ alias TCRO→CRO).
     """
     addr = (e.get("token_addr") or "").strip().lower()
     if addr.startswith("0x"):
         return addr
     sym = _normalize_symbol(e.get("token"))
-    return "CRO" if sym == "CRO" else sym
+    return sym
 
 
 def replay_cost_basis_over_entries(
