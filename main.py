@@ -242,37 +242,70 @@ def _price_cro_fallback():
             if p and p>0: return p
         except: pass
     return None
-
+  
+def _sanitize_price(sym: str, p: float | None):
+    if p is None or p <= 0:
+        return None
+    sU = (sym or "").upper()
+    # CRO/WCRO: αγνόησε γελοία outliers από DS
+    if sU in ("CRO", "WCRO") and p < 0.02:
+        return None
+    return p
+  
 def get_price_usd(symbol_or_addr: str):
-    if not symbol_or_addr: return None
-    key = PRICE_ALIASES.get(symbol_or_addr.strip().lower(), symbol_or_addr.strip().lower())
-    now = time.time()
-    c = PRICE_CACHE.get(key)
-    if c and (now - c[1] < PRICE_CACHE_TTL): return c[0]
+    if not symbol_or_addr:
+        return None
+    key = symbol_or_addr.strip().lower()
+    key = PRICE_ALIASES.get(key, key)
+    now_ts = time.time()
 
-    price=None
+    cached = PRICE_CACHE.get(key)
+    if cached and (now_ts - cached[1] < PRICE_CACHE_TTL):
+        return cached[0]
+
+    price = None
     try:
-        if key in ("cro","wcro","w-cro","wrappedcro","wrapped cro"):
-            for q in ["wcro usdt","cro usdt"]:
-                data=safe_json(safe_get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)) or {}
-                price=_pick_best_price(data.get("pairs"))
-                if price: break
-            if not price: price=_price_cro_fallback()
-        elif key.startswith("0x") and len(key)==42:
-            price=_pick_best_price(_pairs_for_token_addr(key))
+        if key in ("cro", "wcro", "w-cro", "wrappedcro", "wrapped cro"):
+            r = safe_get(DEX_BASE_SEARCH, params={"q": "wcro usdt"}, timeout=10)
+            data = safe_json(r) or {}
+            price = _pick_best_price(data.get("pairs"))
+            if not price:
+                r = safe_get(DEX_BASE_SEARCH, params={"q": "cro usdt"}, timeout=10)
+                data = safe_json(r) or {}
+                price = _pick_best_price(data.get("pairs"))
+            if not price:
+                price = _price_cro_fallback()
+        elif key.startswith("0x") and len(key) == 42:
+            price = _pick_best_price(_pairs_for_token_addr(key))
         else:
-            for q in [key, f"{key} usdt", f"{key} wcro"]:
-                data=safe_json(safe_get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)) or {}
-                price=_pick_best_price(data.get("pairs"))
-                if price: break
-    except: price=None
+            r = safe_get(DEX_BASE_SEARCH, params={"q": key}, timeout=10)
+            data = safe_json(r) or {}
+            price = _pick_best_price(data.get("pairs"))
+            if not price and len(key) <= 12:
+                r = safe_get(DEX_BASE_SEARCH, params={"q": f"{key} usdt"}, timeout=10)
+                data = safe_json(r) or {}
+                price = _pick_best_price(data.get("pairs"))
+                if not price:
+                    r = safe_get(DEX_BASE_SEARCH, params={"q": f"{key} wcro"}, timeout=10)
+                    data = safe_json(r) or {}
+                    price = _pick_best_price(data.get("pairs"))
+    except Exception:
+        price = None
 
-    if (price is None) or (not price) or (float(price)<=0):
-        hist=_history_price_fallback(symbol_or_addr, symbol_hint=symbol_or_addr)
-        if hist and hist>0: price=float(hist)
+    # Sanitize & fallback
+    san = _sanitize_price(symbol_or_addr, float(price) if price is not None else None)
+    if san is None:
+        # try last valid cached
+        if cached and cached[0] and cached[0] > 0:
+            PRICE_CACHE[key] = (cached[0], now_ts)
+            return cached[0]
+        # try history
+        hist = _history_price_fallback(symbol_or_addr, symbol_hint=symbol_or_addr)
+        if hist and hist > 0:
+            san = float(hist)
 
-    PRICE_CACHE[key]=(price, now)
-    return price
+    PRICE_CACHE[key] = (san, now_ts)
+    return san
 
 def get_change_and_price_for_symbol_or_addr(sym_or_addr: str):
     if sym_or_addr.lower().startswith("0x") and len(sym_or_addr)==42:
@@ -549,44 +582,53 @@ def compute_holdings_usd_via_rpc():
     return total, breakdown, unrealized
 
 def rebuild_open_positions_from_history():
-    pos_qty, pos_cost = defaultdict(float), defaultdict(float)
-    symbol_to_contract=_build_history_maps()
+    pos_qty = defaultdict(float)
+    pos_cost = defaultdict(float)
+    symbol_to_contract = _build_history_maps()
 
-    def _update(pos_qty,pos_cost,token_key,signed_amount,price_usd):
-        qty=pos_qty[token_key]; cost=pos_cost[token_key]
-        if signed_amount>EPSILON:
-            pos_qty[token_key]=qty+signed_amount
-            pos_cost[token_key]=cost+signed_amount*(price_usd or 0.0)
-        elif signed_amount<-EPSILON and qty>EPSILON:
-            sell_qty=min(-signed_amount, qty)
-            avg_cost=(cost/qty) if qty>EPSILON else (price_usd or 0.0)
-            pos_qty[token_key]=qty-sell_qty
-            pos_cost[token_key]=max(0.0, cost - avg_cost*sell_qty)
+    def _update(pos_qty, pos_cost, token_key, signed_amount, price_usd):
+        qty = pos_qty[token_key]
+        cost = pos_cost[token_key]
+        if signed_amount > EPSILON:
+            pos_qty[token_key] = qty + signed_amount
+            pos_cost[token_key] = cost + signed_amount * (price_usd or 0.0)
+        elif signed_amount < -EPSILON and qty > EPSILON:
+            sell_qty = min(-signed_amount, qty)
+            avg_cost = (cost / qty) if qty > EPSILON else (price_usd or 0.0)
+            pos_qty[token_key] = qty - sell_qty
+            pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
 
-    files=[]
+    files = []
     try:
         for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"): files.append(fn)
-    except Exception as ex: log.exception("listdir data error: %s", ex)
+            if fn.startswith("transactions_") and fn.endswith(".json"):
+                files.append(fn)
+    except Exception as ex:
+        log.exception("listdir data error: %s", ex)
+
     files.sort()
-
     for fn in files:
-        data=read_json(os.path.join(DATA_DIR,fn), default=None)
-        if not isinstance(data,dict): continue
-        for e in data.get("entries",[]):
-            sym_raw=(e.get("token") or "").strip()
-            addr_raw=(e.get("token_addr") or "").strip().lower()
-            amt=float(e.get("amount") or 0.0)
-            pr=float(e.get("price_usd") or 0.0)
-            symU=sym_raw.upper() if sym_raw else sym_raw
-            if addr_raw and addr_raw.startswith("0x"): key=addr_raw
-            else:
-                mapped=symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
-                key=mapped if (mapped and mapped.startswith("0x")) else (symU or sym_raw or "?")
-            _update(pos_qty,pos_cost,key,amt,pr)
+        data = read_json(os.path.join(DATA_DIR, fn), default=None)
+        if not isinstance(data, dict):
+            continue
+        for e in data.get("entries", []):
+            sym_raw = (e.get("token") or "").strip()
+            addr_raw = (e.get("token_addr") or "").strip().lower()
+            amt = float(e.get("amount") or 0.0)
+            pr = float(e.get("price_usd") or 0.0)
+            symU = sym_raw.upper() if sym_raw else sym_raw
 
-    for k,v in list(pos_qty.items()):
-        if abs(v)<1e-10: pos_qty[k]=0.0
+            if addr_raw and addr_raw.startswith("0x"):
+                key = addr_raw
+            else:
+                mapped = symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
+                key = mapped if (mapped and mapped.startswith("0x")) else (symU or sym_raw or "?")
+
+            _update(pos_qty, pos_cost, key, amt, pr)
+
+    for k, v in list(pos_qty.items()):
+        if abs(v) < 1e-10:
+            pos_qty[k] = 0.0
     return pos_qty, pos_cost
 
 def compute_holdings_usd_from_history_positions():
@@ -626,43 +668,107 @@ def compute_holdings_usd_from_history_positions():
 
     breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
     return total, breakdown, unrealized
+  
+def _recompute_unreal_from_merged(breakdown: list[dict]) -> float:
+    """
+    Recompute unrealized from fully merged holdings:
+      - Build open positions (qty & cost) from full history
+      - For each asset in the merged breakdown, value only the actually open qty
+      - Receipt tokens (π.χ. TCRO) δεν πρέπει να υπάρχουν εδώ (το callsite τις εξαιρεί)
+    """
+    pos_qty, pos_cost = rebuild_open_positions_from_history()
+
+    total_unreal = 0.0
+    for b in breakdown:
+        addr = b.get("token_addr")
+        sym  = (b.get("token") or "").upper()
+        key = addr.lower() if (isinstance(addr, str) and addr.startswith("0x")) else sym
+
+        qty_now = float(b.get("amount") or 0.0)
+        price   = float(b.get("price_usd") or 0.0)
+
+        open_qty  = float(pos_qty.get(key, 0.0))
+        open_cost = float(pos_cost.get(key, 0.0))
+
+        if open_qty <= 0.0 or price <= 0.0:
+            continue
+
+        # αποτιμάμε μόνο το κομμάτι που είναι πράγματι ανοικτό
+        eff_qty = min(qty_now, open_qty)
+        eff_cost = (open_cost if eff_qty == open_qty else (open_cost * (eff_qty / open_qty)))
+        total_unreal += (eff_qty * price - eff_cost)
+
+    return total_unreal
 
 def compute_holdings_merged():
-    total_r, br_r, unrl_r = compute_holdings_usd_via_rpc()
-    total_h, br_h, unrl_h = compute_holdings_usd_from_history_positions()
+    """
+    Merge RPC + History. Returns:
+      total_usd, breakdown(list), unrealized_usd, receipts(list)
+    - 'breakdown' excludes receipt symbols (e.g., TCRO) from MTM total
+    - 'receipts' holds them separately (price usually 0)
+    """
+    total_r, br_r, _unrl_r = compute_holdings_usd_via_rpc()
+    total_h, br_h, _unrl_h = compute_holdings_usd_from_history_positions()
 
+    # Merge by (addr if present, else symbol)
     def _key(b):
-        addr=b.get("token_addr"); sym=(b.get("token") or "").upper()
-        return addr.lower() if (isinstance(addr,str) and addr.startswith("0x")) else sym
+        addr = b.get("token_addr")
+        sym = (b.get("token") or "").upper()
+        return addr.lower() if (isinstance(addr, str) and addr.startswith("0x")) else sym
 
-    merged={}
+    merged = {}
     def _add(b):
-        k=_key(b)
-        if not k: return
-        cur=merged.get(k, {"token":b["token"],"token_addr":b.get("token_addr"),
-                           "amount":0.0,"price_usd":0.0,"usd_value":0.0})
-        cur["token"]=b["token"] or cur["token"]
-        cur["token_addr"]=b.get("token_addr", cur.get("token_addr"))
+        k = _key(b)
+        if not k:
+            return
+        cur = merged.get(k, {
+            "token": b.get("token"),
+            "token_addr": b.get("token_addr"),
+            "amount": 0.0,
+            "price_usd": 0.0,
+            "usd_value": 0.0,
+        })
+        # prefer filled meta
+        if not cur.get("token"):
+            cur["token"] = b.get("token")
+        if not cur.get("token_addr") and b.get("token_addr"):
+            cur["token_addr"] = b.get("token_addr")
+        # accumulate amount
         cur["amount"] += float(b.get("amount") or 0.0)
-        pr=float(b.get("price_usd") or 0.0)
-        if pr>0: cur["price_usd"]=pr
-        cur["usd_value"]=cur["amount"]*(cur["price_usd"] or 0.0)
-        merged[k]=cur
+        # prefer a non-zero price
+        pr = float(b.get("price_usd") or 0.0)
+        if pr > 0:
+            cur["price_usd"] = pr
+        merged[k] = cur
 
-    for b in br_h or []: _add(b)
-    for b in br_r or []: _add(b)
+    for b in br_h or []:
+        _add(b)
+    for b in br_r or []:
+        _add(b)
 
-    receipts, breakdown, total = [], [], 0.0
+    receipts = []
+    breakdown = []
+    total = 0.0
+
     for rec in merged.values():
-        symU=(rec["token"] or "").upper()
-        if symU in RECEIPT_SYMBOLS or symU=="TCRO":
-            receipts.append(rec); continue
-        if symU=="CRO": rec["token"]="CRO"
-        rec["usd_value"]=float(rec.get("amount",0.0))*float(rec.get("price_usd",0.0) or 0.0)
-        total+=rec["usd_value"]; breakdown.append(rec)
+        symU = (rec.get("token") or "").upper()
+        # receipts δεν μπαίνουν στα totals/unreal
+        if symU in RECEIPT_SYMBOLS or symU == "TCRO":
+            receipts.append(rec)
+            continue
+        if symU == "CRO":
+            rec["token"] = "CRO"
+        amt = float(rec.get("amount", 0.0))
+        prc = float(rec.get("price_usd", 0.0) or 0.0)
+        rec["usd_value"] = amt * prc
+        total += rec["usd_value"]
+        breakdown.append(rec)
 
-    breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
-    unrealized = unrl_r + unrl_h
+    breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
+
+    # recompute unrealized από το merged breakdown (όχι άθροισμα από RPC/History)
+    unrealized = _recompute_unreal_from_merged(breakdown)
+
     return total, breakdown, unrealized, receipts
 
 # ---------- Day report wrapper ----------
@@ -970,55 +1076,95 @@ def _cooldown_ok(key):
     return False
 
 def get_wallet_balances_snapshot():
-    balances={}
-    for k,v in list(_token_balances.items()):
-        amt=float(v)
-        if amt<=EPSILON: continue
-        if k=="CRO": sym="CRO"
-        elif isinstance(k,str) and k.startswith("0x"):
-            meta=_token_meta.get(k,{})
-            sym=(meta.get("symbol") or k[:8]).upper()
+    """
+    Lightweight runtime snapshot from _token_balances/_meta (used by alerts).
+    Keyed by stable identity (contract addr ή "CRO") -> {symbol, token_addr, amount}
+    Αποφεύγονται collisions μεταξύ συμβολαίων με ίδιο symbol.
+    """
+    balances = {}
+    for k, v in list(_token_balances.items()):
+        amt = float(v)
+        if amt <= EPSILON:
+            continue
+
+        if k == "CRO":
+            key = "CRO"
+            rec = balances.get(key, {"symbol": "CRO", "token_addr": None, "amount": 0.0})
+            rec["amount"] += amt
+            balances[key] = rec
+            continue
+
+        if isinstance(k, str) and k.startswith("0x"):
+            addr = k.lower()
+            sym = (_token_meta.get(k, {}).get("symbol") or k[:8]).upper()
+            key = addr
+            rec = balances.get(key, {"symbol": sym, "token_addr": addr, "amount": 0.0})
+            rec["amount"] += amt
+            balances[key] = rec
         else:
-            sym=str(k).upper()
-        balances[sym]=balances.get(sym,0.0)+amt
+            # legacy symbol-only asset
+            sym = str(k).upper()
+            key = sym
+            rec = balances.get(key, {"symbol": sym, "token_addr": None, "amount": 0.0})
+            rec["amount"] += amt
+            balances[key] = rec
+
     return balances
 
 def alerts_monitor_loop():
     send_telegram(f"🛰 Alerts monitor every {ALERTS_INTERVAL_MIN}m. Wallet 24h dump/pump: {DUMP_ALERT_24H_PCT}/{PUMP_ALERT_24H_PCT}.")
     while not shutdown_event.is_set():
         try:
-            wallet_bal=get_wallet_balances_snapshot()
-            for sym,amt in list(wallet_bal.items()):
-                if amt<=EPSILON: continue
-                price,ch24,ch2h,url=get_change_and_price_for_symbol_or_addr(sym)
-                if not price or price<=0: continue
+            wallet_bal = get_wallet_balances_snapshot()
+            # iterate με πλήρη ταυτότητα (addr/symbol) — όχι μόνο symbol
+            for rec in wallet_bal.values():
+                sym = rec.get("symbol")
+                addr = rec.get("token_addr")
+                amt  = float(rec.get("amount") or 0.0)
+                if amt <= EPSILON:
+                    continue
+
+                query = addr if (isinstance(addr, str) and addr.startswith("0x")) else sym
+                price, ch24, ch2h, url = get_change_and_price_for_symbol_or_addr(query)
+                if not price or price <= 0:
+                    continue
                 if ch24 is not None:
-                    if ch24>=PUMP_ALERT_24H_PCT and _cooldown_ok(f"24h_pump:{sym}"):
+                    key_p = f"24h_pump:{query}"
+                    key_d = f"24h_dump:{query}"
+                    if ch24 >= PUMP_ALERT_24H_PCT and _cooldown_ok(key_p):
                         send_telegram(f"🚀 Pump Alert {sym} 24h {ch24:.2f}%\nPrice ${_format_price(price)}\n{url}")
-                    if ch24<=DUMP_ALERT_24H_PCT and _cooldown_ok(f"24h_dump:{sym}"):
+                    if ch24 <= DUMP_ALERT_24H_PCT and _cooldown_ok(key_d):
                         send_telegram(f"⚠️ Dump Alert {sym} 24h {ch24:.2f}%\nPrice ${_format_price(price)}\n{url}")
-            data=read_json(data_file_for_today(), default={"entries":[]})
-            seen=set()
-            for e in data.get("entries",[]):
-                if float(e.get("amount") or 0)>0:
-                    sym=(e.get("token") or "?").upper()
-                    addr=(e.get("token_addr") or "").lower()
-                    key=addr if (addr and addr.startswith("0x")) else sym
-                    if key in seen: continue
+
+            # recent buys focus
+            data = read_json(data_file_for_today(), default={"entries": []})
+            seen = set()
+            for e in data.get("entries", []):
+                if float(e.get("amount") or 0) > 0:
+                    sym = (e.get("token") or "?").upper()
+                    addr = (e.get("token_addr") or "").lower()
+                    key = addr if (addr and addr.startswith("0x")) else sym
+                    if key in seen:
+                        continue
                     seen.add(key)
-                    query=addr if (addr and addr.startswith("0x")) else sym
-                    price,ch24,ch2h,url=get_change_and_price_for_symbol_or_addr(query)
-                    if not price or price<=0: continue
+                    query = addr if (addr and addr.startswith("0x")) else sym
+                    price, ch24, ch2h, url = get_change_and_price_for_symbol_or_addr(query)
+                    if not price or price <= 0:
+                        continue
                     ch = ch2h if (ch2h is not None) else ch24
-                    if ch is None: continue
-                    if ch>=PUMP_ALERT_24H_PCT and _cooldown_ok(f"risky:pump:{key}"):
+                    if ch is None:
+                        continue
+                    if ch >= PUMP_ALERT_24H_PCT and _cooldown_ok(f"risky:pump:{key}"):
                         send_telegram(f"🚀 Pump (recent) {sym} {ch:.2f}%\nPrice ${_format_price(price)}\n{url}")
-                    if ch<=DUMP_ALERT_24H_PCT and _cooldown_ok(f"risky:dump:{key}"):
+                    if ch <= DUMP_ALERT_24H_PCT and _cooldown_ok(f"risky:dump:{key}"):
                         send_telegram(f"⚠️ Dump (recent) {sym} {ch:.2f}%\nPrice ${_format_price(price)}\n{url}")
+
         except Exception as e:
             log.exception("alerts monitor error: %s", e)
-        for _ in range(ALERTS_INTERVAL_MIN*60):
-            if shutdown_event.is_set(): break
+
+        for _ in range(ALERTS_INTERVAL_MIN * 60):
+            if shutdown_event.is_set():
+                break
             time.sleep(1)
 
 def guard_monitor_loop():
@@ -1125,6 +1271,7 @@ def _format_daily_sum_message():
     lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(tot_flow)}")
     if _nonzero(tot_unrl): lines.append(f"*Σύνολο unreal (open τώρα):* ${_format_amount(tot_unrl)}")
     return "\n".join(lines)
+  
 # ---------- Totals (today|month|all) ----------
 def _iter_ledger_files_for_scope(scope:str):
     files=[]
