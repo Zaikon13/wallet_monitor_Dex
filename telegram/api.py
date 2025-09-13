@@ -1,29 +1,41 @@
-# telegram/api.py
+import time
+import threading
+import requests
 import os
-import logging
-from utils.http import safe_get
 
-log = logging.getLogger("telegram")
+_send_lock = threading.Lock()
+_last_payload = {"chat_id": None, "text": None}
 
-TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-def send_telegram(message: str) -> bool:
-    """Αποστολή μηνύματος στο Telegram bot"""
-    try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("Telegram not configured.")
-            return False
-        url = TELEGRAM_URL.format(token=TELEGRAM_BOT_TOKEN)
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        r = safe_get(url, params=payload, timeout=12, retries=2)
-        if not r or r.status_code != 200:
-            if r:
-                log.warning("Telegram status %s: %s", r.status_code, r.text[:200])
-            return False
-        return True
-    except Exception as e:
-        log.exception("send_telegram exception: %s", e)
+def send_telegram(text: str, chat_id: str | None = None, parse_mode: str = "Markdown") -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat  = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat or not text:
         return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+
+    with _send_lock:
+        global _last_payload
+        if _last_payload == {"chat_id": chat, "text": text}:
+            return True  # dedupe identical consecutive sends
+
+        backoff = 0.5
+        for _ in range(5):
+            try:
+                r = requests.post(url, json=payload, timeout=15)
+            except Exception:
+                time.sleep(backoff); backoff = min(backoff * 2, 8); continue
+
+            if r.status_code == 200 and r.json().get("ok"):
+                _last_payload = {"chat_id": chat, "text": text}
+                return True
+            if r.status_code == 429:
+                try:
+                    ra = float(r.json().get("parameters", {}).get("retry_after", 1))
+                except Exception:
+                    ra = 1.0
+                time.sleep(max(backoff, ra))
+            else:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8)
+    return False
