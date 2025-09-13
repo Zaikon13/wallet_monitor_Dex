@@ -1305,20 +1305,36 @@ def _load_entries_for_totals(scope:str):
             entries.append({"asset":sym,"side":side,"qty":abs(amt),"usd":usd,"realized_usd":realized})
     return entries
 
-def format_totals(scope:str):
-    scope=(scope or "all").lower()
-    rows=aggregate_per_asset(_load_entries_for_totals(scope))
-    if not rows: return f"📊 Totals per Asset — {scope.capitalize()}: (no data)"
-    lines=[f"📊 Totals per Asset — {scope.capitalize()}:"]
-    for i,r in enumerate(rows,1):
+def format_totals(scope: str):
+    """
+    Εκτυπώνει totals per asset, ομαδοποιημένα ανά (asset, token_addr) για να αποφύγονται collisions.
+    Απαιτεί aggregate_per_asset(rows, by_addr=True).
+    """
+    scope = scope or "all"
+    rows = aggregate_per_asset(_load_entries_for_totals(scope), by_addr=True)
+    if not rows:
+        return f"📊 Totals per Asset — {scope.capitalize()}: (no data)"
+
+    lines = [f"📊 Totals per Asset — {scope.capitalize()}:"]
+    for i, r in enumerate(rows, 1):
+        name = r["asset"]
+        addr = r.get("token_addr")
+        if addr:
+            try:
+                short = addr[:8] + "…" + addr[-4:]
+            except Exception:
+                short = addr
+            name = f"{name} [{short}]"
         lines.append(
-            f"{i}. {r['asset']}  "
+            f"{i}. {name}  "
             f"IN: {_format_amount(r['in_qty'])} (${_format_amount(r['in_usd'])}) | "
             f"OUT: {_format_amount(r['out_qty'])} (${_format_amount(r['out_usd'])}) | "
             f"REAL: ${_format_amount(r['realized_usd'])}"
         )
-    totals_line = f"\nΣύνολο realized: ${_format_amount(sum(float(x['realized_usd']) for x in rows))}"
-    lines.append(totals_line)
+
+    tot_real = sum(float(x.get("realized_usd") or 0.0) for x in rows)
+    lines.append("")
+    lines.append(f"Σύνολο realized: ${_format_amount(tot_real)}")
     return "\n".join(lines)
 
 # ---------- Wallet monitor loop ----------
