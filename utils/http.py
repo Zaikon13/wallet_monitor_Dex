@@ -1,40 +1,31 @@
-# utils/http.py
-import time
+import threading
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+_tls = threading.local()
 
-_last_req_ts = 0.0
-REQS_PER_SEC = 5
-MIN_GAP = 1.0 / REQS_PER_SEC
+def _get_session():
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        retry = Retry(
+            total=3, connect=3, read=3, backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST")
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _tls.session = s
+    return s
 
-def safe_json(r):
-    if r is None:
-        return None
-    if not getattr(r, "ok", False):
-        return None
+def safe_get(url, params=None, timeout=15, retries=0):
+    # retries handled by session adapter; 'retries' param kept for API-compat
+    return _get_session().get(url, params=params, timeout=timeout)
+
+def safe_json(resp):
     try:
-        return r.json()
+        return resp.json()
     except Exception:
         return None
-
-def safe_get(url, params=None, timeout=12, retries=3, backoff=1.5):
-    """Rate-limited GET με retries/backoff"""
-    global _last_req_ts
-    for i in range(retries):
-        gap = time.time() - _last_req_ts
-        if gap < MIN_GAP:
-            time.sleep(MIN_GAP - gap)
-        try:
-            resp = SESSION.get(url, params=params, timeout=timeout)
-            _last_req_ts = time.time()
-            if resp.status_code == 200:
-                return resp
-            if resp.status_code in (404, 429, 502, 503):
-                time.sleep(backoff * (i + 1))
-                continue
-            return resp
-        except Exception:
-            time.sleep(backoff * (i + 1))
-    return None
