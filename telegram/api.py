@@ -1,70 +1,58 @@
 # telegram/api.py
-# -*- coding: utf-8 -*-
+import re, time, random, logging, requests, os
 
-import os
-import time
-import threading
-import requests
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID") or ""
+TG_MAX = 4096
 
-_send_lock = threading.Lock()
-_last_payload = {"chat_id": None, "text": None}
+log = logging.getLogger("telegram")
 
-def send_telegram(text: str, chat_id: str | None = None, parse_mode: str = "Markdown") -> bool:
-    """
-    Robust Telegram sender:
-      - POST (όχι GET)
-      - backoff & retry για 5xx και 429 (τιμά το retry_after)
-      - απλή απο-διπλοποίηση για ίδια διαδοχικά μηνύματα
-    """
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat  = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat or not text:
-        return False
+MDV2_ESC = r'_*[]()~`>#+-=|{}.!'
+def escape_md(text: str) -> str:
+    return ''.join('\\'+c if c in MDV2_ESC else c for c in (text or ""))
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-
-    with _send_lock:
-        global _last_payload
-        # απλή dedupe: αν είναι *ακριβώς* ίδιο με το προηγούμενο, μην το ξαναστείλεις
-        if _last_payload == {"chat_id": chat, "text": text}:
-            return True
-
-        backoff = 0.5
-        for _ in range(5):
-            try:
-                r = requests.post(url, json=payload, timeout=15)
-            except Exception:
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 8)
-                continue
-
+def _post(payload):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    backoff = 2
+    for attempt in range(6):
+        try:
+            r = requests.post(url, json=payload, timeout=20)
             if r.status_code == 200:
-                try:
-                    j = r.json()
-                except Exception:
-                    j = {}
-                if j.get("ok"):
-                    _last_payload = {"chat_id": chat, "text": text}
-                    return True
-
+                return True
             if r.status_code == 429:
-                # Floodwait: σεβάσου το retry_after
                 try:
-                    ra = float(r.json().get("parameters", {}).get("retry_after", 1))
+                    ra = r.json().get("parameters", {}).get("retry_after", 1)
                 except Exception:
-                    ra = 1.0
-                time.sleep(max(backoff, ra))
-            else:
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 8)
-
+                    ra = 1
+                time.sleep(ra + random.uniform(0, 0.5))
+                continue
+            # άλλα λάθη: σύντομο backoff
+            time.sleep(min(30, backoff + random.uniform(0, 1)))
+            backoff = min(30, backoff * 2)
+        except Exception as e:
+            log.debug("telegram post error: %s", e)
+            time.sleep(min(30, backoff + random.uniform(0, 1)))
+            backoff = min(30, backoff * 2)
     return False
 
-
-__all__ = ["send_telegram"]
+def send_telegram(text: str, parse_mode: str = "MarkdownV2"):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    # chunk >4096
+    chunks = []
+    s = text or ""
+    while s:
+        chunks.append(s[:TG_MAX])
+        s = s[TG_MAX:]
+    ok = True
+    for i, ch in enumerate(chunks, 1):
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": escape_md(ch) if parse_mode == "MarkdownV2" else ch,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        if len(chunks) > 1:
+            payload["text"] = f"{payload['text']}\n\n_{i}/{len(chunks)}_"
+        ok = _post(payload) and ok
+    return ok
