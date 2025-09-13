@@ -1,10 +1,11 @@
-# --- imports (κρατά τα, αν ήδη υπάρχουν μην τα διπλασιάσεις) ---
+# telegram/api.py
+# -*- coding: utf-8 -*-
+
+import os
 import time
 import threading
 import requests
-import os
 
-# --- module-level state for safe, idempotent sends ---
 _send_lock = threading.Lock()
 _last_payload = {"chat_id": None, "text": None}
 
@@ -25,7 +26,7 @@ def send_telegram(text: str, chat_id: str | None = None, parse_mode: str = "Mark
         "chat_id": chat,
         "text": text,
         "parse_mode": parse_mode,
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
 
     with _send_lock:
@@ -64,3 +65,6 @@ def send_telegram(text: str, chat_id: str | None = None, parse_mode: str = "Mark
                 backoff = min(backoff * 2, 8)
 
     return False
+
+
+__all__ = ["send_telegram"]
