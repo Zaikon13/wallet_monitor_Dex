@@ -1,32 +1,52 @@
-def aggregate_per_asset(rows: list[dict], by_addr: bool = False) -> list[dict]:
+# -*- coding: utf-8 -*-
+"""
+Aggregate helpers for totals per asset.
+Adds net_qty, net_usd, and tx_count to the classic IN/OUT/REALIZED fields.
+"""
+from decimal import Decimal
+
+def aggregate_per_asset(entries):
     """
-    rows: [{"asset": str, "side": "IN"/"OUT", "qty": float, "usd": float, "realized_usd": float,
-            "token_addr": Optional[str]}]
+    entries: list of {asset, side(IN/OUT), qty, usd, realized_usd}
+    Returns rows with:
+      asset, in_qty, in_usd, out_qty, out_usd, realized_usd, net_qty, net_usd, tx_count
     """
     acc = {}
-    for r in rows:
-        asset = (r.get("asset") or "?").upper()
-        addr  = r.get("token_addr") if by_addr else None
-        addr_key = (addr.lower() if isinstance(addr, str) and addr.startswith("0x") else None)
-        key   = (asset, addr_key)
-        side  = (r.get("side") or "").upper()
-
-        cur = acc.get(key, {
+    for e in entries or []:
+        asset = (e.get("asset") or "?").upper()
+        side  = (e.get("side")  or "IN").upper()
+        qty   = Decimal(str(e.get("qty") or 0))
+        usd   = Decimal(str(e.get("usd") or 0))
+        real  = Decimal(str(e.get("realized_usd") or 0))
+        cur = acc.get(asset, {
             "asset": asset,
-            "token_addr": addr_key,
-            "in_qty": 0.0, "in_usd": 0.0,
-            "out_qty": 0.0, "out_usd": 0.0,
-            "realized_usd": 0.0
+            "in_qty": Decimal("0"), "in_usd": Decimal("0"),
+            "out_qty": Decimal("0"), "out_usd": Decimal("0"),
+            "realized_usd": Decimal("0"),
+            "tx_count": 0,
         })
         if side == "IN":
-            cur["in_qty"] += float(r.get("qty") or 0.0)
-            cur["in_usd"] += float(r.get("usd") or 0.0)
-        elif side == "OUT":
-            cur["out_qty"] += float(r.get("qty") or 0.0)
-            cur["out_usd"] += float(r.get("usd") or 0.0)
-        cur["realized_usd"] += float(r.get("realized_usd") or 0.0)
-        acc[key] = cur
+            cur["in_qty"] += qty
+            cur["in_usd"] += usd
+        else:
+            cur["out_qty"] += qty
+            # preserve sign on usd for OUT if caller already uses negative — otherwise subtract
+            cur["out_usd"] += usd if usd < 0 else -usd
+        cur["realized_usd"] += real
+        cur["tx_count"] += 1
+        acc[asset] = cur
 
-    out = list(acc.values())
-    out.sort(key=lambda x: abs(x["in_usd"]) + abs(x["out_usd"]), reverse=True)
-    return out
+    rows = []
+    for a, r in acc.items():
+        net_qty = r["in_qty"] - r["out_qty"]
+        net_usd = r["in_usd"] + r["out_usd"]
+        rows.append({
+            "asset": a,
+            "in_qty": float(r["in_qty"]), "in_usd": float(r["in_usd"]),
+            "out_qty": float(r["out_qty"]), "out_usd": float(r["out_usd"]),
+            "realized_usd": float(r["realized_usd"]),
+            "net_qty": float(net_qty), "net_usd": float(net_usd),
+            "tx_count": int(r["tx_count"]),
+        })
+    rows.sort(key=lambda x: abs(x["net_usd"]) + abs(x["in_usd"]) + abs(x["out_usd"]), reverse=True)
+    return rows
