@@ -1,31 +1,69 @@
-import threading
+#utils/http.py
+# -*- coding: utf-8 -*-
+import time, random, logging
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import Optional
 
-_tls = threading.local()
+log = logging.getLogger("http")
 
+_session = None
 def _get_session():
-    s = getattr(_tls, "session", None)
-    if s is None:
-        s = requests.Session()
-        retry = Retry(
-            total=3, connect=3, read=3, backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET", "POST")
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-        s.mount("http://", adapter)
-        s.mount("https://", adapter)
-        _tls.session = s
-    return s
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({"User-Agent": "CronosDefiSentinel/1.0"})
+    return _session
 
-def safe_get(url, params=None, timeout=15, retries=0):
-    # retries handled by session adapter; 'retries' param kept for API-compat
-    return _get_session().get(url, params=params, timeout=timeout)
+# Simple circuit breaker
+_CB_FAILS = 0
+_CB_OPEN_UNTIL = 0.0
+_CB_THRESHOLD = 6
+_CB_COOLDOWN = 20.0  # seconds
+
+def _cb_open() -> bool:
+    return time.time() < _CB_OPEN_UNTIL
+
+def _cb_note_failure():
+    global _CB_FAILS, _CB_OPEN_UNTIL
+    _CB_FAILS += 1
+    if _CB_FAILS >= _CB_THRESHOLD:
+        _CB_OPEN_UNTIL = time.time() + _CB_COOLDOWN
+        log.warning("HTTP circuit breaker OPEN for %.1fs", _CB_COOLDOWN)
+
+def _cb_note_success():
+    global _CB_FAILS, _CB_OPEN_UNTIL
+    _CB_FAILS = 0
+    _CB_OPEN_UNTIL = 0.0
+
+def safe_get(url: str, params: Optional[dict]=None, timeout: int=15, retries: int=0):
+    """
+    GET with jittered exponential backoff + circuit breaker. Never raises requests exceptions.
+    """
+    if _cb_open():
+        time.sleep(0.2)
+        return None
+    sess = _get_session()
+    attempt = 0
+    delay = 0.6
+    while True:
+        try:
+            r = sess.get(url, params=params, timeout=timeout)
+            if r.status_code >= 500:
+                raise requests.RequestException(f"HTTP {r.status_code}")
+            _cb_note_success()
+            return r
+        except Exception as e:
+            log.debug("safe_get error (%s): %s", url, e)
+            _cb_note_failure()
+            if attempt >= retries:
+                return None
+            attempt += 1
+            time.sleep(delay + random.uniform(0, delay*0.2))
+            delay = min(delay * 2, 5.0)
 
 def safe_json(resp):
     try:
+        if resp is None: return None
         return resp.json()
     except Exception:
         return None
