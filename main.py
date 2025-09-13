@@ -1365,7 +1365,7 @@ def _handle_command(text: str):
                     send_telegram(f"👁 Added {escape_md(pair)}")
                 else:
                     send_telegram("Use format cronos/<pairAddress>")
-            elif rest.startswith("rm ""):
+            elif rest.startswith("rm "):
                 pair=rest.split(" ",1)[1].strip().lower()
                 with PAIR_LOCK:
                     if pair in _tracked_pairs:
