@@ -105,7 +105,6 @@ log = logging.getLogger("wallet-monitor")
 
 # ----------------- Runtime & Locks -----------------
 shutdown_event = threading.Event()
-
 # shared state + locks
 _token_balances = defaultdict(float)
 _token_meta     = {}
