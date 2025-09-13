@@ -1,8 +1,15 @@
-# reports/day_report.py
 # -*- coding: utf-8 -*-
+"""
+Day report builder
+- Timezone-safe timestamps
+- Graceful empty breakdowns
+
+build_day_report_text(date_str, entries, net_flow, realized_today_total, holdings_total, breakdown, unrealized, data_dir)
+returns Markdown string for Telegram (MarkdownV2 escaping handled by sender)
+"""
 from datetime import datetime
-import os
-import json
+from decimal import Decimal
+
 
 def _format_amount(a):
     try:
@@ -10,10 +17,11 @@ def _format_amount(a):
     except Exception:
         return str(a)
     if abs(a) >= 1:
-        return f"{a:,.4f}"
+        return f"{a:,.2f}"
     if abs(a) >= 0.0001:
         return f"{a:.6f}"
     return f"{a:.8f}"
+
 
 def _format_price(p):
     try:
@@ -28,94 +36,57 @@ def _format_price(p):
         return f"{p:.8f}"
     return f"{p:.10f}"
 
-def _nonzero(v, eps=1e-12):
+
+def _ts_of(e):
+    t = e.get("time") or ""
     try:
-        return abs(float(v)) > eps
+        # accept both naive and tz-aware ISO strings
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
     except Exception:
-        return False
+        return datetime.utcnow()  # fallback
 
-def month_prefix_from(date_str: str) -> str:
-    return date_str[:7]
 
-def sum_month_net_flows_and_realized(data_dir: str, month_prefix: str) -> tuple[float, float]:
-    total_flow = 0.0
-    total_real = 0.0
-    try:
-        for fn in os.listdir(data_dir):
-            if fn.startswith("transactions_") and fn.endswith(".json") and month_prefix in fn:
-                path = os.path.join(data_dir, fn)
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if isinstance(data, dict):
-                        total_flow += float(data.get("net_usd_flow", 0.0))
-                        total_real += float(data.get("realized_pnl", 0.0))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return total_flow, total_real
+def build_day_report_text(*, date_str, entries, net_flow, realized_today_total, holdings_total, breakdown, unrealized, data_dir):
+    sorted_entries = sorted(entries or [], key=_ts_of)
 
-def build_day_report_text(
-    *,
-    date_str: str,
-    entries: list[dict],
-    net_flow: float,
-    realized_today_total: float,
-    holdings_total: float,
-    breakdown: list[dict],
-    unrealized: float,
-    data_dir: str = "/app/data",
-) -> str:
-    lines = [f"*📒 Daily Report* ({date_str})"]
+    lines = [f"*📅 Ημέρα:* {date_str}"]
+    lines.append("")
 
-    if not entries:
-        lines.append("_No transactions today._")
-    else:
-        def _ts_of(e):
-            try:
-                return datetime.strptime(e.get("time", "")[:19], "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return datetime.now()
-        sorted_entries = sorted(entries, key=_ts_of)
-
-        lines.append("*Transactions:*")
-        MAX_TX_LINES = 60
-        cut = max(0, len(sorted_entries) - MAX_TX_LINES)
-        shown = sorted_entries[-MAX_TX_LINES:] if cut > 0 else sorted_entries
-        for e in shown:
+    if sorted_entries:
+        lines.append("*Συναλλαγές σήμερα:*")
+        for e in sorted_entries[-20:]:
             tok = e.get("token") or "?"
-            amt = float(e.get("amount") or 0)
-            usd = float(e.get("usd_value") or 0)
-            tm = (e.get("time", "")[-8:]) or ""
-            direction = "IN" if amt > 0 else "OUT"
-            unit_price = float(e.get("price_usd") or 0.0)
-            rp = float(e.get("realized_pnl", 0.0) or 0.0)
-            pnl_line = f"  PnL: ${_format_amount(rp)}" if _nonzero(rp) else ""
-            lines.append(
-                f"• {tm} — {direction} {tok} {_format_amount(amt)}  @ ${_format_price(unit_price)}  "
-                f"(${_format_amount(usd)}){pnl_line}"
-            )
-        if cut > 0:
-            lines.append(f"_…and {cut} earlier txs._")
+            amt = e.get("amount") or 0
+            px  = e.get("price_usd") or 0
+            usd = e.get("usd_value") or 0
+            rp  = e.get("realized_pnl") or 0
+            tm  = (e.get("time", "")[11:19]) or "--:--:--"
+            lines.append(f"• {tm} {tok} {amt:+.6f} @ ${_format_price(px)} → ${_format_amount(usd)} (real ${_format_amount(rp)})")
+        lines.append("")
+    else:
+        lines.append("*Συναλλαγές σήμερα:* (καμία)")
+        lines.append("")
 
-    lines.append(f"\n*Net USD flow today:* ${_format_amount(net_flow)}")
-    lines.append(f"*Realized PnL today:* ${_format_amount(realized_today_total)}")
-    lines.append(f"*Holdings (MTM) now:* ${_format_amount(holdings_total)}")
+    lines.append(f"*Net flow σήμερα:* ${_format_amount(net_flow)}")
+    lines.append(f"*Realized σήμερα:* ${_format_amount(realized_today_total)}")
+    if abs(float(unrealized or 0)) > 1e-9:
+        lines.append(f"*Unrealized τώρα:* ${_format_amount(unrealized)}")
+    lines.append("")
+
+    lines.append(f"*Holdings (MTM) τώρα:* ${_format_amount(holdings_total)}")
     if breakdown:
-        for b in breakdown[:15]:
-            tok = b.get("token", "?")
-            amt = float(b.get("amount") or 0.0)
-            pr = float(b.get("price_usd") or 0.0)
-            val = float(b.get("usd_value") or 0.0)
-            lines.append(f"  – {tok}: {_format_amount(amt)} @ ${_format_price(pr)} = ${_format_amount(val)}")
+        for b in (breakdown or [])[:15]:
+            tok = b.get("token") or "?"
+            amt = b.get("amount") or 0
+            px  = b.get("price_usd") or 0
+            val = b.get("usd_value") or 0
+            lines.append(f"• {tok}: {amt:.6f} @ ${_format_price(px)} = ${_format_amount(val)}")
         if len(breakdown) > 15:
-            lines.append(f"  …and {len(breakdown) - 15} more.")
-    if _nonzero(unrealized):
-        lines.append(f"*Unrealized PnL (open positions):* ${_format_amount(unrealized)}")
+            lines.append(f"… και άλλα {len(breakdown)-15}")
+    else:
+        lines.append("(No holdings to display)")
 
-    mp = month_prefix_from(date_str)
-    month_flow, month_real = sum_month_net_flows_and_realized(data_dir, mp)
-    lines.append(f"\n*Month Net Flow:* ${_format_amount(month_flow)}")
-    lines.append(f"*Month Realized PnL:* ${_format_amount(month_real)}")
     return "\n".join(lines)
+
+
+__all__ = ["build_day_report_text"]
