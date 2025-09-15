@@ -13,7 +13,7 @@ MIN_GAP = 1.0 / REQS_PER_SEC
 
 
 def safe_get(url, params=None, timeout=12, retries=3, backoff=1.5):
-    """HTTP GET με retry/backoff & rate-limit"""
+    """HTTP GET με retry/backoff & rate-limit."""
     global _last_req_ts
     for i in range(retries):
         gap = time.time() - _last_req_ts
