@@ -1,0 +1,68 @@
+name: Cordex Diag
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/cordex-diag.yml"
+      - "scripts/cordex_diag.py"
+      - "scripts/cordex_ping.py"
+      - "requirements.txt"
+      - "main.py"
+      - "core/**"
+      - "reports/**"
+      - "telegram/**"
+      - "utils/**"
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (best-effort)
+        run: |
+          python -V
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          pip install pipdeptree || true
+
+      - name: Run Cordex Diag
+        env:
+          TZ: ${{ secrets.TZ }}
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ETHERSCAN_API: ${{ secrets.ETHERSCAN_API }}
+          RPC_URL: ${{ secrets.RPC_URL }}
+          DEX_PAIRS: ${{ secrets.DEX_PAIRS }}
+          PRICE_MOVE_THRESHOLD: ${{ secrets.PRICE_MOVE_THRESHOLD }}
+          INTRADAY_HOURS: ${{ secrets.INTRADAY_HOURS }}
+          EOD_TIME: ${{ secrets.EOD_TIME }}
+        run: |
+          python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils
+
+      - name: Save Job Summary
+        run: |
+          echo "## Cordex Diag Summary" >> $GITHUB_STEP_SUMMARY
+          if [ -f diag_report.md ]; then
+            cat diag_report.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No diag_report.md produced._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordex-diag
+          path: |
+            diag_report.md
+            diag_report.json
+            diag_imports.log
+            diag_tree.txt
+          if-no-files-found: warn
