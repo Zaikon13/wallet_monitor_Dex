@@ -1,31 +1,36 @@
 # core/config.py
 import os
-from dotenv import load_dotenv
+from dataclasses import dataclass
 
-# Φόρτωσε .env αν υπάρχει (στο Railway αγνοείται, ok)
-load_dotenv()
-
-def _alias_env(src: str, dst: str):
-    """Αν δεν υπάρχει το dst και υπάρχει το src, κάνε αντιγραφή — χρήσιμο για Railway ονόματα."""
+# Legacy aliases → new envs
+_ALIAS = {
+    "ALERTS_INTERVAL_MINUTES": "ALERTS_INTERVAL_MIN",
+    "DISCOVER_REQUIRE_WCRO_QUOTE": "DISCOVER_REQUIRE_WCRO",
+}
+for src, dst in _ALIAS.items():
     if os.getenv(dst) is None and os.getenv(src) is not None:
         os.environ[dst] = os.getenv(src)
 
-def apply_env_aliases():
-    # minutes vs min
-    _alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
-    # WCRO quote
-    _alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
-    # ενιαίο όριο απόλυτης μεταβολής (το χρησιμοποιείς ήδη)
-    _alias_env("DISCOVER_MIN_ABS_CHANGE_PCT", "DISCOVER_MIN_ABS_CHANGE_PCT")
-    # καθάρισε πιθανά κενά στα numeric envs
-    for k in [
-        "DEX_POLL","WALLET_POLL","INTRADAY_HOURS","EOD_HOUR","EOD_MINUTE",
-        "PRICE_WINDOW","PRICE_MOVE_THRESHOLD","SPIKE_THRESHOLD",
-        "ALERTS_INTERVAL_MIN","DISCOVER_LIMIT","DISCOVER_POLL",
-        "DISCOVER_MIN_LIQ_USD","DISCOVER_MIN_VOL24_USD","DISCOVER_MAX_PAIR_AGE_HOURS",
-        "PUMP_ALERT_24H_PCT","DUMP_ALERT_24H_PCT","MIN_VOLUME_FOR_ALERT",
-        "GUARD_WINDOW_MIN","GUARD_PUMP_PCT","GUARD_DROP_PCT","GUARD_TRAIL_DROP_PCT",
-    ]:
-        v = os.getenv(k)
-        if v is not None:
-            os.environ[k] = v.strip()
+@dataclass(frozen=True)
+class Settings:
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    WALLET_ADDRESS: str = (os.getenv("WALLET_ADDRESS", "")).lower()
+    ETHERSCAN_API: str = os.getenv("ETHERSCAN_API", "")
+    CRONOS_RPC_URL: str = os.getenv("CRONOS_RPC_URL", "")
+
+    # Discovery / watch rules (χρησιμοποιούνται αργότερα)
+    PRICE_MOVE_THRESHOLD: float = float(os.getenv("PRICE_MOVE_THRESHOLD","5"))
+    ALERTS_INTERVAL_MIN: int = int(os.getenv("ALERTS_INTERVAL_MIN","15"))
+    DISCOVER_MIN_LIQ_USD: float = float(os.getenv("DISCOVER_MIN_LIQ_USD","30000"))
+    DISCOVER_MIN_VOL24_USD: float = float(os.getenv("DISCOVER_MIN_VOL24_USD","5000"))
+    DISCOVER_REQUIRE_WCRO: bool = os.getenv("DISCOVER_REQUIRE_WCRO","false").lower() in ("1","true","yes","on")
+
+    WALLET_POLL: int = int(os.getenv("WALLET_POLL","15"))
+    INTRADAY_HOURS: int = int(os.getenv("INTRADAY_HOURS","3"))
+    EOD_HOUR: int = int(os.getenv("EOD_HOUR","23"))
+    EOD_MINUTE: int = int(os.getenv("EOD_MINUTE","59"))
+
+    DATA_DIR: str = os.getenv("DATA_DIR", "/app/data")
+
+settings = Settings()
