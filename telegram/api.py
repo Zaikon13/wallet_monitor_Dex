@@ -1,77 +1,70 @@
+# telegram/api.py
+# -*- coding: utf-8 -*-
+
 import os
 import time
-import math
-import logging
+import threading
 import requests
-from typing import Iterable
 
-__all__ = ["send_telegram", "escape_md"]
+_send_lock = threading.Lock()
+_last_payload = {"chat_id": None, "text": None}
 
-log = logging.getLogger("telegram.api")
+def send_telegram(text: str, chat_id: str | None = None, parse_mode: str = "Markdown") -> bool:
+    """
+    Robust Telegram sender:
+      - POST (όχι GET)
+      - backoff & retry για 5xx και 429 (τιμά το retry_after)
+      - απλή απο-διπλοποίηση για ίδια διαδοχικά μηνύματα
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat  = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat or not text:
+        return False
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
 
-MAX_LEN = 4000  # leave room for MarkdownV2 quirks
-API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    with _send_lock:
+        global _last_payload
+        # απλή dedupe: αν είναι *ακριβώς* ίδιο με το προηγούμενο, μην το ξαναστείλεις
+        if _last_payload == {"chat_id": chat, "text": text}:
+            return True
 
-
-def escape_md(text: str) -> str:
-    """Minimal MarkdownV2 escaping."""
-    if not text:
-        return text
-    special = "_[]()~`>#+-=|{}.!"  # Telegram MarkdownV2
-    out = []
-    for ch in text:
-        if ch in special:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _chunks(s: str, size: int) -> Iterable[str]:
-    for i in range(0, len(s), size):
-        yield s[i : i + size]
-
-
-def _post(method: str, payload: dict, *, retries: int = 2):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"{API_URL}/{method}"
-    backoff = 0.7
-    for i in range(retries + 1):
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            if r.status_code == 429:
-                # respect retry-after if provided
-                try:
-                    wait = int(r.json().get("parameters", {}).get("retry_after", 2))
-                except Exception:
-                    wait = 2
-                time.sleep(wait)
+        backoff = 0.5
+        for _ in range(5):
+            try:
+                r = requests.post(url, json=payload, timeout=15)
+            except Exception:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8)
                 continue
-            if r.status_code >= 500:
-                raise RuntimeError(f"5xx {r.status_code}")
-            return
-        except Exception as e:
-            if i == retries:
-                log.warning("Telegram send failed: %s", e)
-                return
-            time.sleep(backoff * (i + 1))
+
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                except Exception:
+                    j = {}
+                if j.get("ok"):
+                    _last_payload = {"chat_id": chat, "text": text}
+                    return True
+
+            if r.status_code == 429:
+                # Floodwait: σεβάσου το retry_after
+                try:
+                    ra = float(r.json().get("parameters", {}).get("retry_after", 1))
+                except Exception:
+                    ra = 1.0
+                time.sleep(max(backoff, ra))
+            else:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8)
+
+    return False
 
 
-def send_telegram(text: str):
-    if not text:
-        return
-    for part in _chunks(text, MAX_LEN):
-        _post(
-            "sendMessage",
-            {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": part,
-                "parse_mode": "MarkdownV2",
-                "disable_web_page_preview": True,
-            },
-        )
-        time.sleep(0.05)
+__all__ = ["send_telegram"]
