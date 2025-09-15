@@ -5,7 +5,7 @@ import logging
 import requests
 from typing import Iterable
 
-__all__ = ["send_telegram", "escape_md"]
+__all__ = ["send_telegram", "escape_md", "send_watchlist_alerts"]
 
 log = logging.getLogger("telegram.api")
 
@@ -20,7 +20,7 @@ def escape_md(text: str) -> str:
     """Minimal MarkdownV2 escaping."""
     if not text:
         return text
-    special = "_[]()~`>#+-=|{}.!"  # Telegram MarkdownV2
+    special = "_[]()~`>#+-=|{}.!"
     out = []
     for ch in text:
         if ch in special:
@@ -75,3 +75,33 @@ def send_telegram(text: str):
             },
         )
         time.sleep(0.05)
+
+
+def send_watchlist_alerts(alerts: list[dict]):
+    """
+    Send formatted alerts for watchlist scanner.
+    alerts: list of dict with keys {pair, token0, token1, price, change, vol24h, liq_usd, url}
+    """
+    if not alerts:
+        return
+    lines = ["*🔍 Watchlist Alerts*"]
+    for a in alerts:
+        pair = a.get("pair") or f"{a.get('token0','?')}/{a.get('token1','?')}"
+        price = a.get("price")
+        ch = a.get("change")
+        vol = a.get("vol24h")
+        liq = a.get("liq_usd")
+        url = a.get("url", "")
+        base = f"• {pair}: "
+        if price is not None:
+            base += f"${price:.6f}"
+        if ch is not None:
+            base += f" | Δ24h {ch:+.2f}%"
+        if vol is not None:
+            base += f" | Vol24h ${vol:,.0f}"
+        if liq is not None:
+            base += f" | Liq ${liq:,.0f}"
+        if url:
+            base += f"\n{url}"
+        lines.append(base)
+    send_telegram("\n".join(lines))
