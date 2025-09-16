@@ -1,98 +1,88 @@
 # core/alerts.py
-"""
-Holdings spike/dump alerts with cooldown (persisted).
-Scans current wallet balances (symbols), looks up Dexscreener 24h/2h change,
-and sends Telegram alerts when thresholds χτυπάνε — με cooldown ανά asset.
-"""
+# Simple price-move alerts (24h pump/dump) using Dexscreener
+
 from __future__ import annotations
-import os, time, json
-from typing import Dict, Tuple, Optional
-from utils.http import safe_get, safe_json
-from core.config import settings
-from telegram.api import send_telegram
+import os
+import time
+from typing import Dict, Any, Optional
 
-DEX_BASE_SEARCH  = "https://api.dexscreener.com/latest/dex/search"
-STATE_PATH = os.path.join(settings.DATA_DIR, "alerts_state.json")
+try:
+    from utils.http import get_json  # type: ignore
+except Exception:
+    import requests
 
-def _load_state() -> dict:
+    def get_json(url: str, timeout: int = 10):
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+try:
+    from telegram.api import send_telegram  # type: ignore
+except Exception:
+    def send_telegram(text: str, **kwargs):
+        print("[TELEGRAM disabled]", text)
+        return False, 0, "disabled"
+
+# Cache για να μην spam-άρει το ίδιο alert συνέχεια
+_last_alert: Dict[str, float] = {}
+_SUPPRESS_SEC = 3600  # 1 ώρα
+
+def _now() -> float:
+    return time.time()
+
+def _should_alert(key: str) -> bool:
+    last = _last_alert.get(key, 0)
+    if _now() - last < _SUPPRESS_SEC:
+        return False
+    _last_alert[key] = _now()
+    return True
+
+def check_pair_alert(token_address: str, chain: str = "cronos") -> Optional[str]:
+    """
+    Ελέγχει Dexscreener για το token και στέλνει alert αν υπάρχει pump/dump.
+    Trigger: priceChange24h >= +20% ή <= -20%.
+    """
+    if not token_address or not token_address.startswith("0x"):
+        return None
+
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        data = get_json(url, timeout=12)
+    except Exception as e:
+        return f"Error fetching Dexscreener: {e}"
 
-def _save_state(st: dict) -> None:
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_PATH)
-
-def _best_pair_change(query: str) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[float]]:
-    """
-    Returns: (ch24, ch2h, dexscreener_url, price_usd)
-    Picks the highest-liquidity Cronos pair for the query (symbol or 0x).
-    """
-    data = safe_json(safe_get(DEX_BASE_SEARCH, params={"q": query}, timeout=12)) or {}
     pairs = data.get("pairs") or []
-    best, best_liq = None, -1.0
+    if not pairs:
+        return None
+
+    # Πάρε το πρώτο ζευγάρι που έχει priceChange24h
+    pair = None
     for p in pairs:
-        try:
-            if str(p.get("chainId","")).lower() != "cronos":  # only Cronos
-                continue
-            liq = float((p.get("liquidity") or {}).get("usd") or 0)
-            if liq > best_liq:
-                best_liq, best = liq, p
-        except:  # noqa: E722
-            continue
-    if not best:
-        return None, None, None, None
-    ch = best.get("priceChange") or {}
-    ch24 = ch.get("h24"); ch2h = ch.get("h2")
+        if "priceChange24h" in p:
+            pair = p
+            break
+    if not pair:
+        return None
+
     try:
-        ch24 = float(ch24) if ch24 is not None else None
-    except: ch24 = None  # noqa: E722
-    try:
-        ch2h = float(ch2h) if ch2h is not None else None
-    except: ch2h = None  # noqa: E722
-    url = f"https://dexscreener.com/cronos/{best.get('pairAddress')}"
-    try:
-        price = float(best.get("priceUsd") or 0)
-    except:
-        price = None
-    return ch24, ch2h, url, price
+        change = float(pair["priceChange24h"])
+    except Exception:
+        return None
 
-def scan_holdings_alerts(balances: Dict[str, float]) -> None:
-    """
-    balances: dict SYMBOL -> amount
-    - Triggers on 24h change crossing ±PRICE_MOVE_THRESHOLD (fallback to 2h if 24h missing).
-    - Respects cooldown (ALERTS_INTERVAL_MIN).
-    """
-    state = _load_state()
-    now = time.time()
-    cd_sec = max(60, settings.ALERTS_INTERVAL_MIN * 60)
+    symbol = pair.get("baseToken", {}).get("symbol", token_address[:6])
+    price_usd = pair.get("priceUsd", "?")
 
-    for sym, amt in list(balances.items()):
-        try:
-            if float(amt) <= 0: 
-                continue
-        except:
-            continue
-        ch24, ch2h, url, price = _best_pair_change(sym)
-        ch = ch24 if ch24 is not None else ch2h
-        if ch is None:
-            continue
+    if change >= 20.0:
+        key = f"{token_address}-pump"
+        if _should_alert(key):
+            msg = f"🚀 Pump alert: {symbol} +{change:.1f}% (24h) — ${price_usd}"
+            send_telegram(msg)
+            return msg
+    elif change <= -20.0:
+        key = f"{token_address}-dump"
+        if _should_alert(key):
+            msg = f"💀 Dump alert: {symbol} {change:.1f}% (24h) — ${price_usd}"
+            send_telegram(msg)
+            return msg
 
-        key = f"hold:{sym.upper()}"
-        last = float(state.get(key, 0))
-        if now - last < cd_sec:
-            continue  # cooldown
-
-        thr = float(settings.PRICE_MOVE_THRESHOLD or 5.0)
-        if abs(ch) >= thr:
-            if ch > 0:
-                send_telegram(f"🚀 Pump {sym} {ch:.2f}% — ${price or 0:.6f}\n{url or ''}".strip())
-            else:
-                send_telegram(f"⚠️ Dump {sym} {ch:.2f}% — ${price or 0:.6f}\n{url or ''}".strip())
-            state[key] = now
-
-    _save_state(state)
+    return None
