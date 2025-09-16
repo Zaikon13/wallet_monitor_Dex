@@ -1,7 +1,6 @@
 import os, json, time, logging, sys
 from telegram.formatters import format_holdings
 from core.holdings import get_wallet_snapshot
-from telegram.formatters import escape_md
 
 import requests
 
