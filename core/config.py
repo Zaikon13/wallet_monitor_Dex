@@ -1,36 +1,37 @@
 # core/config.py
+# Environment configuration + aliases
+
+from __future__ import annotations
 import os
-from dataclasses import dataclass
+from typing import Dict
 
-# Legacy aliases → new envs
-_ALIAS = {
-    "ALERTS_INTERVAL_MINUTES": "ALERTS_INTERVAL_MIN",
-    "DISCOVER_REQUIRE_WCRO_QUOTE": "DISCOVER_REQUIRE_WCRO",
+# Χάρτης aliases ώστε main.py να βρίσκει πάντα τις σωστές μεταβλητές
+ENV_ALIASES: Dict[str, str] = {
+    "BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
+    "CHAT_ID": "TELEGRAM_CHAT_ID",
+    "WALLET": "WALLET_ADDRESS",
+    "RPC": "RPC_URL",
+    "ETHERSCAN": "ETHERSCAN_API",
 }
-for src, dst in _ALIAS.items():
-    if os.getenv(dst) is None and os.getenv(src) is not None:
-        os.environ[dst] = os.getenv(src)
 
-@dataclass(frozen=True)
-class Settings:
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    WALLET_ADDRESS: str = (os.getenv("WALLET_ADDRESS", "")).lower()
-    ETHERSCAN_API: str = os.getenv("ETHERSCAN_API", "")
-    CRONOS_RPC_URL: str = os.getenv("CRONOS_RPC_URL", "")
+def apply_env_aliases() -> None:
+    """
+    Εφαρμόζει alias mapping:
+    Αν υπάρχει π.χ. BOT_TOKEN στο env αλλά όχι TELEGRAM_BOT_TOKEN,
+    θα το αντιγράψει εκεί.
+    """
+    for short, full in ENV_ALIASES.items():
+        val = os.getenv(short)
+        if val and not os.getenv(full):
+            os.environ[full] = val
 
-    # Discovery / watch rules (χρησιμοποιούνται αργότερα)
-    PRICE_MOVE_THRESHOLD: float = float(os.getenv("PRICE_MOVE_THRESHOLD","5"))
-    ALERTS_INTERVAL_MIN: int = int(os.getenv("ALERTS_INTERVAL_MIN","15"))
-    DISCOVER_MIN_LIQ_USD: float = float(os.getenv("DISCOVER_MIN_LIQ_USD","30000"))
-    DISCOVER_MIN_VOL24_USD: float = float(os.getenv("DISCOVER_MIN_VOL24_USD","5000"))
-    DISCOVER_REQUIRE_WCRO: bool = os.getenv("DISCOVER_REQUIRE_WCRO","false").lower() in ("1","true","yes","on")
+def get_env(key: str, default: str | None = None) -> str | None:
+    """Wrapper για os.getenv με fallback default."""
+    return os.getenv(key, default)
 
-    WALLET_POLL: int = int(os.getenv("WALLET_POLL","15"))
-    INTRADAY_HOURS: int = int(os.getenv("INTRADAY_HOURS","3"))
-    EOD_HOUR: int = int(os.getenv("EOD_HOUR","23"))
-    EOD_MINUTE: int = int(os.getenv("EOD_MINUTE","59"))
-
-    DATA_DIR: str = os.getenv("DATA_DIR", "/app/data")
-
-settings = Settings()
+def require_env(key: str) -> str:
+    """Όπως get_env αλλά σπάει αν λείπει η μεταβλητή."""
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return val
