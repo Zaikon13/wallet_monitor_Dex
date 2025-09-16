@@ -108,7 +108,10 @@ def intraday_loop():
 def eod_loop():
     while not _shutdown.is_set():
         now = now_dt(LOCAL_TZ)
-        hh, mm = [int(x) for x in EOD_TIME.split(":")]
+        try:
+            hh, mm = [int(x) for x in EOD_TIME.split(":")]
+        except Exception:
+            hh, mm = 23, 59
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if target <= now: target += timedelta(days=1)
         wait = (target - now).total_seconds()
