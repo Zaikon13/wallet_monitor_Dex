@@ -35,18 +35,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          set -e
-          python scripts/snapshot_wallet.py | tee snapshot.txt
-          echo "SNAP_PATH=snapshot.txt" >> $GITHUB_OUTPUT
+          set +e
+          python scripts/snapshot_wallet.py > snapshot.txt 2>&1
 
       - name: Create/Update Issue "Wallet Snapshot — latest"
+        id: issue
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
             const fs = require('fs');
             const title = 'Wallet Snapshot — latest';
-            const body = fs.existsSync('snapshot.txt') ? fs.readFileSync('snapshot.txt','utf8') : '_No snapshot.txt_';
+            let body = '_No snapshot.txt_';
+            try { body = fs.readFileSync('snapshot.txt', 'utf8'); } catch (e) {}
 
             const { owner, repo } = context.repo;
             const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open' });
@@ -60,12 +61,12 @@ jobs:
               const { data } = await github.rest.issues.create({ owner, repo, title, body });
               url = data.html_url || '';
             }
-            core.setOutput('issue_url', url);
+            return url;
 
       - name: Show Issue link
         run: |
           echo "### Wallet Snapshot Issue" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.Create_Update_Issue_Wallet_Snapshot_—_latest.outputs.issue_url }}" >> "$GITHUB_STEP_SUMMARY" || true
+          echo "${{ steps.issue.outputs.result }}" >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload artifact (optional)
         uses: actions/upload-artifact@v4
