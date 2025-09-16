@@ -1,189 +1,131 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Cordex Diag — produces repo tree, hashes, env snapshot (masked), versions,
-pip deps, and import checks, then writes:
-- diag_tree.txt
-- diag_imports.log
-- diag_report.md
-- diag_report.json
-"""
+name: Cordex Diag
 
-from __future__ import annotations
-import os, sys, json, hashlib, traceback, argparse, subprocess
-from datetime import datetime
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/cordex-diag.yml"
+      - "scripts/cordex_diag.py"
+      - "requirements.txt"
+      - "main.py"
+      - "core/**"
+      - "reports/**"
+      - "telegram/**"
+      - "utils/**"
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # commit στο repo
+      issues: write     # δημιουργία/ενημέρωση issue
 
-MASK_KEYS = {
-    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "ETHERSCAN_API",
-    "RPC_URL", "WALLET_ADDRESS"
-}
-MASK_PARTIAL = {"WALLET_ADDRESS"}  # δείχνει μόνο αρχή+τέλος
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-# ---------------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+      - name: Install deps (best-effort)
+        run: |
+          python -V
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          pip install pipdeptree || true
 
-def walk_tree(base: str) -> list[dict]:
-    out = []
-    for dirpath, dirnames, filenames in os.walk(base):
-        if any(x in dirpath for x in [".git", ".venv", "__pycache__", ".pytest_cache", ".github/artifacts"]):
-            continue
-        for fn in sorted(filenames):
-            p = os.path.join(dirpath, fn)
-            rel = os.path.relpath(p, base)
-            try:
-                size = os.path.getsize(p)
-                hsh = sha256_file(p) if size < 5_000_000 else "skipped>5MB"
-            except Exception:
-                size, hsh = -1, "err"
-            out.append({"path": rel, "size": size, "sha256": hsh})
-    return sorted(out, key=lambda d: d["path"])
+      - name: Run Cordex Diag
+        env:
+          TZ: ${{ secrets.TZ }}
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ETHERSCAN_API: ${{ secrets.ETHERSCAN_API }}
+          RPC_URL: ${{ secrets.RPC_URL }}
+          DEX_PAIRS: ${{ secrets.DEX_PAIRS }}
+          PRICE_MOVE_THRESHOLD: ${{ secrets.PRICE_MOVE_THRESHOLD }}
+          INTRADAY_HOURS: ${{ secrets.INTRADAY_HOURS }}
+          EOD_TIME: ${{ secrets.EOD_TIME }}
+        run: |
+          python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils
 
-def render_tree_txt(files: list[dict]) -> str:
-    return "\n".join(f"{f['path']}  ({f['size']} bytes)  {f['sha256']}" for f in files)
+      - name: Publish diag into repo (.cordex/latest)
+        run: |
+          set -e
+          mkdir -p .cordex/latest
+          cp diag_report.md .cordex/latest/ || true
+          cp diag_report.json .cordex/latest/ || true
+          cp diag_tree.txt .cordex/latest/ || true
+          cp diag_imports.log .cordex/latest/ || true
 
-def mask_value(k: str, v: str | None) -> str | None:
-    if v is None:
-        return None
-    if k in MASK_KEYS:
-        if k in MASK_PARTIAL and len(v) > 10:
-            return v[:6] + "…" + v[-4:]
-        return "****"
-    return v
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- .cordex/latest; then
+            git add .cordex/latest
+            git commit -m "Cordex diag: ${GITHUB_RUN_NUMBER} (${GITHUB_SHA})"
+            git push
+          fi
 
-def collect_env(mask: bool) -> dict:
-    # FIXED: τώρα είναι set.union αντί για list|set
-    keys = sorted(set(MASK_KEYS).union({"TZ","DEX_PAIRS","PRICE_MOVE_THRESHOLD","INTRADAY_HOURS","EOD_TIME"}))
-    return {k: (mask_value(k, os.getenv(k)) if mask else os.getenv(k)) for k in keys}
+      - name: Save Job Summary
+        run: |
+          echo "## Cordex Diag Summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f diag_report.md ]; then
+            cat diag_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No diag_report.md produced._" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-def run_cmd(args: list[str]) -> tuple[int, str, str]:
-    try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=90)
-        return p.returncode, p.stdout.strip(), p.stderr.strip()
-    except Exception as e:
-        return 1, "", f"{type(e).__name__}: {e}"
-
-def try_import_modules(mods: list[str]) -> list[dict]:
-    results = []
-    sys.path.insert(0, ROOT)
-    for mod in mods:
-        item = {"target": mod, "ok": False, "traceback": None}
-        try:
-            if mod.endswith(".py") and os.path.isfile(os.path.join(ROOT, mod)):
-                import importlib.util
-                spec = importlib.util.spec_from_file_location("cordex_dynamic", os.path.join(ROOT, mod))
-                m = importlib.util.module_from_spec(spec)
-                assert spec and spec.loader
-                spec.loader.exec_module(m)  # type: ignore
-            else:
-                __import__(mod)
-            item["ok"] = True
-        except Exception:
-            item["traceback"] = traceback.format_exc()
-        results.append(item)
-    return results
-
-def _write(path: str, text: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-# ---------------------------------------------------------------------
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mask-secrets", action="store_true")
-    ap.add_argument("--try-import", nargs="*", default=[])
-    args = ap.parse_args()
-
-    os.chdir(ROOT)
-    error_tb = None
-
-    try:
-        files = walk_tree(ROOT)
-        _write("diag_tree.txt", render_tree_txt(files))
-
-        env_snap = collect_env(mask=args.mask_secrets)
-
-        pyver = sys.version.replace("\n", " ")
-        _, pip_freeze, pip_err = run_cmd([sys.executable, "-m", "pip", "freeze"])
-        _, pipdeptree, pdt_err = run_cmd([sys.executable, "-m", "pipdeptree"])
-        _, git_status, _ = run_cmd(["git", "status", "--porcelain"])
-
-        imports = try_import_modules(args.try_import)
-        _write("diag_imports.log", "\n".join(
-            [f"[{it['target']}] OK={it['ok']}\n{it['traceback'] or ''}".strip() for it in imports]
-        ))
-
-        report = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "python": pyver,
-            "files_count": len(files),
-            "env": env_snap,
-            "git_dirty": bool(git_status),
-            "pip_freeze": (pip_freeze or "").splitlines(),
-            "pipdeptree": pipdeptree,
-            "imports": imports,
-            "warnings": {
-                "pipdeptree": pdt_err or None,
-                "pip_freeze": pip_err or None,
+      - name: Create or update issue "Cordex Diag - latest"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const title = 'Cordex Diag - latest';
+            let body = '_No diag_report.md produced._';
+            if (fs.existsSync('diag_report.md')) {
+              body = fs.readFileSync('diag_report.md', 'utf8');
             }
-        }
-    except Exception:
-        error_tb = traceback.format_exc()
-        report = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "python": sys.version.replace("\n"," "),
-            "files_count": 0,
-            "env": collect_env(mask=True),
-            "git_dirty": None,
-            "pip_freeze": [],
-            "pipdeptree": "",
-            "imports": [],
-            "error": "Unhandled exception in cordex_diag.py",
-        }
 
-    # Markdown summary
-    md = []
-    md.append(f"**Time (UTC):** {report['timestamp']}")
-    md.append(f"**Python:** `{report['python']}`")
-    md.append(f"**Files scanned:** {report.get('files_count', 0)}")
-    md.append(f"**Git dirty:** {('Yes' if report.get('git_dirty') else 'No') if report.get('git_dirty') is not None else 'N/A'}")
-    md.append("")
-    md.append("### Env (masked)")
-    for k, v in (report.get("env") or {}).items():
-        md.append(f"- **{k}**: `{v}`")
-    md.append("")
-    if report.get("warnings", {}).get("pipdeptree"):
-        md.append(f"> pipdeptree warning: `{report['warnings']['pipdeptree']}`")
-        md.append("")
-    if error_tb:
-        md.append("### ❌ Exception (traceback)")
-        md.append("```")
-        md.append(error_tb)
-        md.append("```")
-        md.append("")
-    if report.get("imports"):
-        md.append("### Import checks")
-        for it in report["imports"]:
-            md.append(f"- {'✅' if it['ok'] else '❌'} {it['target']}")
-        md.append("")
-    md.append("### Files (hashes) — see artifact or diag_tree.txt")
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = process.env.GITHUB_REF_NAME || context.ref?.replace('refs/heads/','') || 'main';
+            const baseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/.cordex/latest`;
 
-    _write("diag_report.md", "\n".join(md))
-    with open("diag_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+            const appendix = `
+---
+**Raw files**
+- [diag_report.md](${baseUrl}/diag_report.md)
+- [diag_report.json](${baseUrl}/diag_report.json)
+- [diag_tree.txt](${baseUrl}/diag_tree.txt)
+- [diag_imports.log](${baseUrl}/diag_imports.log)
+`;
 
-    # πάντα επιτυχές exit για να μην κόβει το workflow
-    sys.exit(0)
+            const fullBody = body + appendix;
 
-# ---------------------------------------------------------------------
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open'
+            });
 
-if __name__ == "__main__":
-    main()
+            const existing = issues.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body: fullBody
+              });
+            } else {
+              await github.rest.issues.create({
+                owner, repo, title, body: fullBody
+              });
+            }
+
+      - name: Upload artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordex-diag
+          path: |
+            diag_report.md
+            diag_report.json
+            diag_imports.log
+            diag_tree.txt
+          if-no-files-found: warn
