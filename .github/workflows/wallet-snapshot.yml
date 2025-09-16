@@ -1,0 +1,75 @@
+name: Wallet Snapshot (on demand)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (requests only)
+        run: |
+          python -V
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run snapshot
+        id: run_snap
+        env:
+          TZ: ${{ secrets.TZ }}
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          RPC_URL: ${{ secrets.RPC_URL }}
+          CRONOS_RPC_URL: ${{ secrets.CRONOS_RPC_URL }}
+          DEX_PAIRS: ${{ secrets.DEX_PAIRS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -e
+          python scripts/snapshot_wallet.py | tee snapshot.txt
+          echo "SNAP_PATH=snapshot.txt" >> $GITHUB_OUTPUT
+
+      - name: Create/Update Issue "Wallet Snapshot — latest"
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            const title = 'Wallet Snapshot — latest';
+            const body = fs.existsSync('snapshot.txt') ? fs.readFileSync('snapshot.txt','utf8') : '_No snapshot.txt_';
+
+            const { owner, repo } = context.repo;
+            const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open' });
+            const existing = issues.find(i => i.title === title);
+
+            let url = '';
+            if (existing) {
+              const { data } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+              url = data.html_url || '';
+            } else {
+              const { data } = await github.rest.issues.create({ owner, repo, title, body });
+              url = data.html_url || '';
+            }
+            core.setOutput('issue_url', url);
+
+      - name: Show Issue link
+        run: |
+          echo "### Wallet Snapshot Issue" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.Create_Update_Issue_Wallet_Snapshot_—_latest.outputs.issue_url }}" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-snapshot
+          path: snapshot.txt
+          if-no-files-found: warn
