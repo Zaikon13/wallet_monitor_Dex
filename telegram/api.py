@@ -1,85 +1,74 @@
 # telegram/api.py
-import os, time, logging, requests
-from typing import Iterable
+# Simple Telegram sender with safe MarkdownV2 escaping (or plain text)
+from __future__ import annotations
+import os
+import json
+from typing import Optional
 
-__all__ = ["send_telegram", "escape_md", "send_watchlist_alerts"]
+try:
+    from utils.http import post_json as _post_json  # type: ignore
+except Exception:
+    import requests
 
-log = logging.getLogger("telegram.api")
+    def _post_json(url: str, payload: dict, timeout: int = 10):
+        r = requests.post(url, json=payload, timeout=timeout)
+        return r.status_code, r.text
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-MAX_LEN = 4000
+MDV2_RESERVED = r'_\*\[\]\(\)~`>#+\-=|{}.!'
 
+def escape_markdown_v2(text: str) -> str:
+    if text is None:
+        return ""
+    # Πρώτα escape backslash
+    text = text.replace("\\", "\\\\")
+    # Μετά escape όλα τα ειδικά
+    for ch in MDV2_RESERVED:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
-def escape_md(text: str) -> str:
-    """Minimal MarkdownV2 escaping"""
-    special = "_[]()~`>#+-=|{}.!"
-    out = []
-    for ch in text or "":
-        out.append("\\" + ch if ch in special else ch)
-    return "".join(out)
+def send_telegram(
+    text: str,
+    parse_mode: Optional[str] = None,
+    disable_web_page_preview: bool = True,
+    chat_id: Optional[str] = None,
+    token: Optional[str] = None,
+) -> tuple[bool, int, str]:
+    """
+    Στέλνει μήνυμα στο Telegram.
+    - By default ΧΩΡΙΣ parse_mode (σκέτο text) για να μη σκάει.
+    - Αν θες MarkdownV2, δώσε parse_mode='MarkdownV2' και θα γίνει escape αυτόματα.
+    Διαβάζει TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID από το περιβάλλον αν δεν δοθούν.
+    """
+    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False, 0, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
 
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-def _chunks(s: str, size: int) -> Iterable[str]:
-    for i in range(0, len(s), size):
-        yield s[i : i + size]
+    payload = {
+        "chat_id": str(chat_id),
+        "disable_web_page_preview": disable_web_page_preview,
+    }
 
+    if parse_mode and parse_mode.upper() == "MARKDOWNV2":
+        payload["parse_mode"] = "MarkdownV2"
+        payload["text"] = escape_markdown_v2(text or "")
+    elif parse_mode and parse_mode.upper() in ("MARKDOWN", "HTML"):
+        # Δεν προτείνεται, αλλά το υποστηρίζουμε
+        payload["parse_mode"] = parse_mode
+        payload["text"] = text or ""
+    else:
+        # Plain text (ασφαλές)
+        payload["text"] = text or ""
 
-def _post(method: str, payload: dict, retries: int = 2):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"{API_URL}/{method}"
-    for i in range(retries + 1):
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            if r.status_code == 429:
-                wait = int(r.json().get("parameters", {}).get("retry_after", 2))
-                time.sleep(wait)
-                continue
-            if r.status_code >= 500:
-                raise RuntimeError(f"5xx {r.status_code}")
-            return
-        except Exception as e:
-            if i == retries:
-                log.warning("Telegram send failed: %s", e)
-                return
-            time.sleep(1.5 * (i + 1))
+    try:
+        status, resp = _post_json(url, payload, timeout=12)
+        ok = (200 <= status < 300)
+        return ok, status, resp
+    except Exception as e:
+        return False, 0, f"Exception: {e}"
 
-
-def send_telegram(text: str):
-    if not text:
-        return
-    for part in _chunks(text, MAX_LEN):
-        _post(
-            "sendMessage",
-            {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": part,
-                "parse_mode": "MarkdownV2",
-                "disable_web_page_preview": True,
-            },
-        )
-        time.sleep(0.05)
-
-
-def send_watchlist_alerts(alerts: list[dict]):
-    """Alerts από watchlist scanner"""
-    if not alerts:
-        return
-    lines = ["*🔍 Watchlist Alerts*"]
-    for a in alerts:
-        pair = a.get("pair") or f"{a.get('token0','?')}/{a.get('token1','?')}"
-        base = f"• {pair}"
-        if a.get("price") is not None:
-            base += f" @ ${a['price']:.6f}"
-        if a.get("change") is not None:
-            base += f" | Δ24h {a['change']:+.2f}%"
-        if a.get("vol24h") is not None:
-            base += f" | Vol24h ${a['vol24h']:,.0f}"
-        if a.get("liq_usd") is not None:
-            base += f" | Liq ${a['liq_usd']:,.0f}"
-        if a.get("url"):
-            base += f"\n{a['url']}"
-        lines.append(base)
-    send_telegram("\n".join(lines))
+def send_telegram_lines(lines: list[str], **kwargs) -> tuple[bool, int, str]:
+    text = "\n".join(lines or [])
+    return send_telegram(text, **kwargs)
