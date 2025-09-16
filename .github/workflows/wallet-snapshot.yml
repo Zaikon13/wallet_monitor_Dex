@@ -1,4 +1,4 @@
-name: Wallet Snapshot (on demand)
+name: Wallet Snapshot (on demand, SAFE)
 
 on:
   workflow_dispatch:
@@ -24,8 +24,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run snapshot
+      - name: Run snapshot (never fail)
         id: run_snap
+        continue-on-error: true
         env:
           TZ: ${{ secrets.TZ }}
           WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
@@ -36,7 +37,25 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set +e
-          python scripts/snapshot_wallet.py > snapshot.txt 2>&1
+          python scripts/snapshot_wallet.py > snapshot.txt 2>&1 || true
+          # Αν δεν γράφτηκε τίποτα, βάλε χρήσιμα debug
+          if [ ! -s snapshot.txt ]; then
+            {
+              echo "No snapshot output produced."
+              echo
+              echo "### Debug"
+              echo "- CWD: $(pwd)"
+              echo "- Python:"; python -V
+              echo "- Files:"; ls -la
+              echo
+              echo "- Env presence:"
+              echo "WALLET_ADDRESS: $([ -n "$WALLET_ADDRESS" ] && echo SET || echo MISSING)"
+              echo "RPC_URL/CRONOS_RPC_URL: $([ -n "$RPC_URL$CRONOS_RPC_URL" ] && echo SET || echo MISSING)"
+              echo "DEX_PAIRS: $([ -n "$DEX_PAIRS" ] && echo SET || echo EMPTY)"
+              echo "TELEGRAM_BOT_TOKEN: $([ -n "$TELEGRAM_BOT_TOKEN" ] && echo SET || echo MISSING)"
+              echo "TELEGRAM_CHAT_ID: $([ -n "$TELEGRAM_CHAT_ID" ] && echo SET || echo MISSING)"
+            } > snapshot.txt
+          fi
 
       - name: Create/Update Issue "Wallet Snapshot — latest"
         id: issue
@@ -47,12 +66,10 @@ jobs:
             const fs = require('fs');
             const title = 'Wallet Snapshot — latest';
             let body = '_No snapshot.txt_';
-            try { body = fs.readFileSync('snapshot.txt', 'utf8'); } catch (e) {}
-
+            try { body = fs.readFileSync('snapshot.txt', 'utf8'); } catch {}
             const { owner, repo } = context.repo;
             const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open' });
             const existing = issues.find(i => i.title === title);
-
             let url = '';
             if (existing) {
               const { data } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
