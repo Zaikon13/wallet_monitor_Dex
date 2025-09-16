@@ -1,4 +1,4 @@
-name: Cordex Diag (Ultra-lite + Debug v2)
+name: Cordex Diag (Ultra-lite + Debug SAFE)
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
         run: |
           set +e
           python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils || true
-          # Αν δεν φτιάχτηκαν, γράψε placeholders + λίγα debug
+          # placeholders + μικρό debug αν δεν παραχθεί report
           if [ ! -f diag_report.md ]; then
             {
               echo "_No diag_report.md produced._"
@@ -68,26 +68,25 @@ jobs:
           result-encoding: string
           script: |
             const fs = require('fs');
-            const title = 'Cordex Diag — latest';
-            const readOr = (f, alt) => fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : alt;
 
+            function readOr(p, alt) {
+              try { return fs.readFileSync(p, 'utf8'); } catch { return alt; }
+            }
+            function tail(txt, n) {
+              const lines = (txt || '').split('\n');
+              return lines.slice(Math.max(0, lines.length - n)).join('\n');
+            }
+
+            const title = 'Cordex Diag — latest';
             const md   = readOr('diag_report.md',   '_No diag_report.md produced._');
             const tree = readOr('diag_tree.txt',    '_No diag_tree.txt produced._');
             const imps = readOr('diag_imports.log', '_No diag_imports.log produced._');
 
-            const body = `${md}
-
----
-### diag_tree.txt (tail)
-\`\`\`
-${tree.split('\n').slice(-40).join('\n')}
-\`\`\`
-
-### diag_imports.log
-\`\`\`
-${imps}
-\`\`\`
-`;
+            // ΧΩΡΙΣ template literals (backticks) για να μην σκάει από περιεχόμενο με `${` ή backticks
+            const body =
+              md +
+              '\n\n---\n### diag_tree.txt (tail)\n```\n' + tail(tree, 40) + '\n```\n' +
+              '\n### diag_imports.log\n```\n' + imps + '\n```\n';
 
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
@@ -95,15 +94,19 @@ ${imps}
             const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open' });
             const existing = issues.find(i => i.title === title);
 
-            let url;
+            let url = '';
             if (existing) {
-              const { data } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
-              url = data.html_url;
+              const { data } = await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body
+              });
+              url = data.html_url || '';
             } else {
-              const { data } = await github.rest.issues.create({ owner, repo, title, body });
-              url = data.html_url;
+              const { data } = await github.rest.issues.create({
+                owner, repo, title, body
+              });
+              url = data.html_url || '';
             }
-            return url || '';
+            return url;
 
       - name: Show Issue link
         if: always()
