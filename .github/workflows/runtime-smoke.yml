@@ -1,0 +1,43 @@
+name: Runtime Smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (best-effort)
+        run: |
+          python -V
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          # αν δεν υπάρχει στο requirements
+          pip install requests || true
+
+      - name: Run main.py --once
+        env:
+          TZ: ${{ secrets.TZ }}
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEX_PAIRS: ${{ secrets.DEX_PAIRS }}
+          INTRADAY_HOURS: "3"
+          EOD_TIME: "23:59"
+        run: |
+          set -e
+          python main.py --once | tee runtime_output.txt
+
+      - name: Job Summary
+        run: |
+          echo "## main.py --once output" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat runtime_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
