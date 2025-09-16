@@ -1,78 +1,93 @@
-# -*- coding: utf-8 -*-
-import requests, time, math, logging
+import os, json, time, logging, sys
+from telegram.formatters import format_holdings
+from core.holdings import get_wallet_snapshot
+from telegram.formatters import escape_md
 
-from os import getenv
+import requests
 
-BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN") or ""
-CHAT_ID   = getenv("TELEGRAM_CHAT_ID") or ""
-API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-MAX_LEN   = 4096
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 
-log = logging.getLogger("telegram")
+OFFSET_PATH = "/app/data/telegram_offset.json"
 
-_MD_CHARS = r'_\*\[\]\(\)~`>#+-=|{}.!'
+def send_telegram(msg: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logging.warning("Telegram send failed %s: %s", r.status_code, r.text)
+    except Exception as e:
+        logging.warning("Telegram send error: %s", e)
 
-def escape_md(s: str) -> str:
-    if not s: return s
-    out=[]
-    for ch in s:
-        if ch in _MD_CHARS:
-            out.append("\\"+ch)
-        else:
-            out.append(ch)
-    return "".join(out)
+def _load_offset():
+    try:
+        with open(OFFSET_PATH, "r") as f:
+            data = json.load(f)
+            return data.get("offset")
+    except:
+        return None
 
-def _post(text: str, parse_mode="MarkdownV2"):
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-    backoff = 1.0
-    for attempt in range(5):
+def _save_offset(offset):
+    try:
+        os.makedirs(os.path.dirname(OFFSET_PATH), exist_ok=True)
+        with open(OFFSET_PATH, "w") as f:
+            json.dump({"offset": offset}, f)
+    except Exception as e:
+        logging.warning("Failed to save offset: %s", e)
+
+def _tg_api(method: str, **params):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+        r = requests.get(url, params=params, timeout=50)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logging.debug("tg api error %s: %s", method, e)
+    return None
+
+def _handle_command(text: str):
+    cmd = (text or "").strip().lower()
+    if cmd.startswith("/status"):
+        send_telegram("✅ Running. Wallet monitor, Dex monitor, Alerts & Guard active.")
+    elif cmd.startswith("/diag"):
+        send_telegram("🔧 Diagnostics available.")
+    elif cmd.startswith("/rescan"):
+        send_telegram("🔄 Rescan triggered.")
+    elif cmd in ["/holdings", "/show_wallet_assets", "/showwalletassets", "/showassets", "/show"]:
         try:
-            r = requests.post(API_URL, json=payload, timeout=20)
-            if r.status_code == 429:
-                try:
-                    retry_after = int(r.json().get("parameters", {}).get("retry_after", 1))
-                except Exception:
-                    retry_after = 1
-                time.sleep(retry_after + 0.2)
-                continue
-            if r.status_code >= 400:
-                log.warning("Telegram send failed %s: %s", r.status_code, r.text[:200])
-            return
+            snapshot = get_wallet_snapshot(WALLET_ADDRESS)
+            msg = format_holdings(snapshot)
+            send_telegram(msg)
         except Exception as e:
-            log.debug("Telegram error: %s", e)
-            time.sleep(backoff)
-            backoff = min(backoff*2, 8.0)
+            send_telegram(f"❌ Error fetching holdings:\n`{e}`")
+    else:
+        send_telegram("❓ Unknown command")
 
-def send_telegram(text: str):
-    """
-    Escapes MarkdownV2 and chunks messages > 4096 chars.
-    """
-    if not BOT_TOKEN or not CHAT_ID or not text:
-        return
-    esc = escape_md(text)
-    # chunk by MAX_LEN
-    if len(esc) <= MAX_LEN:
-        _post(esc)
-        return
-    # split at line boundaries where possible
-    start=0
-    idx=0
-    while start < len(esc):
-        end = min(len(esc), start + MAX_LEN)
-        # try break at last newline
-        nl = esc.rfind("\n", start, end)
-        if nl == -1 or nl <= start + 100:
-            nl = end
-        part = esc[start:nl]
-        idx += 1
-        header = f"_part {idx}_\n" if idx>1 else ""
-        _post(header + part)
-        start = nl
-
-# exported for other modules
-__all__ = ["send_telegram", "escape_md"]
+def telegram_long_poll_loop():
+    offset = _load_offset()
+    send_telegram("🤖 Telegram command handler online.")
+    while True:
+        resp = _tg_api("getUpdates", timeout=50, offset=offset, allowed_updates=json.dumps(["message"]))
+        if not resp or not resp.get("ok"):
+            time.sleep(1)
+            continue
+        for upd in resp.get("result", []):
+            offset = upd["update_id"] + 1
+            _save_offset(offset)
+            msg = upd.get("message") or {}
+            chat_id = str(((msg.get("chat") or {}).get("id") or ""))
+            if CHAT_ID and CHAT_ID != chat_id:
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            _handle_command(text)
