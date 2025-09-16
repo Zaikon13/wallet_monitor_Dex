@@ -1,7 +1,6 @@
 import os, json, time, logging, sys
-from telegram.formatters import format_holdings
+from telegram.formatters import escape_md, format_holdings
 from core.holdings import get_wallet_snapshot
-
 import requests
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -67,13 +66,14 @@ def _handle_command(text: str):
             msg = format_holdings(snapshot)
             send_telegram(msg)
         except Exception as e:
-            send_telegram(f"❌ Error fetching holdings:\n`{e}`")
+            send_telegram(f"❌ Error fetching holdings:\\n`{escape_md(str(e))}`")
     else:
         send_telegram("❓ Unknown command")
 
 def telegram_long_poll_loop():
     offset = _load_offset()
     send_telegram("🤖 Telegram command handler online.")
+    backoff = 1.0
     while True:
         resp = _tg_api("getUpdates", timeout=50, offset=offset, allowed_updates=json.dumps(["message"]))
         if not resp or not resp.get("ok"):
