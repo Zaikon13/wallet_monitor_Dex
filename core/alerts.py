@@ -1,55 +1,88 @@
-import os, logging, time
-from decimal import Decimal
-from utils.http import safe_json
-from telegram.api import send_telegram
+# core/alerts.py
+# Simple price-move alerts (24h pump/dump) using Dexscreener
 
-DEXSCREENER_API = os.getenv("DEXSCREENER_API", "https://api.dexscreener.com/latest/dex/pairs/cronos")
-PRICE_MOVE_THRESHOLD = float(os.getenv("PRICE_MOVE_THRESHOLD", "10"))
+from __future__ import annotations
+import os
+import time
+from typing import Dict, Any, Optional
 
-_watchlist = set((os.getenv("DEX_PAIRS") or "").split(","))
-_guard_prices = {}
+try:
+    from utils.http import get_json  # type: ignore
+except Exception:
+    import requests
 
-def _get_dex_data():
-    data = safe_json(DEXSCREENER_API)
-    return (data or {}).get("pairs", [])
+    def get_json(url: str, timeout: int = 10):
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
 
-def _check_pump_dump(pair):
-    if not pair: return None
-    change = float(pair.get("priceChange", 0))
-    if abs(change) >= PRICE_MOVE_THRESHOLD:
-        return f"⚠️ {'Pump' if change > 0 else 'Dump'} {pair.get('pairAddress')[:8].upper()} {change:+.2f}% — ${pair.get('priceUsd')[:10]}\n{pair.get('url')}"
-    return None
+try:
+    from telegram.api import send_telegram  # type: ignore
+except Exception:
+    def send_telegram(text: str, **kwargs):
+        print("[TELEGRAM disabled]", text)
+        return False, 0, "disabled"
 
-def _check_guard(pair):
-    if not pair: return None
-    addr = pair.get("pairAddress")
-    if addr not in _watchlist:
+# Cache για να μην spam-άρει το ίδιο alert συνέχεια
+_last_alert: Dict[str, float] = {}
+_SUPPRESS_SEC = 3600  # 1 ώρα
+
+def _now() -> float:
+    return time.time()
+
+def _should_alert(key: str) -> bool:
+    last = _last_alert.get(key, 0)
+    if _now() - last < _SUPPRESS_SEC:
+        return False
+    _last_alert[key] = _now()
+    return True
+
+def check_pair_alert(token_address: str, chain: str = "cronos") -> Optional[str]:
+    """
+    Ελέγχει Dexscreener για το token και στέλνει alert αν υπάρχει pump/dump.
+    Trigger: priceChange24h >= +20% ή <= -20%.
+    """
+    if not token_address or not token_address.startswith("0x"):
         return None
-    current_price = Decimal(pair.get("priceUsd", "0"))
-    if current_price <= 0:
+
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+    try:
+        data = get_json(url, timeout=12)
+    except Exception as e:
+        return f"Error fetching Dexscreener: {e}"
+
+    pairs = data.get("pairs") or []
+    if not pairs:
         return None
-    last_price = _guard_prices.get(addr)
-    if last_price:
-        change = ((current_price - last_price) / last_price) * 100
-        if abs(change) >= PRICE_MOVE_THRESHOLD:
-            msg = f"⚠️ {'Pump' if change > 0 else 'Dump'} {addr[:8].upper()} {change:+.2f}% — ${current_price:.6f}\n{pair.get('url')}"
-            _guard_prices[addr] = current_price
+
+    # Πάρε το πρώτο ζευγάρι που έχει priceChange24h
+    pair = None
+    for p in pairs:
+        if "priceChange24h" in p:
+            pair = p
+            break
+    if not pair:
+        return None
+
+    try:
+        change = float(pair["priceChange24h"])
+    except Exception:
+        return None
+
+    symbol = pair.get("baseToken", {}).get("symbol", token_address[:6])
+    price_usd = pair.get("priceUsd", "?")
+
+    if change >= 20.0:
+        key = f"{token_address}-pump"
+        if _should_alert(key):
+            msg = f"🚀 Pump alert: {symbol} +{change:.1f}% (24h) — ${price_usd}"
+            send_telegram(msg)
             return msg
-    _guard_prices[addr] = current_price
-    return None
+    elif change <= -20.0:
+        key = f"{token_address}-dump"
+        if _should_alert(key):
+            msg = f"💀 Dump alert: {symbol} {change:.1f}% (24h) — ${price_usd}"
+            send_telegram(msg)
+            return msg
 
-def alert_loop():
-    logging.info("Starting alerts loop...")
-    while True:
-        try:
-            pairs = _get_dex_data()
-            if not pairs:
-                time.sleep(30)
-                continue
-            for p in pairs:
-                alert_msg = _check_pump_dump(p) or _check_guard(p)
-                if alert_msg:
-                    send_telegram(alert_msg)
-        except Exception as e:
-            logging.warning("Alert loop error: %s", e)
-        time.sleep(60)
+    return None
