@@ -33,3 +33,7 @@ def parse_ts(s: str, tz: ZoneInfo | None = None) -> datetime:
     If parsing fails, returns now_local().
     """
     try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=(tz or _tz()))
+    except Exception:
+        return now_local()
