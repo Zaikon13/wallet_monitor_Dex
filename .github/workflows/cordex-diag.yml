@@ -1,4 +1,4 @@
-name: Cordex Diag (Ultra-lite)
+name: Cordex Diag (Ultra-lite + Debug)
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           pip install pipdeptree || true
 
-      - name: Run Cordex Diag
+      - name: Run Cordex Diag (never fail)
         continue-on-error: true
         env:
           TZ: ${{ secrets.TZ }}
@@ -38,40 +38,81 @@ jobs:
           INTRADAY_HOURS: ${{ secrets.INTRADAY_HOURS }}
           EOD_TIME: ${{ secrets.EOD_TIME }}
         run: |
+          set +e
           python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils || true
-          [ -f diag_report.md ]   || echo "_No diag_report.md produced._" > diag_report.md
+          # Αν δεν φτιάχτηκε, φτιάξε placeholder με timestamp + μικρό debug
+          if [ ! -f diag_report.md ]; then
+            echo "_No diag_report.md produced._" > diag_report.md
+            echo "" >> diag_report.md
+            echo "### Debug" >> diag_report.md
+            echo "- Runner CWD: $(pwd)" >> diag_report.md
+            echo "- Files in CWD:" >> diag_report.md
+            ls -la >> diag_report.md
+            echo "" >> diag_report.md
+            echo "- Python:" >> diag_report.md
+            python -V >> diag_report.md
+            echo "" >> diag_report.md
+            echo "- Exists scripts/cordex_diag.py ? $( [ -f scripts/cordex_diag.py ] && echo YES || echo NO )" >> diag_report.md
+          fi
+          # Γράψε έστω άδεια για τα υπόλοιπα αν λείπουν
+          [ -f diag_report.json ]  || echo '{}' > diag_report.json
+          [ -f diag_tree.txt ]     || echo "_No diag_tree.txt produced._" > diag_tree.txt
+          [ -f diag_imports.log ]  || echo "_No diag_imports.log produced._" > diag_imports.log
 
       - name: Create/Update Issue "Cordex Diag — latest"
         uses: actions/github-script@v7
         with:
+          result-encoding: string
           script: |
             const fs = require('fs');
             const title = 'Cordex Diag — latest';
-            let body = '_No diag_report.md produced._';
-            if (fs.existsSync('diag_report.md')) {
-              body = fs.readFileSync('diag_report.md', 'utf8');
+            function readOr(f, alt) {
+              return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : alt;
             }
+            const md   = readOr('diag_report.md',   '_No diag_report.md produced._');
+            const tree = readOr('diag_tree.txt',    '_No diag_tree.txt produced._');
+            const imps = readOr('diag_imports.log', '_No diag_imports.log produced._');
+
+            const body = `${md}
+
+---
+### diag_tree.txt (tail)
+\`\`\`
+${tree.split('\n').slice(-40).join('\n')}
+\`\`\`
+
+### diag_imports.log
+\`\`\`
+${imps}
+\`\`\`
+`;
+
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
             const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open'
+              owner, repo, state: 'open'
             });
             const existing = issues.find(i => i.title === title);
+
+            let url;
             if (existing) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.number,
-                body
+              const { data } = await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body
               });
+              url = data.html_url;
             } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body
+              const { data } = await github.rest.issues.create({
+                owner, repo, title, body
               });
+              url = data.html_url;
             }
+            return url;
+
+      - name: Show Issue link
+        run: |
+          echo "### Cordex Diag Issue" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.Create_Or_Update_Issue_Cordex_Diag_—_latest.outputs.result }}" >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload artifact (optional)
         if: always()
