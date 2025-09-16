@@ -1,4 +1,4 @@
-name: Cordex Diag (Ultra-lite + Debug)
+name: Cordex Diag (Ultra-lite + Debug v2)
 
 on:
   workflow_dispatch:
@@ -40,35 +40,37 @@ jobs:
         run: |
           set +e
           python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils || true
-          # Αν δεν φτιάχτηκε, φτιάξε placeholder με timestamp + μικρό debug
+          # Αν δεν φτιάχτηκαν, γράψε placeholders + λίγα debug
           if [ ! -f diag_report.md ]; then
-            echo "_No diag_report.md produced._" > diag_report.md
-            echo "" >> diag_report.md
-            echo "### Debug" >> diag_report.md
-            echo "- Runner CWD: $(pwd)" >> diag_report.md
-            echo "- Files in CWD:" >> diag_report.md
-            ls -la >> diag_report.md
-            echo "" >> diag_report.md
-            echo "- Python:" >> diag_report.md
-            python -V >> diag_report.md
-            echo "" >> diag_report.md
-            echo "- Exists scripts/cordex_diag.py ? $( [ -f scripts/cordex_diag.py ] && echo YES || echo NO )" >> diag_report.md
+            {
+              echo "_No diag_report.md produced._"
+              echo
+              echo "### Debug"
+              echo "- CWD: $(pwd)"
+              echo "- Files in CWD:"
+              ls -la
+              echo
+              echo "- Python:"
+              python -V
+              echo
+              echo "- scripts/cordex_diag.py exists? $([ -f scripts/cordex_diag.py ] && echo YES || echo NO)"
+            } > diag_report.md
           fi
-          # Γράψε έστω άδεια για τα υπόλοιπα αν λείπουν
-          [ -f diag_report.json ]  || echo '{}' > diag_report.json
-          [ -f diag_tree.txt ]     || echo "_No diag_tree.txt produced._" > diag_tree.txt
-          [ -f diag_imports.log ]  || echo "_No diag_imports.log produced._" > diag_imports.log
+          [ -f diag_report.json ] || echo '{}' > diag_report.json
+          [ -f diag_tree.txt ]    || echo "_No diag_tree.txt produced._" > diag_tree.txt
+          [ -f diag_imports.log ] || echo "_No diag_imports.log produced._" > diag_imports.log
 
       - name: Create/Update Issue "Cordex Diag — latest"
+        id: issue
+        if: always()
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
             const fs = require('fs');
             const title = 'Cordex Diag — latest';
-            function readOr(f, alt) {
-              return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : alt;
-            }
+            const readOr = (f, alt) => fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : alt;
+
             const md   = readOr('diag_report.md',   '_No diag_report.md produced._');
             const tree = readOr('diag_tree.txt',    '_No diag_tree.txt produced._');
             const imps = readOr('diag_imports.log', '_No diag_imports.log produced._');
@@ -90,29 +92,24 @@ ${imps}
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open'
-            });
+            const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open' });
             const existing = issues.find(i => i.title === title);
 
             let url;
             if (existing) {
-              const { data } = await github.rest.issues.update({
-                owner, repo, issue_number: existing.number, body
-              });
+              const { data } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
               url = data.html_url;
             } else {
-              const { data } = await github.rest.issues.create({
-                owner, repo, title, body
-              });
+              const { data } = await github.rest.issues.create({ owner, repo, title, body });
               url = data.html_url;
             }
-            return url;
+            return url || '';
 
       - name: Show Issue link
+        if: always()
         run: |
           echo "### Cordex Diag Issue" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.Create_Or_Update_Issue_Cordex_Diag_—_latest.outputs.result }}" >> "$GITHUB_STEP_SUMMARY" || true
+          echo "${{ steps.issue.outputs.result }}" >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload artifact (optional)
         if: always()
