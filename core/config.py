@@ -1,31 +1,37 @@
 # core/config.py
+# Environment configuration + aliases
+
+from __future__ import annotations
 import os
-from dotenv import load_dotenv
+from typing import Dict
 
-# Φόρτωσε .env αν υπάρχει (στο Railway αγνοείται, ok)
-load_dotenv()
+# Χάρτης aliases ώστε main.py να βρίσκει πάντα τις σωστές μεταβλητές
+ENV_ALIASES: Dict[str, str] = {
+    "BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
+    "CHAT_ID": "TELEGRAM_CHAT_ID",
+    "WALLET": "WALLET_ADDRESS",
+    "RPC": "RPC_URL",
+    "ETHERSCAN": "ETHERSCAN_API",
+}
 
-def _alias_env(src: str, dst: str):
-    """Αν δεν υπάρχει το dst και υπάρχει το src, κάνε αντιγραφή — χρήσιμο για Railway ονόματα."""
-    if os.getenv(dst) is None and os.getenv(src) is not None:
-        os.environ[dst] = os.getenv(src)
+def apply_env_aliases() -> None:
+    """
+    Εφαρμόζει alias mapping:
+    Αν υπάρχει π.χ. BOT_TOKEN στο env αλλά όχι TELEGRAM_BOT_TOKEN,
+    θα το αντιγράψει εκεί.
+    """
+    for short, full in ENV_ALIASES.items():
+        val = os.getenv(short)
+        if val and not os.getenv(full):
+            os.environ[full] = val
 
-def apply_env_aliases():
-    # minutes vs min
-    _alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
-    # WCRO quote
-    _alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
-    # ενιαίο όριο απόλυτης μεταβολής (το χρησιμοποιείς ήδη)
-    _alias_env("DISCOVER_MIN_ABS_CHANGE_PCT", "DISCOVER_MIN_ABS_CHANGE_PCT")
-    # καθάρισε πιθανά κενά στα numeric envs
-    for k in [
-        "DEX_POLL","WALLET_POLL","INTRADAY_HOURS","EOD_HOUR","EOD_MINUTE",
-        "PRICE_WINDOW","PRICE_MOVE_THRESHOLD","SPIKE_THRESHOLD",
-        "ALERTS_INTERVAL_MIN","DISCOVER_LIMIT","DISCOVER_POLL",
-        "DISCOVER_MIN_LIQ_USD","DISCOVER_MIN_VOL24_USD","DISCOVER_MAX_PAIR_AGE_HOURS",
-        "PUMP_ALERT_24H_PCT","DUMP_ALERT_24H_PCT","MIN_VOLUME_FOR_ALERT",
-        "GUARD_WINDOW_MIN","GUARD_PUMP_PCT","GUARD_DROP_PCT","GUARD_TRAIL_DROP_PCT",
-    ]:
-        v = os.getenv(k)
-        if v is not None:
-            os.environ[k] = v.strip()
+def get_env(key: str, default: str | None = None) -> str | None:
+    """Wrapper για os.getenv με fallback default."""
+    return os.getenv(key, default)
+
+def require_env(key: str) -> str:
+    """Όπως get_env αλλά σπάει αν λείπει η μεταβλητή."""
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return val
