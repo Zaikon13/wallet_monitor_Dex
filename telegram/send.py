@@ -1,4 +1,3 @@
-# send.py – lightweight send_telegram helper, no dependencies
 import os
 import requests
 import logging
