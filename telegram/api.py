@@ -1,74 +1,78 @@
-# telegram/api.py
-# Simple Telegram sender with safe MarkdownV2 escaping (or plain text)
-from __future__ import annotations
-import os
-import json
-from typing import Optional
+# -*- coding: utf-8 -*-
+import requests, time, math, logging
 
-try:
-    from utils.http import post_json as _post_json  # type: ignore
-except Exception:
-    import requests
+from os import getenv
 
-    def _post_json(url: str, payload: dict, timeout: int = 10):
-        r = requests.post(url, json=payload, timeout=timeout)
-        return r.status_code, r.text
+BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN") or ""
+CHAT_ID   = getenv("TELEGRAM_CHAT_ID") or ""
+API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+MAX_LEN   = 4096
 
-MDV2_RESERVED = r'_\*\[\]\(\)~`>#+\-=|{}.!'
+log = logging.getLogger("telegram")
 
-def escape_markdown_v2(text: str) -> str:
-    if text is None:
-        return ""
-    # Πρώτα escape backslash
-    text = text.replace("\\", "\\\\")
-    # Μετά escape όλα τα ειδικά
-    for ch in MDV2_RESERVED:
-        text = text.replace(ch, f"\\{ch}")
-    return text
+_MD_CHARS = r'_\*\[\]\(\)~`>#+-=|{}.!'
 
-def send_telegram(
-    text: str,
-    parse_mode: Optional[str] = None,
-    disable_web_page_preview: bool = True,
-    chat_id: Optional[str] = None,
-    token: Optional[str] = None,
-) -> tuple[bool, int, str]:
-    """
-    Στέλνει μήνυμα στο Telegram.
-    - By default ΧΩΡΙΣ parse_mode (σκέτο text) για να μη σκάει.
-    - Αν θες MarkdownV2, δώσε parse_mode='MarkdownV2' και θα γίνει escape αυτόματα.
-    Διαβάζει TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID από το περιβάλλον αν δεν δοθούν.
-    """
-    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return False, 0, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+def escape_md(s: str) -> str:
+    if not s: return s
+    out=[]
+    for ch in s:
+        if ch in _MD_CHARS:
+            out.append("\\"+ch)
+        else:
+            out.append(ch)
+    return "".join(out)
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
+def _post(text: str, parse_mode="MarkdownV2"):
     payload = {
-        "chat_id": str(chat_id),
-        "disable_web_page_preview": disable_web_page_preview,
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
     }
+    backoff = 1.0
+    for attempt in range(5):
+        try:
+            r = requests.post(API_URL, json=payload, timeout=20)
+            if r.status_code == 429:
+                try:
+                    retry_after = int(r.json().get("parameters", {}).get("retry_after", 1))
+                except Exception:
+                    retry_after = 1
+                time.sleep(retry_after + 0.2)
+                continue
+            if r.status_code >= 400:
+                log.warning("Telegram send failed %s: %s", r.status_code, r.text[:200])
+            return
+        except Exception as e:
+            log.debug("Telegram error: %s", e)
+            time.sleep(backoff)
+            backoff = min(backoff*2, 8.0)
 
-    if parse_mode and parse_mode.upper() == "MARKDOWNV2":
-        payload["parse_mode"] = "MarkdownV2"
-        payload["text"] = escape_markdown_v2(text or "")
-    elif parse_mode and parse_mode.upper() in ("MARKDOWN", "HTML"):
-        # Δεν προτείνεται, αλλά το υποστηρίζουμε
-        payload["parse_mode"] = parse_mode
-        payload["text"] = text or ""
-    else:
-        # Plain text (ασφαλές)
-        payload["text"] = text or ""
+def send_telegram(text: str):
+    """
+    Escapes MarkdownV2 and chunks messages > 4096 chars.
+    """
+    if not BOT_TOKEN or not CHAT_ID or not text:
+        return
+    esc = escape_md(text)
+    # chunk by MAX_LEN
+    if len(esc) <= MAX_LEN:
+        _post(esc)
+        return
+    # split at line boundaries where possible
+    start=0
+    idx=0
+    while start < len(esc):
+        end = min(len(esc), start + MAX_LEN)
+        # try break at last newline
+        nl = esc.rfind("\n", start, end)
+        if nl == -1 or nl <= start + 100:
+            nl = end
+        part = esc[start:nl]
+        idx += 1
+        header = f"_part {idx}_\n" if idx>1 else ""
+        _post(header + part)
+        start = nl
 
-    try:
-        status, resp = _post_json(url, payload, timeout=12)
-        ok = (200 <= status < 300)
-        return ok, status, resp
-    except Exception as e:
-        return False, 0, f"Exception: {e}"
-
-def send_telegram_lines(lines: list[str], **kwargs) -> tuple[bool, int, str]:
-    text = "\n".join(lines or [])
-    return send_telegram(text, **kwargs)
+# exported for other modules
+__all__ = ["send_telegram", "escape_md"]
