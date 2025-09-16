@@ -1,24 +1,14 @@
-name: Cordex Diag
+name: Cordex Diag (Ultra-lite)
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/cordex-diag.yml"
-      - "scripts/cordex_diag.py"
-      - "requirements.txt"
-      - "main.py"
-      - "core/**"
-      - "reports/**"
-      - "telegram/**"
-      - "utils/**"
 
 jobs:
   diag:
     runs-on: ubuntu-latest
     permissions:
-      contents: write     # για commit στο repo
-      issues: write       # για δημιουργία/ενημέρωση issue
+      issues: write  # μόνο για Issue (όχι commits)
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,6 +25,7 @@ jobs:
           pip install pipdeptree || true
 
       - name: Run Cordex Diag
+        continue-on-error: true
         env:
           TZ: ${{ secrets.TZ }}
           WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
@@ -47,72 +38,38 @@ jobs:
           INTRADAY_HOURS: ${{ secrets.INTRADAY_HOURS }}
           EOD_TIME: ${{ secrets.EOD_TIME }}
         run: |
-          python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils
+          python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils || true
+          [ -f diag_report.md ]   || echo "_No diag_report.md produced._" > diag_report.md
 
-      - name: Publish diag into repo (.cordex/latest)
-        run: |
-          set -e
-          mkdir -p .cordex/latest
-          cp diag_report.md .cordex/latest/ || true
-          cp diag_report.json .cordex/latest/ || true
-          cp diag_tree.txt .cordex/latest/ || true
-          cp diag_imports.log .cordex/latest/ || true
-
-          # commit μόνο αν υπάρχουν αλλαγές
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- .cordex/latest; then
-            git add .cordex/latest
-            git commit -m "Cordex diag: $GITHUB_RUN_NUMBER ($GITHUB_SHA)"
-            git push
-          fi
-
-      - name: Save Job Summary
-        run: |
-          echo "## Cordex Diag Summary" >> $GITHUB_STEP_SUMMARY
-          if [ -f diag_report.md ]; then
-            cat diag_report.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "_No diag_report.md produced._" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Create/Update Issue 'Cordex Diag — latest'
+      - name: Create/Update Issue "Cordex Diag — latest"
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let body = "_No diag_report.md produced._";
+            const title = 'Cordex Diag — latest';
+            let body = '_No diag_report.md produced._';
             if (fs.existsSync('diag_report.md')) {
               body = fs.readFileSync('diag_report.md', 'utf8');
             }
-            // πρόσθεσε link στα committed files
-            const repo = context.repo.repo;
-            const owner = context.repo.owner;
-            const branch = process.env.GITHUB_REF_NAME || 'main';
-            const baseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/.cordex/latest`;
-
-            const appendix = `
----
-**Raw files**
-- [diag_report.md](${baseUrl}/diag_report.md)
-- [diag_report.json](${baseUrl}/diag_report.json)
-- [diag_tree.txt](${baseUrl}/diag_tree.txt)
-- [diag_imports.log](${baseUrl}/diag_imports.log)
-`;
-            const fullBody = body + appendix;
-
             const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open'
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
             });
-            const title = 'Cordex Diag — latest';
             const existing = issues.find(i => i.title === title);
             if (existing) {
               await github.rest.issues.update({
-                owner, repo, issue_number: existing.number, body: fullBody
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body
               });
             } else {
               await github.rest.issues.create({
-                owner, repo, title, body: fullBody
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body
               });
             }
 
