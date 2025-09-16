@@ -1,39 +1,31 @@
 # core/tz.py
-# -*- coding: utf-8 -*-
-"""
-Timezone helpers used by main.py
-- now_local(): returns timezone-aware "now" using TZ env (default Europe/Athens)
-- ymd(dt): YYYY-MM-DD string in local TZ
-- parse_ts(s): parse "YYYY-MM-DD HH:MM:SS" to timezone-aware datetime
-"""
-
-import os
+import os, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-_DEF_TZ = os.getenv("TZ", "Europe/Athens")
+# Θα οριστικοποιηθεί με tz_init() στην εκκίνηση
+LOCAL_TZ = ZoneInfo(os.getenv("TZ", "Europe/Athens"))
 
-def _tz() -> ZoneInfo:
+def tz_init(tz_str: str | None = None):
+    """Κλειδώνει το timezone σε όλο το process (Europe/Athens by default)."""
+    tz = (tz_str or os.getenv("TZ") or "Europe/Athens").strip()
+    os.environ["TZ"] = tz
     try:
-        return ZoneInfo(_DEF_TZ)
+        if hasattr(time, "tzset"):
+            time.tzset()
     except Exception:
-        return ZoneInfo("UTC")
+        pass
+    global LOCAL_TZ
+    LOCAL_TZ = ZoneInfo(tz)
+    return LOCAL_TZ
 
-def now_local() -> datetime:
-    """Return current datetime with the configured local timezone."""
-    return datetime.now(_tz())
+def now_dt():
+    return datetime.now(LOCAL_TZ)
 
-def ymd(dt: datetime | None = None) -> str:
-    """Return YYYY-MM-DD in local timezone."""
-    return (dt or now_local()).strftime("%Y-%m-%d")
+def ymd(dt=None):
+    if dt is None: dt = now_dt()
+    return dt.strftime("%Y-%m-%d")
 
-def parse_ts(s: str, tz: ZoneInfo | None = None) -> datetime:
-    """
-    Parse 'YYYY-MM-DD HH:MM:SS' and return timezone-aware dt.
-    If parsing fails, returns now_local().
-    """
-    try:
-        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=(tz or _tz()))
-    except Exception:
-        return now_local()
+def month_prefix(dt=None):
+    if dt is None: dt = now_dt()
+    return dt.strftime("%Y-%m")
