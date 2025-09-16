@@ -1,17 +1,13 @@
-# core/holdings.py
-# Snapshot όλων των holdings από Cronos RPC (CRO + ERC-20) με προαιρετικό pricing από Dexscreener.
-# Κρατάμε tCRO/receipts ξεχωριστά (ΔΕΝ γίνεται alias σε CRO).
-
-from __future__ import annotations
-import os, time
+import os, requests
 from decimal import Decimal
-from collections import defaultdict
+from typing import List, Dict
 
-# --- ENV ---
-CRONOS_RPC_URL = os.getenv("CRONOS_RPC_URL") or ""
+# Environment
+CRONOS_RPC_URL = os.getenv("CRONOS_RPC_URL", "")
 WALLET_ADDRESS = (os.getenv("WALLET_ADDRESS") or "").lower()
+ETHERSCAN_API = os.getenv("ETHERSCAN_API", "")
 
-# --- Web3 (μικρό, τοπικό helper) ---
+# Web3 minimal
 WEB3 = None
 ERC20_ABI_MIN = [
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
@@ -30,9 +26,9 @@ def _w3_init():
         WEB3 = Web3(Web3.HTTPProvider(CRONOS_RPC_URL, request_kwargs={"timeout": 15}))
         if WEB3.is_connected():
             return WEB3
-        return None
     except Exception:
-        return None
+        WEB3 = None
+    return WEB3
 
 def _cs(addr: str) -> str:
     try:
@@ -46,9 +42,11 @@ def _erc20_symbol_decimals(addr: str) -> tuple[str, int]:
     if not w3:
         return (addr[:8].upper(), 18)
     try:
-        c = w3.eth.contract(address=_cs(addr), abi=ERC20_ABI_MIN)
-        sym = c.functions.symbol().call()
-        dec = int(c.functions.decimals().call())
+        contract = w3.eth.contract(address=_cs(addr), abi=ERC20_ABI_MIN)
+        sym = contract.functions.symbol().call()
+        dec = int(contract.functions.decimals().call())
+        if isinstance(sym, bytes):
+            sym = sym.decode("utf-8", "ignore").strip()
         return (sym or addr[:8].upper(), dec or 18)
     except Exception:
         return (addr[:8].upper(), 18)
@@ -58,9 +56,8 @@ def _erc20_balance(addr: str, owner: str) -> Decimal:
     if not w3:
         return Decimal("0")
     try:
-        c = w3.eth.contract(address=_cs(addr), abi=ERC20_ABI_MIN)
-        raw = c.functions.balanceOf(_cs(owner)).call()
-        # decimals θα το εφαρμόσουμε εκτός, όπου χρειαστεί
+        contract = w3.eth.contract(address=_cs(addr), abi=ERC20_ABI_MIN)
+        raw = contract.functions.balanceOf(_cs(owner)).call()
         return Decimal(str(raw))
     except Exception:
         return Decimal("0")
@@ -75,18 +72,13 @@ def _native_balance(owner: str) -> Decimal:
     except Exception:
         return Decimal("0")
 
-# --- Dexscreener pricing (light) ---
-from typing import Optional
-import requests
-
 DEX_BASE_TOKENS = "https://api.dexscreener.com/latest/dex/tokens"
 DEX_BASE_SEARCH = "https://api.dexscreener.com/latest/dex/search"
 
-def _pick_best_price(pairs: list[dict]) -> Optional[float]:
-    if not pairs:
-        return None
-    best, best_liq = None, -1.0
-    for p in pairs:
+def _pick_best_price(pairs: list) -> float:
+    best_price = None
+    best_liq = -1.0
+    for p in pairs or []:
         try:
             if str(p.get("chainId", "")).lower() != "cronos":
                 continue
@@ -95,111 +87,132 @@ def _pick_best_price(pairs: list[dict]) -> Optional[float]:
             if price <= 0:
                 continue
             if liq > best_liq:
-                best_liq, best = liq, price
+                best_liq = liq
+                best_price = price
         except Exception:
             continue
-    return best
+    return best_price if best_price is not None else 0.0
 
-def _price_usd_for(key: str) -> Optional[float]:
+def _price_usd_for(key: str) -> float:
+    """
+    Return current USD price for given token symbol or contract address via Dexscreener.
+    """
+    query = key.strip().lower()
     try:
-        if key.lower() in ("cro", "wcro"):
-            # canonical CRO μέσω WCRO/USDT (fallback: "cro usdt")
+        if query in ("cro", "wcro"):
             for q in ("wcro usdt", "wcro usdc", "cro usdt"):
-                r = requests.get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)
-                if r.ok:
-                    j = r.json() or {}
-                    p = _pick_best_price(j.get("pairs") or [])
+                resp = requests.get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)
+                if resp.ok:
+                    data = resp.json()
+                    p = _pick_best_price(data.get("pairs") or [])
                     if p and p > 0:
                         return p
-            return None
-        if key.startswith("0x") and len(key) == 42:
-            r = requests.get(f"{DEX_BASE_TOKENS}/cronos/{key}", timeout=10)
-            if r.ok:
-                j = r.json() or {}
-                p = _pick_best_price(j.get("pairs") or [])
+            return 0.0
+        if query.startswith("0x") and len(query) == 42:
+            resp = requests.get(f"{DEX_BASE_TOKENS}/cronos/{query}", timeout=10)
+            if resp.ok:
+                data = resp.json()
+                p = _pick_best_price(data.get("pairs") or [])
                 if p and p > 0:
                     return p
-            # fallback: search by addr
-            r = requests.get(DEX_BASE_SEARCH, params={"q": key}, timeout=10)
-            if r.ok:
-                j = r.json() or {}
-                p = _pick_best_price(j.get("pairs") or [])
+            resp = requests.get(DEX_BASE_SEARCH, params={"q": query}, timeout=10)
+            if resp.ok:
+                data = resp.json()
+                p = _pick_best_price(data.get("pairs") or [])
                 if p and p > 0:
                     return p
-            return None
-        # symbol search
-        r = requests.get(DEX_BASE_SEARCH, params={"q": key}, timeout=10)
-        if r.ok:
-            j = r.json() or {}
-            p = _pick_best_price(j.get("pairs") or [])
+            return 0.0
+        resp = requests.get(DEX_BASE_SEARCH, params={"q": query}, timeout=10)
+        if resp.ok:
+            data = resp.json()
+            p = _pick_best_price(data.get("pairs") or [])
             if p and p > 0:
                 return p
-        # extra attempts
-        for q in (f"{key} usdt", f"{key} wcro"):
-            r = requests.get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)
-            if r.ok:
-                j = r.json() or {}
-                p = _pick_best_price(j.get("pairs") or [])
+        for q in (f"{query} usdt", f"{query} wcro"):
+            resp = requests.get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)
+            if resp.ok:
+                data = resp.json()
+                p = _pick_best_price(data.get("pairs") or [])
                 if p and p > 0:
                     return p
-        return None
+        return 0.0
     except Exception:
-        return None
+        return 0.0
 
-# --- Public API ---
-def get_wallet_snapshot(normalize_zero: bool = True, with_prices: bool = True) -> list[dict]:
+def get_wallet_snapshot(normalize_zero: bool = True, with_prices: bool = True) -> Dict[str, dict]:
     """
-    Επιστρέφει λίστα από dicts:
-      { "symbol": str, "token_addr": str|None, "amount": Decimal, "price_usd": float|None, "usd_value": float|None }
-    * Native CRO με 18 decimals (Wei → CRO)
-    * ERC-20 balances με πραγματικό decimals
-    * ΔΕΝ γίνεται alias tCRO → CRO (receipt tokens μένουν ξεχωριστά)
+    Returns current wallet holdings snapshot as dict: {symbol: {"amount": Decimal, "price": float|None}}
     """
-    if not WALLET_ADDRESS:
-        return []
-
-    out: list[dict] = []
-
-    # Native CRO
-    wei = _native_balance(WALLET_ADDRESS)
+    addr = WALLET_ADDRESS
+    if not addr:
+        return {}
+    snapshot_list = []
+    # Native CRO balance
+    wei = _native_balance(addr)
     if normalize_zero is False or wei > 0:
-        cro_amt = (wei / Decimal(10 ** 18)).quantize(Decimal("0.00000001"))
-        price = _price_usd_for("CRO") if with_prices else None
-        usd = float(cro_amt) * float(price) if (price and cro_amt) else None
-        out.append({"symbol": "CRO", "token_addr": None, "amount": cro_amt, "price_usd": price, "usd_value": usd})
-
-    # ERC-20 discovery via recent token txs (light) + balanceOf check
-    # Για απλότητα εδώ, ο χρήστης μπορεί να δώσει συμβόλαια στο env TOKENS=cronos/0x....
-    tokens_env = [t.strip().lower() for t in (os.getenv("TOKENS", "")).split(",") if t.strip()]
-    addrs = []
+        cro_amt = (wei / Decimal(10**18)).quantize(Decimal("0.00000001"))
+        price = _price_usd_for("cro") if with_prices else None
+        usd_val = float(cro_amt) * float(price) if (price and cro_amt) else None
+        snapshot_list.append({"symbol": "CRO", "token_addr": None, "amount": cro_amt, "price_usd": price, "usd_value": usd_val})
+    # Gather token addresses from env and Etherscan
+    token_addrs = set()
+    tokens_env = [t.strip().lower() for t in os.getenv("TOKENS", "").split(",") if t.strip()]
     for t in tokens_env:
         if t.startswith("cronos/"):
-            addrs.append(t.split("/", 1)[1])
-
-    # Αν θέλεις αυτόματο discovery όπως στο main.py (logs), το αφήνουμε στο main.
-    # Εδώ διαβάζουμε αυτά που μας δίνεις στο env για να είναι ανεξάρτητο helper.
-
-    seen = set()
-    for addr in addrs:
-        if not (addr.startswith("0x") and len(addr) == 42):
+            _, contract = t.split("/", 1)
+            if contract.startswith("0x"):
+                token_addrs.add(contract.lower())
+        elif t.startswith("0x") and len(t) == 42:
+            token_addrs.add(t.lower())
+    try:
+        if ETHERSCAN_API:
+            url = "https://api.etherscan.io/v2/api"
+            params = {
+                "chainid": 25,
+                "module": "account",
+                "action": "tokentx",
+                "address": addr,
+                "startblock": 0,
+                "endblock": 99999999,
+                "page": 1,
+                "offset": 100,
+                "sort": "desc",
+                "apikey": ETHERSCAN_API
+            }
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if str(data.get("status", "")).strip() == "1":
+                    for tx in data.get("result", []):
+                        ca = (tx.get("contractAddress") or "").lower()
+                        if ca.startswith("0x"):
+                            token_addrs.add(ca)
+    except Exception:
+        pass
+    # Fetch balances for each token
+    for contract in sorted(token_addrs):
+        if not (contract and contract.startswith("0x")):
             continue
-        if addr in seen:
+        sym, dec = _erc20_symbol_decimals(contract)
+        raw_bal = _erc20_balance(contract, addr)
+        if raw_bal <= 0:
             continue
-        seen.add(addr)
-        sym, dec = _erc20_symbol_decimals(addr)
-        raw = _erc20_balance(addr, WALLET_ADDRESS)
-        if raw <= 0:
-            continue
-        amt = (raw / Decimal(10 ** dec)).quantize(Decimal("0.00000001"))
-        price = _price_usd_for(addr) if with_prices else None
-        usd = float(amt) * float(price) if (price and amt) else None
-        out.append({"symbol": sym or addr[:8].upper(), "token_addr": addr, "amount": amt, "price_usd": price, "usd_value": usd})
-
-    # Ταξινόμηση κατά USD value (φθίνουσα), αλλιώς κατά ποσότητα
-    def _key(d):
-        v = d.get("usd_value")
-        if v is not None:
-            return (0, v)
-        return (1, float(d.get("amount") or 0))
-    out.sort(key=_key, reverse=True)
-    return out
+        amt = (raw_bal / Decimal(10**dec)).quantize(Decimal("0.00000001"))
+        price = _price_usd_for(contract) if with_prices else None
+        usd_val = float(amt) * float(price) if (price and amt) else None
+        snapshot_list.append({"symbol": sym or contract[:8].upper(), "token_addr": contract, "amount": amt, "price_usd": price, "usd_value": usd_val})
+    # Sort by USD value (descending)
+    snapshot_list.sort(key=lambda x: float(x.get("usd_value") or 0), reverse=True)
+    # Convert to dict
+    snapshot: Dict[str, dict] = {}
+    for item in snapshot_list:
+        sym = str(item["symbol"]) if item["symbol"] else "TOKEN"
+        key = sym.upper()
+        if key in snapshot:
+            # Differentiate duplicate symbols
+            i = 2
+            while f"{key}{i}" in snapshot:
+                i += 1
+            key = f"{key}{i}"
+        snapshot[key] = {"amount": item["amount"], "price": item["price_usd"]}
+    return snapshot
