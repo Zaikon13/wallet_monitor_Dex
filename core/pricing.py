@@ -1,115 +1,124 @@
 # core/pricing.py
+# Lightweight Dexscreener pricing + in-memory cache
 from __future__ import annotations
+import os
 import time
-from typing import Dict, Tuple, Optional, List
-from utils.http import safe_get, safe_json
+from typing import Any, Dict, Optional
 
-# Dexscreener endpoints
-DEX_BASE_TOKENS  = "https://api.dexscreener.com/latest/dex/tokens"
-DEX_BASE_SEARCH  = "https://api.dexscreener.com/latest/dex/search"
+# --- Public cache (ζητείται από main.py) ---
+HISTORY_LAST_PRICE: Dict[str, float] = {}  # π.χ. {"CRO": 0.12, "0xabc...": 0.00123}
 
-# Common symbol aliases
-PRICE_ALIASES: Dict[str, str] = {"tcro": "cro"}
+# --- Προαιρετικά helpers από utils.http, αλλιώς fallback σε requests ---
+try:
+    from utils.http import get_json as _get_json  # type: ignore
+except Exception:
+    import requests
 
-# Exposed history map so other modules (π.χ. main.py) μπορούν να το seed-άρουν με last-seen prices.
-HISTORY_LAST_PRICE: Dict[str, float] = {}
+    def _get_json(url: str, timeout: int = 10) -> Any:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
 
-# Simple price cache (seconds)
-PRICE_CACHE: Dict[str, Tuple[Optional[float], float]] = {}
-PRICE_CACHE_TTL = 60.0
+# Μικρή τοπική cache για Dexscreener responses (TTL 60s)
+_price_cache: Dict[str, tuple[float, float]] = {}
+_CACHE_TTL = 60.0  # seconds
 
+def _now() -> float:
+    return time.time()
 
-def _pick_best_price(pairs: List[dict] | None) -> Optional[float]:
+def _cache_get(key: str) -> Optional[float]:
+    item = _price_cache.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if _now() - ts > _CACHE_TTL:
+        return None
+    return val
+
+def _cache_set(key: str, val: float) -> None:
+    _price_cache[key] = (_now(), val)
+
+def _normalize_asset_key(asset: str) -> str:
+    return asset.strip().lower()
+
+def _pick_best_pair(pairs: list[dict], prefer_chain: str = "cronos") -> Optional[dict]:
     if not pairs:
         return None
-    best, best_liq = None, -1.0
+    # Προτίμηση σε ζεύγη πάνω στο ζητούμενο chain
     for p in pairs:
-        try:
-            if str(p.get("chainId", "")).lower() != "cronos":
-                continue
-            liq = float((p.get("liquidity") or {}).get("usd") or 0)
-            price = float(p.get("priceUsd") or 0)
-            if price <= 0:
-                continue
-            if liq > best_liq:
-                best_liq, best = liq, price
-        except:  # noqa: E722
-            continue
-    return best
-
-
-def _pairs_for_token_addr(addr: str) -> List[dict]:
-    data = safe_json(safe_get(f"{DEX_BASE_TOKENS}/cronos/{addr}", timeout=10)) or {}
-    pairs = data.get("pairs") or []
-    if not pairs:
-        data = safe_json(safe_get(f"{DEX_BASE_TOKENS}/{addr}", timeout=10)) or {}
-        pairs = data.get("pairs") or []
-    if not pairs:
-        data = safe_json(safe_get(DEX_BASE_SEARCH, params={"q": addr}, timeout=10)) or {}
-        pairs = data.get("pairs") or []
-    return pairs
-
-
-def _history_price_fallback(query_key: str, symbol_hint: str | None = None) -> Optional[float]:
-    if not query_key:
-        return None
-    k = query_key.strip()
-    if not k:
-        return None
-    # First try exact 0x address key
-    if k.startswith("0x"):
-        p = HISTORY_LAST_PRICE.get(k)
-        if p and p > 0:
+        if (p.get("chainId") or "").lower() == prefer_chain.lower():
             return p
-    # Then try symbol (upper + alias)
-    sym = (symbol_hint or k)
-    sym = (PRICE_ALIASES.get(sym.lower(), sym.lower())).upper()
-    p = HISTORY_LAST_PRICE.get(sym)
-    if p and p > 0:
-        return p
-    return None
+    # Αλλιώς πάρε το πρώτο
+    return pairs[0]
 
-
-def get_price_usd(symbol_or_addr: str) -> Optional[float]:
-    """
-    Returns best USD price for a Cronos token (symbol or 0x address).
-    Uses Dexscreener and falls back to HISTORY_LAST_PRICE when needed.
-    """
-    if not symbol_or_addr:
+def _price_from_pairs(pairs: list[dict], prefer_chain: str = "cronos") -> Optional[float]:
+    best = _pick_best_pair(pairs, prefer_chain=prefer_chain)
+    if not best:
         return None
-    key = PRICE_ALIASES.get(symbol_or_addr.strip().lower(), symbol_or_addr.strip().lower())
-    now = time.time()
-    c = PRICE_CACHE.get(key)
-    if c and (now - c[1] < PRICE_CACHE_TTL):
-        return c[0]
-
-    price = None
+    price_str = best.get("priceUsd")
     try:
-        # CRO shortcuts
-        if key in ("cro", "wcro", "w-cro", "wrappedcro", "wrapped cro"):
-            for q in ["wcro usdt", "cro usdt", "cro usdc"]:
-                data = safe_json(safe_get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)) or {}
-                price = _pick_best_price(data.get("pairs"))
-                if price:
-                    break
-        # 0x address
-        elif key.startswith("0x") and len(key) == 42:
-            price = _pick_best_price(_pairs_for_token_addr(key))
-        # symbol
-        else:
-            for q in [key, f"{key} usdt", f"{key} wcro"]:
-                data = safe_json(safe_get(DEX_BASE_SEARCH, params={"q": q}, timeout=10)) or {}
-                price = _pick_best_price(data.get("pairs"))
-                if price:
-                    break
-    except:  # noqa: E722
-        price = None
+        return float(price_str) if price_str is not None else None
+    except Exception:
+        return None
 
-    # Fallback σε τελευταία ιστορική τιμή από ledger
-    if (price is None) or (not price) or (float(price) <= 0):
-        hist = _history_price_fallback(symbol_or_addr, symbol_hint=symbol_or_addr)
-        if hist and hist > 0:
-            price = float(hist)
+def _price_by_token_address(chain: str, address: str) -> Optional[float]:
+    # Dexscreener tokens endpoint
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+    data = _get_json(url, timeout=12)
+    pairs = data.get("pairs") or []
+    return _price_from_pairs(pairs, prefer_chain=chain)
 
-    PRICE_CACHE[key] = (price, now)
+def get_price_usd(asset: str, chain: str = "cronos") -> float:
+    """
+    Επιστρέφει USD price για asset:
+      - Αν είναι address (0x...), ψάχνει Dexscreener /tokens/{address}
+      - Αλλιώς χρησιμοποιεί/ενημερώνει HISTORY_LAST_PRICE
+    Ποτέ δεν σηκώνει exception — αν δεν βρει τιμή, επιστρέφει 0.0.
+    """
+    if not asset:
+        return 0.0
+
+    key = _normalize_asset_key(asset)
+
+    # 1) Cache
+    cached = _cache_get(f"{chain}:{key}")
+    if cached is not None:
+        return cached
+
+    price: Optional[float] = None
+
+    # 2) Αν μοιάζει με address → Dexscreener
+    if key.startswith("0x") and len(key) in (42, 66):
+        try:
+            price = _price_by_token_address(chain, key)
+        except Exception:
+            price = None
+
+    # 3) Αν δεν βρήκε από address ή asset είναι σύμβολο → δοκίμασε HISTORY
+    if price is None:
+        # Προσπάθησε με σύμβολο/alias από HISTORY
+        sym = asset.upper()
+        if sym in HISTORY_LAST_PRICE:
+            price = HISTORY_LAST_PRICE[sym]
+
+    # 4) Τελικό fallback: 0.0 (δεν σπάμε ροή)
+    if price is None:
+        price = 0.0
+
+    # 5) Ενημέρωσε caches
+    _cache_set(f"{chain}:{key}", price)
+    # Αν είναι "καθαρό" σύμβολο, κρατάμε και στο HISTORY_LAST_PRICE
+    if not key.startswith("0x"):
+        HISTORY_LAST_PRICE[asset.upper()] = price
+
     return price
+
+def seed_price(symbol: str, price_usd: float) -> None:
+    """Προαιρετικό helper για pre-seed τιμών σε HISTORY_LAST_PRICE."""
+    if not symbol:
+        return
+    try:
+        p = float(price_usd)
+    except Exception:
+        return
+    HISTORY_LAST_PRICE[symbol.upper()] = p
