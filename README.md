@@ -23,3 +23,4 @@ Compact Python bot (<1000 lines) που παρακολουθεί το Cronos wal
 
 - Python 3.12+
 - Dependencies στο `requirements.txt`:
+# probe-codex-1
