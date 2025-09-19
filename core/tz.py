@@ -2,7 +2,7 @@
 """
 Timezone helpers.
 - Use TZ from environment (default UTC)
-- Provide now_local(), today_str() etc.
+- Provide now_local(), today_str(), datetime_str(), ymd()
 """
 
 import os
@@ -39,3 +39,13 @@ def datetime_str(dt: datetime) -> str:
     Format datetime as ISO string in local TZ.
     """
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ymd(dt: datetime | None = None) -> str:
+    """
+    Return YYYY-MM-DD string from datetime (local TZ).
+    If dt is None, use now().
+    """
+    if dt is None:
+        dt = now_local()
+    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
