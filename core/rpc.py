@@ -1,210 +1,120 @@
-from __future__ import annotations
+# core/rpc.py
+"""
+Minimal Cronos RPC helpers.
+- Native CRO balance
+- Generic ERC-20 token balance(s)
+"""
+
 import os
+import logging
+from decimal import Decimal
+from typing import Dict, Any
+
 import requests
-from typing import Dict, List, Any
 
-WEB3 = None
-ERC20_ABI_MIN = [
-    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
-    {"constant": True, "inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
-]
+RPC_URL = os.getenv("CRONOS_RPC_URL", "https://evm.cronos.org")
 
-# Environment
-RPC_URL = os.getenv("CRONOS_RPC_URL", "") or os.getenv("RPC_URL", "")
-WALLET_ADDR = (os.getenv("WALLET_ADDRESS") or "").lower()
-ETHERSCAN_API = os.getenv("ETHERSCAN_API", "")
+# Native CRO (gas token) has fixed decimals = 18
+NATIVE_DECIMALS = 18
 
-_sym_cache: Dict[str, str] = {}
-_dec_cache: Dict[str, int] = {}
 
-def rpc_init() -> bool:
-    """
-    Initialize Web3 provider once; return True if connected.
-    """
-    global WEB3
-    if WEB3 is not None:
-        try:
-            return bool(WEB3.is_connected())
-        except Exception:
-            pass
-    if not RPC_URL:
-        return False
+# ---------- Low-level JSON-RPC ----------
+
+def _rpc_call(method: str, params: list[Any]) -> Any:
     try:
-        from web3 import Web3
-        WEB3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
-        return bool(WEB3.is_connected())
-    except Exception:
-        WEB3 = None
-        return False
+        resp = requests.post(
+            RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(f"RPC error {data['error']}")
+        return data.get("result")
+    except Exception as e:
+        logging.exception(f"RPC call {method} failed: {e}")
+        return None
 
-def get_native_balance(addr: str) -> float:
+
+# ---------- Native CRO ----------
+
+def get_native_balance(wallet_address: str) -> Decimal:
     """
-    Returns the CRO balance of the given address.
+    Return native CRO balance for the given address.
     """
-    if not rpc_init():
-        return 0.0
+    result = _rpc_call("eth_getBalance", [wallet_address, "latest"])
+    if result is None:
+        return Decimal("0")
     try:
-        wei = WEB3.eth.get_balance(WEB3.to_checksum_address(addr))
-        return float(wei) / (10 ** 18)
-    except Exception:
-        return 0.0
+        return Decimal(int(result, 16)) / Decimal(10**NATIVE_DECIMALS)
+    except Exception as e:
+        logging.warning(f"Failed to parse CRO balance {result}: {e}")
+        return Decimal("0")
 
-def erc20_balance(contract: str, owner: str) -> float:
+
+# ---------- ERC-20 Tokens ----------
+
+# Minimal ERC-20 ABI fragments (for balanceOf & decimals & symbol)
+ERC20_BALANCEOF = "0x70a08231"  # balanceOf(address)
+ERC20_DECIMALS  = "0x313ce567"  # decimals()
+ERC20_SYMBOL    = "0x95d89b41"  # symbol()
+
+
+def _call_contract(to_address: str, data: str) -> Any:
+    return _rpc_call("eth_call", [{"to": to_address, "data": data}, "latest"])
+
+
+def _encode_address(addr: str) -> str:
+    # Remove 0x and pad left
+    return "0x" + addr.lower().replace("0x", "").rjust(64, "0")
+
+
+def get_erc20_balance(wallet_address: str, token_address: str) -> Decimal:
     """
-    Returns the token balance of owner for the given ERC20 contract (scaled to token units).
+    Return ERC-20 token balance for given wallet & token contract.
     """
-    if not rpc_init():
-        return 0.0
     try:
-        c = WEB3.eth.contract(address=WEB3.to_checksum_address(contract), abi=ERC20_ABI_MIN)
-        bal = c.functions.balanceOf(WEB3.to_checksum_address(owner)).call()
-        if contract not in _dec_cache:
-            try:
-                _dec_cache[contract] = int(c.functions.decimals().call())
-            except Exception:
-                _dec_cache[contract] = 18
-        return float(bal) / (10 ** _dec_cache[contract])
-    except Exception:
-        return 0.0
+        data = ERC20_BALANCEOF + _encode_address(wallet_address)[2:]
+        raw = _call_contract(token_address, data)
+        if raw is None:
+            return Decimal("0")
+        bal = int(raw, 16)
 
-def erc20_symbol(contract: str) -> str:
+        # decimals
+        dec_raw = _call_contract(token_address, ERC20_DECIMALS)
+        decimals = int(dec_raw, 16) if dec_raw else 18
+
+        return Decimal(bal) / Decimal(10**decimals)
+    except Exception as e:
+        logging.warning(f"ERC20 balance fetch failed: {e}")
+        return Decimal("0")
+
+
+def get_erc20_symbol(token_address: str) -> str:
     """
-    Returns the symbol for the given ERC20 contract.
+    Try to fetch ERC-20 symbol. If fail, return shortened address.
     """
-    if contract in _sym_cache:
-        return _sym_cache[contract]
-    if not rpc_init():
-        _sym_cache[contract] = contract[:8].upper()
-        return _sym_cache[contract]
     try:
-        c = WEB3.eth.contract(address=WEB3.to_checksum_address(contract), abi=ERC20_ABI_MIN)
-        sym = c.functions.symbol().call()
-        if isinstance(sym, bytes):
-            sym = sym.decode("utf-8", "ignore").strip()
-        _sym_cache[contract] = sym or contract[:8].upper()
-        return _sym_cache[contract]
+        raw = _call_contract(token_address, ERC20_SYMBOL)
+        if raw and len(raw) >= 66:
+            # decode as ascii string padded
+            hexdata = raw[130:] if raw.startswith("0x") else raw
+            bytestr = bytes.fromhex(hexdata).rstrip(b"\x00")
+            return bytestr.decode("utf-8")
     except Exception:
-        _sym_cache[contract] = contract[:8].upper()
-        return _sym_cache[contract]
+        pass
+    return token_address[:6].upper()
 
-def get_symbol_decimals(contract: str) -> tuple[str, int]:
-    """
-    Returns (symbol, decimals) for the given ERC20 contract address.
-    """
-    if contract in _sym_cache and contract in _dec_cache:
-        return (_sym_cache[contract], _dec_cache[contract])
-    if not rpc_init():
-        _sym_cache[contract] = contract[:8].upper()
-        _dec_cache[contract] = 18
-        return (_sym_cache[contract], _dec_cache[contract])
-    try:
-        c = WEB3.eth.contract(address=WEB3.to_checksum_address(contract), abi=ERC20_ABI_MIN)
-        sym = c.functions.symbol().call()
-        dec = int(c.functions.decimals().call())
-        if isinstance(sym, bytes):
-            sym = sym.decode("utf-8", "ignore").strip()
-        _sym_cache[contract] = sym or contract[:8].upper()
-        _dec_cache[contract] = dec if dec is not None else 18
-    except Exception:
-        _sym_cache[contract] = contract[:8].upper()
-        _dec_cache[contract] = 18
-    return (_sym_cache[contract], _dec_cache[contract])
 
-def discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: int) -> set[str]:
+def get_erc20_balances(wallet_address: str, token_map: Dict[str, str]) -> Dict[str, Decimal]:
     """
-    Scans recent blockchain logs for ERC20 Transfer events involving the owner address.
-    Returns a set of token contract addresses.
+    Fetch balances for multiple ERC-20 tokens.
+    token_map = { "SYMBOL": "0xTokenAddress", ... }
+    Returns { "SYMBOL": Decimal(amount) }
     """
-    if not rpc_init():
-        return set()
-    latest = None
-    try:
-        latest = WEB3.eth.block_number
-    except Exception:
-        return set()
-    if latest is None:
-        return set()
-    start_block = max(0, latest - max(1, blocks_back))
-    found: set[str] = set()
-    owner_hex = owner.lower().replace("0x", "")
-    topic_addr = "0x" + owner_hex.rjust(64, "0")
-    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    current_block = start_block
-    while current_block <= latest:
-        end_block = min(latest, current_block + chunk - 1)
-        try:
-            logs = WEB3.eth.get_logs({
-                "fromBlock": current_block,
-                "toBlock": end_block,
-                "topics": [transfer_topic, topic_addr]
-            })
-            for log in logs:
-                addr = (log.get("address") or "").lower()
-                if addr.startswith("0x"):
-                    found.add(addr)
-        except Exception:
-            pass
-        try:
-            logs = WEB3.eth.get_logs({
-                "fromBlock": current_block,
-                "toBlock": end_block,
-                "topics": [transfer_topic, None, topic_addr]
-            })
-            for log in logs:
-                addr = (log.get("address") or "").lower()
-                if addr.startswith("0x"):
-                    found.add(addr)
-        except Exception:
-            pass
-        current_block = end_block + 1
-    return found
-
-def discover_wallet_tokens(window_blocks: int = 120000, chunk: int = 5000) -> List[Dict[str, Any]]:
-    """
-    Discover token contracts associated with the wallet and return list of those with balance > 0.
-    Each item: {"token_addr": ..., "symbol": ..., "decimals": ..., "balance": ...}
-    """
-    tokens = []
-    if not WALLET_ADDR:
-        return tokens
-    contracts = discover_token_contracts_by_logs(WALLET_ADDR, window_blocks, chunk)
-    if not contracts and ETHERSCAN_API:
-        try:
-            params = {
-                "chainid": 25,
-                "module": "account",
-                "action": "tokentx",
-                "address": WALLET_ADDR,
-                "startblock": 0,
-                "endblock": 99999999,
-                "page": 1,
-                "offset": 1000,
-                "sort": "desc",
-                "apikey": ETHERSCAN_API
-            }
-            resp = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                if str(data.get("status", "")).strip() == "1":
-                    for tx in data.get("result", []):
-                        ca = (tx.get("contractAddress") or "").lower()
-                        if ca.startswith("0x"):
-                            contracts.add(ca)
-        except Exception:
-            pass
-    if not contracts:
-        return tokens
-    for addr in sorted(contracts):
-        if not addr.startswith("0x"):
-            continue
-        sym, dec = get_symbol_decimals(addr)
-        bal = erc20_balance(addr, WALLET_ADDR)
-        if bal > 1e-12:
-            tokens.append({
-                "token_addr": addr,
-                "symbol": sym,
-                "decimals": dec,
-                "balance": bal
-            })
-    return tokens
+    balances: Dict[str, Decimal] = {}
+    for sym, addr in token_map.items():
+        amt = get_erc20_balance(wallet_address, addr)
+        balances[sym] = amt
+    return balances
