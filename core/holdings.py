@@ -1,266 +1,165 @@
 # core/holdings.py
-# Modular holdings snapshot for /holdings (compatible with legacy imports)
-# - Provides set_runtime_refs(...) to satisfy older main.py imports
-# - Exposes get_wallet_snapshot() and format_snapshot_lines()
-# - Prices via core.pricing.get_price_usd (Dexscreener + history fallback)
-# - CRO is always present; RECEIPT_SYMBOLS (e.g., TCRO) reported separately
+"""
+Wallet holdings snapshot helpers (robust to varying RPC helpers).
+- Does NOT depend on a non-existent get_wallet_balances.
+- Uses core.rpc.get_native_balance and, if available, ERC-20 helpers.
+- Returns clean dict: {symbol: {"amount": Decimal, "usd_value": Decimal}}
+- Keeps CRO and tCRO distinct (no merging).
+"""
 
-import os
-import json
-from collections import defaultdict
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from __future__ import annotations
+import logging
+from decimal import Decimal
+from typing import Dict, Iterable, Tuple, Any
 
-from zoneinfo import ZoneInfo
+# Lazy/defensive imports so we don't explode if functions differ between versions
+from core import rpc as rpc_mod
 from core.pricing import get_price_usd
 
 
-# ---------- Config / Paths ----------
-LOCAL_TZ = ZoneInfo(os.getenv("TZ", "Europe/Athens"))
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-RECEIPT_SYMBOLS = {
-    s.strip().upper() for s in (os.getenv("RECEIPT_SYMBOLS", "TCRO") or "").split(",") if s.strip()
-}
+# ---------- Helpers ----------
 
-# Runtime refs (OPTIONAL; set by main.py in some versions)
-_RUNTIME_QTY: Optional[dict] = None
-_RUNTIME_COST: Optional[dict] = None
-_RUNTIME_META: Optional[dict] = None
-_RUNTIME_BAL: Optional[dict] = None
-
-
-# ---------- Public compatibility API ----------
-def set_runtime_refs(
-    *,
-    position_qty: Optional[dict] = None,
-    position_cost: Optional[dict] = None,
-    token_meta: Optional[dict] = None,
-    token_balances: Optional[dict] = None,
-) -> None:
-    """
-    Older main.py versions import this to inject live runtime state.
-    This module does not REQUIRE these refs, but we accept them for compatibility.
-    """
-    global _RUNTIME_QTY, _RUNTIME_COST, _RUNTIME_META, _RUNTIME_BAL
-    _RUNTIME_QTY = position_qty
-    _RUNTIME_COST = position_cost
-    _RUNTIME_META = token_meta
-    _RUNTIME_BAL = token_balances
-
-
-def get_wallet_snapshot() -> Tuple[float, List[dict], float, List[dict]]:
-    """
-    Returns (total_usd, breakdown, unrealized_usd, receipts)
-    - breakdown rows: {"token","token_addr","amount","price_usd","usd_value"}
-    """
-    pos_qty, pos_cost, key_to_symbol = _rebuild_open_positions_from_ledger()
-
-    # If runtime refs are provided, optionally overlay CRO balance price/unrealized ONLY
-    # to keep behavior conservative and avoid double counting quantities from live scans.
-    # We DO NOT add runtime quantities here—ledger is the source of truth for /holdings.
-    total_usd = 0.0
-    unrealized = 0.0
-    breakdown: List[dict] = []
-    receipts: List[dict] = []
-
-    # Ensure CRO always present
-    if "CRO" not in pos_qty:
-        pos_qty["CRO"] = 0.0
-        pos_cost["CRO"] = 0.0
-        key_to_symbol["CRO"] = "CRO"
-
-    for key in list(pos_qty.keys()):
-        qty = float(pos_qty.get(key, 0.0))
-        # Keep CRO even if zero; skip other zeros
-        if qty <= 1e-12 and key != "CRO":
-            continue
-
-        sym = _symbol_for_key(key, key_to_symbol)
-        is_receipt = sym in RECEIPT_SYMBOLS or sym == "TCRO"
-
-        price = _live_price_for_key(key, sym)
-        usd_value = qty * (price or 0.0)
-
-        cost = float(pos_cost.get(key, 0.0))
-        unrl = 0.0
-        if qty > 1e-12 and price and price > 0:
-            unrl = qty * price - cost
-
-        row = {
-            "token": "CRO" if sym == "CRO" else sym,
-            "token_addr": key if (isinstance(key, str) and key.startswith("0x")) else None,
-            "amount": qty,
-            "price_usd": float(price or 0.0),
-            "usd_value": float(usd_value or 0.0),
-        }
-
-        if is_receipt:
-            receipts.append(row)
-        else:
-            breakdown.append(row)
-            total_usd += row["usd_value"]
-            unrealized += unrl
-
-    breakdown.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
-    receipts.sort(key=lambda b: float(b.get("usd_value", 0.0)), reverse=True)
-    return float(total_usd), breakdown, float(unrealized), receipts
-
-
-def format_snapshot_lines(
-    total_usd: float,
-    breakdown: List[dict],
-    unrealized_usd: float,
-    receipts: List[dict],
-) -> str:
-    """
-    Legacy formatter kept here for full backwards compatibility with some main.py versions
-    that import it from core.holdings. (Your project now also has telegram/formatters.py)
-    """
-    if not breakdown and not receipts:
-        return "📦 Κενά holdings."
-
-    def _fmt_amount(a) -> str:
-        try:
-            a = float(a)
-        except Exception:
-            return str(a)
-        if abs(a) >= 1:
-            return f"{a:,.4f}"
-        if abs(a) >= 0.0001:
-            return f"{a:.6f}"
-        return f"{a:.8f}"
-
-    def _fmt_price(p) -> str:
-        try:
-            p = float(p)
-        except Exception:
-            return str(p)
-        if p >= 1:
-            return f"{p:,.6f}"
-        if p >= 0.01:
-            return f"{p:.6f}"
-        if p >= 1e-6:
-            return f"{p:.8f}"
-        return f"{p:.10f}"
-
-    lines = ["*📦 Holdings (merged):*"]
-    for b in breakdown or []:
-        token = b.get("token") or "?"
-        amt = b.get("amount", 0.0)
-        prc = b.get("price_usd", 0.0)
-        usd = b.get("usd_value", 0.0)
-        lines.append(f"• {token}: {_fmt_amount(amt)}  @ ${_fmt_price(prc)}  = ${_fmt_amount(usd)}")
-
-    if receipts:
-        lines.append("\n*Receipts:*")
-        for r in receipts:
-            token = r.get("token") or "?"
-            amt = r.get("amount", 0.0)
-            prc = r.get("price_usd", 0.0)
-            usd = r.get("usd_value", 0.0)
-            lines.append(f"• {token}: {_fmt_amount(amt)}  (@ ${_fmt_price(prc)} → ${_fmt_amount(usd)})")
-
-    lines.append(f"\nΣύνολο: ${_fmt_amount(total_usd)}")
-    if abs(float(unrealized_usd or 0.0)) > 1e-12:
-        lines.append(f"Unrealized: ${_fmt_amount(unrealized_usd)}")
-    return "\n".join(lines)
-
-
-# ---------- Internal helpers ----------
-def _now_dt() -> datetime:
-    return datetime.now(LOCAL_TZ)
-
-def _ymd(dt: Optional[datetime] = None) -> str:
-    return (dt or _now_dt()).strftime("%Y-%m-%d")
-
-def _read_json(path: str, default):
+def _safe_decimal(x: Any, default: str = "0") -> Decimal:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return Decimal(str(x))
     except Exception:
-        return default
+        return Decimal(default)
 
-def _list_ledger_files() -> List[str]:
-    files = []
+
+def _add_entry(snapshot: Dict[str, Dict[str, Decimal]], symbol: str, amount: Decimal) -> None:
+    if not symbol:
+        return
+    # Keep tCRO separate end-to-end
+    sym = symbol.strip()
+    if sym not in snapshot:
+        snapshot[sym] = {"amount": Decimal("0"), "usd_value": Decimal("0")}
+    snapshot[sym]["amount"] += amount
+
+
+def _iter_erc20_pairs(obj: Any) -> Iterable[Tuple[str, Decimal]]:
+    """
+    Accepts many shapes:
+      - dict { "JASMY": "123.45", "HBAR": 10 }
+      - list[ { "symbol": "JASMY", "amount": "123.45" }, ... ]
+      - list[ (symbol, amount), ... ]
+    Yields (symbol, Decimal(amount)).
+    """
+    if obj is None:
+        return []
+    # dict form
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k, _safe_decimal(v)
+        return
+    # list/iterable form
+    if isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                sym, amt = item
+                yield str(sym), _safe_decimal(amt)
+            elif isinstance(item, dict):
+                sym = item.get("symbol") or item.get("ticker") or item.get("sym") or item.get("token") or item.get("name")
+                amt = item.get("amount") or item.get("balance") or item.get("qty") or item.get("value")
+                if sym is not None and amt is not None:
+                    yield str(sym), _safe_decimal(amt)
+        return
+    # Fallback: nothing
+    return []
+
+
+def _maybe_get_erc20_balances(wallet_address: str):
+    """
+    Try multiple candidate functions that may exist in core.rpc.
+    Return None if none are available.
+    """
+    candidates = [
+        "get_erc20_balances",
+        "list_erc20_balances",
+        "get_token_balances",
+        "list_token_balances",
+    ]
+    for name in candidates:
+        if hasattr(rpc_mod, name):
+            try:
+                return getattr(rpc_mod, name)(wallet_address)
+            except Exception as e:
+                logging.warning(f"ERC20 balance fetch via {name} failed: {e}")
+                return None
+    return None
+
+
+def _price_for(symbol: str) -> Decimal:
+    """
+    Get USD price for a symbol with sensible fallbacks.
+    We try:
+      - direct symbol
+      - WCRO when asking for CRO (common canonical pair)
+    """
     try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"):
-                files.append(os.path.join(DATA_DIR, fn))
+        p = get_price_usd(symbol)
+        return _safe_decimal(p)
     except Exception:
         pass
-    files.sort()
-    return files
 
-def _rebuild_open_positions_from_ledger() -> Tuple[Dict[str, float], Dict[str, float], Dict[str, str]]:
+    # CRO often priced via WCRO
+    if symbol.upper() == "CRO":
+        try:
+            p = get_price_usd("WCRO")
+            return _safe_decimal(p)
+        except Exception:
+            return Decimal("0")
+
+    return Decimal("0")
+
+
+# ---------- Public API ----------
+
+def get_wallet_snapshot(wallet_address: str, include_usd: bool = True) -> Dict[str, Dict[str, Decimal]]:
     """
-    Build open positions strictly from ledger files (no RPC merge to avoid double counting).
-    Returns:
-      pos_qty:  key -> open qty   (key: 'CRO' or 0x<addr> or SYMBOL)
-      pos_cost: key -> open cost
-      key_to_symbol: key -> display symbol
+    Build a snapshot from whatever RPC helpers exist.
+    Returns: {symbol: {"amount": Decimal, "usd_value": Decimal}}
     """
-    pos_qty: Dict[str, float] = defaultdict(float)
-    pos_cost: Dict[str, float] = defaultdict(float)
-    key_to_symbol: Dict[str, str] = {}
+    snapshot: Dict[str, Dict[str, Decimal]] = {}
 
-    def _update(key: str, sym: str, signed_amount: float, price_usd: float):
-        # Record symbol for display
-        if sym:
-            key_to_symbol[key] = sym
-        qty = pos_qty[key]
-        cost = pos_cost[key]
-        if signed_amount > 1e-12:
-            pos_qty[key] = qty + signed_amount
-            pos_cost[key] = cost + signed_amount * (price_usd or 0.0)
-        elif signed_amount < -1e-12:
-            sell_qty = min(-signed_amount, qty) if qty > 1e-12 else 0.0
-            avg_cost = (cost / qty) if qty > 1e-12 else (price_usd or 0.0)
-            pos_qty[key] = max(0.0, qty - sell_qty)
-            pos_cost[key] = max(0.0, cost - avg_cost * sell_qty)
+    # 1) Native CRO
+    if hasattr(rpc_mod, "get_native_balance"):
+        try:
+            cro_amt = _safe_decimal(rpc_mod.get_native_balance(wallet_address))
+            _add_entry(snapshot, "CRO", cro_amt)
+        except Exception as e:
+            logging.exception(f"Failed to fetch native CRO balance: {e}")
+    else:
+        logging.warning("core.rpc.get_native_balance not found")
 
-    for path in _list_ledger_files():
-        data = _read_json(path, default=None)
-        if not isinstance(data, dict):
-            continue
-        for e in data.get("entries", []):
-            sym_raw = (e.get("token") or "").strip()
-            symU = sym_raw.upper() if sym_raw else sym_raw
-            addr = (e.get("token_addr") or "").strip().lower()
-            amt = float(e.get("amount") or 0.0)
-            prc = float(e.get("price_usd") or 0.0)
+    # 2) ERC-20 balances (if any helper exists)
+    erc20 = _maybe_get_erc20_balances(wallet_address)
+    if erc20 is not None:
+        try:
+            for sym, amt in _iter_erc20_pairs(erc20):
+                # Do NOT merge tCRO into CRO — keep distinct
+                _add_entry(snapshot, str(sym), _safe_decimal(amt))
+        except Exception as e:
+            logging.exception(f"Failed to process ERC-20 balances: {e}")
 
-            key = addr if (addr and addr.startswith("0x")) else (symU or sym_raw or "?")
-            _update(key, symU or sym_raw or "?", amt, prc)
+    # 3) Price to USD
+    if include_usd:
+        for sym, data in snapshot.items():
+            price = _price_for(sym)
+            data["usd_value"] = (data.get("amount", Decimal("0")) * price).quantize(Decimal("0.00000001"))
 
-    # Normalize near-zeros
-    for k, v in list(pos_qty.items()):
-        if abs(v) < 1e-10:
-            pos_qty[k] = 0.0
-
-    return pos_qty, pos_cost, key_to_symbol
-
-def _symbol_for_key(key: str, key_to_symbol: Dict[str, str]) -> str:
-    if isinstance(key, str) and key.startswith("0x"):
-        sym = key_to_symbol.get(key)
-        return sym if sym else key[:8].upper()
-    return (key_to_symbol.get(key) or key or "?").upper()
-
-def _live_price_for_key(key: str, sym_hint: str) -> float:
-    try:
-        if isinstance(key, str) and key.startswith("0x"):
-            p = get_price_usd(key)
-            if p:
-                return float(p)
-        p = get_price_usd(sym_hint or key)
-        return float(p or 0.0)
-    except Exception:
-        return 0.0
+    return snapshot
 
 
-# ---------- Optional convenience wrapper ----------
-def compute_holdings_merged() -> Tuple[float, List[dict], float, List[dict]]:
+def format_snapshot_lines(snapshot: Dict[str, Dict[str, Decimal]]) -> list[str]:
     """
-    Convenience alias for older code paths that expect this name from core.holdings.
-    Delegates to get_wallet_snapshot().
+    Convert snapshot dict into list of formatted text lines (stable ordering).
+    CRO first, then alphabetical.
     """
-    return get_wallet_snapshot()
+    ordered = sorted(snapshot.items(), key=lambda kv: (kv[0] != "CRO", kv[0].upper()))
+    lines = []
+    for sym, data in ordered:
+        amt = data.get("amount", Decimal("0"))
+        usd = data.get("usd_value", Decimal("0"))
+        # 8 decimals for amount, 2 for USD
+        lines.append(f"{sym}: {amt:.8f} ≈ ${usd:.2f}")
+    return lines
