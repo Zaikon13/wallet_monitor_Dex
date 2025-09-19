@@ -1,31 +1,41 @@
 # core/tz.py
-import os, time
+"""
+Timezone helpers.
+- Use TZ from environment (default UTC)
+- Provide now_local(), today_str() etc.
+"""
+
+import os
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# Θα οριστικοποιηθεί με tz_init() στην εκκίνηση
-LOCAL_TZ = ZoneInfo(os.getenv("TZ", "Europe/Athens"))
+# Read from env
+_TZ_NAME = os.getenv("TZ", "UTC")
 
-def tz_init(tz_str: str | None = None):
-    """Κλειδώνει το timezone σε όλο το process (Europe/Athens by default)."""
-    tz = (tz_str or os.getenv("TZ") or "Europe/Athens").strip()
-    os.environ["TZ"] = tz
-    try:
-        if hasattr(time, "tzset"):
-            time.tzset()
-    except Exception:
-        pass
-    global LOCAL_TZ
-    LOCAL_TZ = ZoneInfo(tz)
-    return LOCAL_TZ
+try:
+    LOCAL_TZ = ZoneInfo(_TZ_NAME)
+except Exception as e:
+    logging.warning(f"Invalid TZ '{_TZ_NAME}', falling back to UTC ({e})")
+    LOCAL_TZ = ZoneInfo("UTC")
 
-def now_dt():
+
+def now_local() -> datetime:
+    """
+    Return current datetime in configured local TZ.
+    """
     return datetime.now(LOCAL_TZ)
 
-def ymd(dt=None):
-    if dt is None: dt = now_dt()
-    return dt.strftime("%Y-%m-%d")
 
-def month_prefix(dt=None):
-    if dt is None: dt = now_dt()
-    return dt.strftime("%Y-%m")
+def today_str() -> str:
+    """
+    Return today's date as YYYY-MM-DD in local TZ.
+    """
+    return now_local().strftime("%Y-%m-%d")
+
+
+def datetime_str(dt: datetime) -> str:
+    """
+    Format datetime as ISO string in local TZ.
+    """
+    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
