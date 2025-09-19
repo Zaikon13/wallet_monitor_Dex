@@ -690,8 +690,7 @@ def send_daily_report():
     try:
         text = build_day_report_text()
         # Telegram API already handles escaping/chunking inside telegram/api.py
-        send_telegram_message(f"📒 Daily Report
-{text}")
+        send_telegram_message(f"📒 Daily Report\n{text}")
     except Exception as e:
         logging.exception("Failed to build or send daily report: %s", e)
         send_telegram_message("⚠️ Failed to generate daily report.")
