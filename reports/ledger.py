@@ -1,55 +1,136 @@
-import os, json
+# reports/ledger.py
+"""
+Ledger persistence & cost-basis tracking.
+- Append new transactions to daily ledger
+- Update/replay cost basis (FIFO)
+"""
+
+import os
+import json
+import logging
 from decimal import Decimal
+from typing import Dict, Any, List
+
 from core.tz import ymd
 
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-EPSILON = 1e-12
 
-def read_json(path, default):
+
+def _ledger_path(date_str: str) -> str:
+    return os.path.join(DATA_DIR, f"ledger_{date_str}.json")
+
+
+def append_ledger(entry: Dict[str, Any], date_str: str | None = None) -> None:
+    """
+    Append a single ledger entry to today's file.
+    Entry should be JSON-serializable.
+    """
+    if date_str is None:
+        date_str = ymd()
+    path = _ledger_path(date_str)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = []
+        data.append(entry)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.exception(f"Failed to append ledger entry: {e}")
+
+
+def load_ledger(date_str: str | None = None) -> List[Dict[str, Any]]:
+    """
+    Load all ledger entries for given day.
+    """
+    if date_str is None:
+        date_str = ymd()
+    path = _ledger_path(date_str)
+    if not os.path.exists(path):
+        return []
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return default
+    except Exception as e:
+        logging.exception(f"Failed to load ledger for {date_str}: {e}")
+        return []
 
-def write_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
 
-def data_file_for_today():
-    return os.path.join(DATA_DIR, f"transactions_{ymd()}.json")
+def update_cost_basis(ledger_entries: List[Dict[str, Any]]) -> Dict[str, Decimal]:
+    """
+    Recompute cost basis per symbol using FIFO.
+    Returns {symbol: Decimal(cost_basis)}.
+    """
+    basis: Dict[str, Decimal] = {}
+    qty: Dict[str, Decimal] = {}
 
-def append_ledger(entry: dict):
-    path = data_file_for_today()
-    data = read_json(path, default={"date": ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
-    data["entries"].append(entry)
-    data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + float(entry.get("usd_value") or 0.0)
-    data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + float(entry.get("realized_pnl") or 0.0)
-    write_json(path, data)
+    for entry in ledger_entries:
+        sym = entry.get("symbol")
+        amt = Decimal(str(entry.get("amount", "0")))
+        usd = Decimal(str(entry.get("usd_value", "0")))
+        if sym is None:
+            continue
 
-def replay_cost_basis_over_entries(pos_qty: dict, pos_cost: dict, entries: list, eps: float = EPSILON) -> float:
-    total_realized = 0.0
-    for e in entries or []:
-        key = (e.get("token_addr") or "").lower() or (e.get("token") or "").upper()
-        amt = float(e.get("amount") or 0.0)
-        pr = float(e.get("price_usd") or 0.0)
-        total_realized += update_cost_basis(pos_qty, pos_cost, key, amt, pr, eps=eps)
-    return total_realized
+        if amt > 0:
+            # Buy: increase basis and qty
+            prev_qty = qty.get(sym, Decimal("0"))
+            prev_basis = basis.get(sym, Decimal("0"))
+            qty[sym] = prev_qty + amt
+            basis[sym] = prev_basis + usd
+        else:
+            # Sell: reduce basis proportionally
+            prev_qty = qty.get(sym, Decimal("0"))
+            prev_basis = basis.get(sym, Decimal("0"))
+            sell_qty = -amt
+            if prev_qty > 0:
+                ratio = sell_qty / prev_qty
+                basis[sym] = prev_basis * (1 - ratio)
+                qty[sym] = prev_qty - sell_qty
+            else:
+                # Selling without holdings, log but continue
+                logging.warning(f"Selling {sell_qty} {sym} without qty in ledger")
 
-def update_cost_basis(pos_qty: dict, pos_cost: dict, token_key: str, signed_amount: float, price_usd: float, eps: float = EPSILON) -> float:
-    realized = 0.0
-    qty = pos_qty.get(token_key, 0.0)
-    cost = pos_cost.get(token_key, 0.0)
-    if signed_amount > eps:
-        pos_qty[token_key] = qty + signed_amount
-        pos_cost[token_key] = cost + signed_amount * (price_usd or 0.0)
-    elif signed_amount < -eps and qty > eps:
-        sell_qty = min(-signed_amount, qty)
-        avg_cost = (cost / qty) if qty > eps else (price_usd or 0.0)
-        realized = (price_usd - avg_cost) * sell_qty
-        pos_qty[token_key] = qty - sell_qty
-        pos_cost[token_key] = max(0.0, cost - avg_cost * sell_qty)
-    return realized
+    return basis
+
+
+def replay_cost_basis_over_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Replay cost basis calculation and attach running basis to each entry.
+    """
+    basis: Dict[str, Decimal] = {}
+    qty: Dict[str, Decimal] = {}
+
+    out: List[Dict[str, Any]] = []
+
+    for entry in entries:
+        sym = entry.get("symbol")
+        amt = Decimal(str(entry.get("amount", "0")))
+        usd = Decimal(str(entry.get("usd_value", "0")))
+
+        if sym is None:
+            out.append(entry)
+            continue
+
+        if amt > 0:
+            prev_qty = qty.get(sym, Decimal("0"))
+            prev_basis = basis.get(sym, Decimal("0"))
+            qty[sym] = prev_qty + amt
+            basis[sym] = prev_basis + usd
+        else:
+            prev_qty = qty.get(sym, Decimal("0"))
+            prev_basis = basis.get(sym, Decimal("0"))
+            sell_qty = -amt
+            if prev_qty > 0:
+                ratio = sell_qty / prev_qty
+                basis[sym] = prev_basis * (1 - ratio)
+                qty[sym] = prev_qty - sell_qty
+
+        enriched = dict(entry)
+        enriched["running_basis"] = str(basis.get(sym, Decimal("0")))
+        enriched["running_qty"] = str(qty.get(sym, Decimal("0")))
+        out.append(enriched)
+
+    return out
