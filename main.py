@@ -28,8 +28,8 @@ from zoneinfo import ZoneInfo
 
 # external helpers
 from utils.http import safe_get, safe_json
-from telegram.api import send_telegram_message
-from reports.day_report import build_day_report_text
+from telegram.api import send_telegram
+from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
 from reports.aggregates import aggregate_per_asset
 
@@ -1315,17 +1315,6 @@ def _handle_command(text: str):
         send_telegram("❓ Commands: /status /diag /rescan /holdings /show /dailysum /report /totals [today|month|all] /totalstoday /totalsmonth /pnl [scope] /watch ...")
 
 # ---------- Schedulers (Intraday/EOD) ----------
-def send_daily_report():
-    try:
-        text = build_day_report_text()
-        send_telegram_message(f"📒 Daily Report\n{text}")
-    except Exception as e:
-        logging.exception("Failed to build or send daily report")
-        send_telegram_message("⚠️ Failed to generate daily report.")
-
-# Scheduler binding
-schedule.every().day.at(EOD_TIME).do(send_daily_report)
-
 def _scheduler_loop():
     global _last_intraday_sent
     send_telegram("⏱ Scheduler online (intraday/EOD).")
