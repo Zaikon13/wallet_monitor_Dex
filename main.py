@@ -1,58 +1,67 @@
-# main.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cronos DeFi Sentinel — main.py (refactored: commands extracted)
-- Keeps all existing logic from your current file.
-- Extracts Telegram command routing into telegram/commands.py (CommandRouter).
-- Removes 'eps=' kwargs when calling update_cost_basis() to fix TypeError.
-- Preserves tCRO/CRO & RECEIPT_SYMBOLS handling exactly as before.
+Cronos DeFi Sentinel — main.py (refactored & complete)
+
+- Startup, schedulers, Telegram long-poll.
+- Wallet monitor (native + ERC-20 via Etherscan V2).
+- Dexscreener tracked pairs monitor + auto-discovery.
+- Alerts (pump/dump) & Guard (entry/peak trailing).
+- Daily summaries & EOD report delivery.
+- Cost-basis (realized/unrealized) using reports.ledger helpers.
+- Holdings logic EXTRACTED to core/holdings.py and wired via set_runtime_refs().
+- Command routing EXTRACTED to telegram/commands.py (CommandRouter).
+
+Notes
+-----
+- Keeps tCRO distinct from CRO end-to-end; RECEIPT_SYMBOLS are separated in holdings.
+- Removes any unsupported 'eps=' kwarg when calling update_cost_basis() (fixes previous TypeError).
+- Europe/Athens timezone by default (configurable via TZ).
 """
 
-import os, sys, time, json, threading, logging, signal
+import os, sys, time, json, threading, logging, signal, requests
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
-
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
-import requests
+from typing import Iterable
 
-# external helpers
+# ---------- External helpers / project modules ----------
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
 from reports.aggregates import aggregate_per_asset
 
-# NEW: central command router
+# Command router (extracted)
 from telegram.commands import CommandRouter
 
-# ---------- Bootstrap / TZ ----------
+# Holdings (extracted)
+from core.holdings import (
+    set_runtime_refs,
+    gather_all_known_token_contracts,
+    compute_holdings_merged,
+    compute_holdings_usd_from_history_positions,
+    simple_snapshot,
+)
+
+# ---------- Bootstrap / ENV / TZ ----------
 load_dotenv()
+
 def _alias_env(src, dst):
     if os.getenv(dst) is None and os.getenv(src) is not None:
         os.environ[dst] = os.getenv(src)
 _alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
 _alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
 
-def _init_tz(tz_str: str | None):
-    tz = tz_str or "Europe/Athens"
-    os.environ["TZ"] = tz
-    try:
-        import time as _t
-        if hasattr(_t, "tzset"):
-            _t.tzset()
-    except Exception:
-        pass
-    return ZoneInfo(tz)
-
 TZ = os.getenv("TZ", "Europe/Athens")
-LOCAL_TZ = _init_tz(TZ)
+LOCAL_TZ = ZoneInfo(TZ)
+
 def now_dt(): return datetime.now(LOCAL_TZ)
 def ymd(dt=None): return (dt or now_dt()).strftime("%Y-%m-%d")
 def month_prefix(dt=None): return (dt or now_dt()).strftime("%Y-%m")
 
-# ---------- ENV ----------
+# ---------- ENV values ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID") or ""
 WALLET_ADDRESS     = (os.getenv("WALLET_ADDRESS") or "").lower()
@@ -111,7 +120,7 @@ ATH_PATH         = os.path.join(DATA_DIR, "ath.json")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", stream=sys.stdout)
 log = logging.getLogger("wallet-monitor")
 
-# ---------- Runtime ----------
+# ---------- Runtime state ----------
 shutdown_event = threading.Event()
 _seen_tx_hashes = set()
 _last_prices, _price_history, _last_pair_tx = {}, {}, {}
@@ -137,7 +146,10 @@ _guard = {}  # key -> {"entry","peak","start_ts"}
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ---------- Utils ----------
+# Wire holdings runtime dicts into the extracted module
+set_runtime_refs(_position_qty, _position_cost, _token_meta, _token_balances)
+
+# ---------- Small utils ----------
 def _format_amount(a):
     try: a=float(a)
     except: return str(a)
@@ -169,7 +181,7 @@ def write_json(path, obj):
 
 def data_file_for_today(): return os.path.join(DATA_DIR, f"transactions_{ymd()}.json")
 
-# ---------- ATH ----------
+# ---------- ATH store ----------
 def load_ath():
     global ATH
     ATH = read_json(ATH_PATH, default={})
@@ -182,9 +194,9 @@ def update_ath(key: str, live_price: float):
         ATH[key] = live_price; save_ath()
         send_telegram(f"🏆 New ATH {key}: ${_format_price(live_price)}")
 
-# ---------- Pricing (Dexscreener) ----------
+# ---------- Dexscreener pricing ----------
 PRICE_ALIASES = {"tcro":"cro"}
-_HISTORY_LAST_PRICE = {}
+_HISTORY_LAST_PRICE = {}  # filled from history files in holdings module; we keep a light view here
 
 def _pick_best_price(pairs):
     if not pairs: return None
@@ -211,22 +223,6 @@ def _pairs_for_token_addr(addr: str):
         data = safe_json(safe_get(DEX_BASE_SEARCH, params={"q": addr}, timeout=10)) or {}
         pairs = data.get("pairs") or []
     return pairs
-
-def _history_price_fallback(query_key: str, symbol_hint: str=None):
-    if not query_key: return None
-    k=query_key.strip()
-    if not k: return None
-    if k.startswith("0x"):
-        p=_HISTORY_LAST_PRICE.get(k)
-        if p and p>0: return p
-    sym=(symbol_hint or k)
-    sym=(PRICE_ALIASES.get(sym.lower(), sym.lower())).upper()
-    p=_HISTORY_LAST_PRICE.get(sym)
-    if p and p>0: return p
-    if sym=="CRO":
-        p=_HISTORY_LAST_PRICE.get("CRO")
-        if p and p>0: return p
-    return None
 
 def _price_cro_fallback():
     for q in ["wcro usdc","cro usdc","cro busd","cro dai"]:
@@ -262,8 +258,9 @@ def get_price_usd(symbol_or_addr: str):
     except: price=None
 
     if (price is None) or (not price) or (float(price)<=0):
-        hist=_history_price_fallback(symbol_or_addr, symbol_hint=symbol_or_addr)
-        if hist and hist>0: price=float(hist)
+        # best-effort history fallback (only for CRO symbol to avoid double-sources here)
+        if str(symbol_or_addr).upper()=="CRO":
+            price = _HISTORY_LAST_PRICE.get("CRO")
 
     PRICE_CACHE[key]=(price, now)
     return price
@@ -294,7 +291,7 @@ def get_change_and_price_for_symbol_or_addr(sym_or_addr: str):
     ds_url=f"https://dexscreener.com/cronos/{best.get('pairAddress')}"
     return (price, ch24, ch2h, ds_url)
 
-# ---------- Etherscan ----------
+# ---------- Etherscan (native & token txs) ----------
 def fetch_latest_wallet_txs(limit=25):
     if not WALLET_ADDRESS or not ETHERSCAN_API: return []
     params={"chainid":CRONOS_CHAINID,"module":"account","action":"txlist",
@@ -323,360 +320,26 @@ def _replay_today_cost_basis():
     _realized_pnl_today=float(total_realized)
     data["realized_pnl"]=float(total_realized); write_json(path,data)
 
-# ---------- History maps ----------
-def _build_history_maps():
-    symbol_to_contract, symbol_conflict = {}, set()
-    files=[]
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"): files.append(fn)
-    except Exception as ex: log.exception("listdir data error: %s", ex)
-    files.sort()
-    for fn in files:
-        data=read_json(os.path.join(DATA_DIR,fn), default=None)
-        if not isinstance(data,dict): continue
-        for e in data.get("entries",[]):
-            sym=(e.get("token") or "").strip()
-            addr=(e.get("token_addr") or "").strip().lower()
-            p=float(e.get("price_usd") or 0.0)
-            if p>0:
-                if addr and addr.startswith("0x"): _HISTORY_LAST_PRICE[addr]=p
-                if sym: _HISTORY_LAST_PRICE[sym.upper()]=p
-            if sym and addr and addr.startswith("0x"):
-                if sym in symbol_to_contract and symbol_to_contract[sym]!=addr:
-                    symbol_conflict.add(sym)
-                else:
-                    symbol_to_contract.setdefault(sym, addr)
-    for s in symbol_conflict: symbol_to_contract.pop(s,None)
-    return symbol_to_contract
+# ---------- Small helpers for TX handling ----------
+def _remember_token_event(key_tuple):
+    if key_tuple in _seen_token_events: return False
+    _seen_token_events.add(key_tuple); _seen_token_events_q.append(key_tuple)
+    if len(_seen_token_events_q)==_TOKEN_EVENT_LRU_MAX:
+        while len(_seen_token_events)>_TOKEN_EVENT_LRU_MAX:
+            old=_seen_token_events_q.popleft()
+            if old in _seen_token_events: _seen_token_events.remove(old)
+    return True
 
-# ---------- RPC (minimal) ----------
-WEB3=None
-ERC20_ABI_MIN=[
-    {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
-    {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
-    {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
-    {"constant":True,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-]
-TRANSFER_TOPIC0="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+def _remember_token_hash(h):
+    if not h: return True
+    if h in _seen_token_hashes: return False
+    _seen_token_hashes.add(h); _seen_token_hashes_q.append(h)
+    if len(_seen_token_hashes_q)==_TOKEN_HASH_LRU_MAX:
+        while len(_seen_token_hashes)>_TOKEN_HASH_LRU_MAX:
+            old=_seen_token_hashes_q.popleft()
+            if old in _seen_token_hashes: _seen_token_hashes.remove(old)
+    return True
 
-def _to_checksum(addr:str):
-    try:
-        from web3 import Web3
-        return Web3.to_checksum_address(addr)
-    except: return addr
-
-def rpc_init():
-    global WEB3
-    if not CRONOS_RPC_URL:
-        log.warning("CRONOS_RPC_URL not set; RPC disabled."); return False
-    try:
-        from web3 import Web3
-        WEB3=Web3(Web3.HTTPProvider(CRONOS_RPC_URL, request_kwargs={"timeout":15}))
-        ok=WEB3.is_connected()
-        if not ok: log.warning("Web3 not connected.")
-        return ok
-    except Exception as e:
-        log.exception("web3 init error: %s", e); return False
-
-def rpc_block_number():
-    try: return WEB3.eth.block_number if WEB3 else None
-    except: return None
-
-def rpc_get_native_balance(addr:str):
-    try:
-        wei=WEB3.eth.get_balance(addr)
-        return float(wei)/(10**18)
-    except: return 0.0
-
-_rpc_sym_cache,_rpc_dec_cache={},{}
-def rpc_get_symbol_decimals(contract:str):
-    if contract in _rpc_sym_cache and contract in _rpc_dec_cache:
-        return _rpc_sym_cache[contract], _rpc_dec_cache[contract]
-    try:
-        c=WEB3.eth.contract(address=_to_checksum(contract), abi=ERC20_ABI_MIN)
-        sym=c.functions.symbol().call(); dec=int(c.functions.decimals().call())
-        _rpc_sym_cache[contract]=sym; _rpc_dec_cache[contract]=dec
-        return sym,dec
-    except:
-        _rpc_sym_cache[contract]=contract[:8].upper(); _rpc_dec_cache[contract]=18
-        return _rpc_sym_cache[contract], _rpc_dec_cache[contract]
-
-def rpc_get_erc20_balance(contract:str, owner:str):
-    try:
-        c=WEB3.eth.contract(address=_to_checksum(contract), abi=ERC20_ABI_MIN)
-        bal=c.functions.balanceOf(_to_checksum(owner)).call()
-        _,dec=rpc_get_symbol_decimals(contract)
-        return float(bal)/(10**dec)
-    except: return 0.0
-
-def rpc_discover_token_contracts_by_logs(owner:str, blocks_back:int, chunk:int):
-    if not WEB3: return set()
-    latest=rpc_block_number()
-    if not latest: return set()
-    start=max(1, latest - max(1, blocks_back))
-    found=set()
-    try:
-        wallet_topic="0x"+"0"*24+owner.lower().replace("0x","")
-        frm=start
-        while frm<=latest:
-            to=min(latest, frm+chunk-1)
-            for topics in [[TRANSFER_TOPIC0, wallet_topic],[TRANSFER_TOPIC0,None,wallet_topic]]:
-                try:
-                    logs=WEB3.eth.get_logs({"fromBlock":frm,"toBlock":to,"topics":topics})
-                    for lg in logs:
-                        addr=(lg.get("address") or "").lower()
-                        if addr.startswith("0x"): found.add(addr)
-                except: pass
-            frm=to+1
-    except Exception as e:
-        log.debug("rpc_discover_token_contracts_by_logs err: %s", e)
-    return found
-
-def rpc_discover_wallet_tokens(window_blocks:int=None, chunk:int=None):
-    window_blocks=window_blocks or LOG_SCAN_BLOCKS
-    chunk=chunk or LOG_SCAN_CHUNK
-    if not rpc_init():
-        log.warning("rpc_discover_wallet_tokens: RPC not connected."); return 0
-    contracts=set()
-    try:
-        head=rpc_block_number()
-        if head is None: raise RuntimeError("no block number")
-        start=max(0, head-window_blocks)
-        wallet_cs=_to_checksum(WALLET_ADDRESS)
-        topic_wallet="0x"+"0"*24+wallet_cs.lower().replace("0x","")
-        def _scan(from_topic,to_topic):
-            nonlocal contracts
-            frm=start
-            while frm<=head:
-                to=min(head, frm+chunk-1)
-                try:
-                    logs=WEB3.eth.get_logs({"fromBlock":frm,"toBlock":to,"topics":[TRANSFER_TOPIC0,from_topic,to_topic]})
-                    for lg in logs:
-                        addr=(lg.get("address") or "").lower()
-                        if addr.startswith("0x"): contracts.add(addr)
-                except Exception as e:
-                    log.debug("get_logs %s-%s: %s", frm,to,e); time.sleep(0.2)
-                frm=to+1
-        _scan(topic_wallet,None)
-        _scan(None,topic_wallet)
-    except Exception as e:
-        log.warning("rpc_discover_wallet_tokens (RPC phase) failed: %s", e)
-
-    if not contracts:
-        try:
-            for t in fetch_latest_token_txs(limit=1000) or []:
-                ca=(t.get("contractAddress") or "").lower()
-                if ca.startswith("0x"): contracts.add(ca)
-            if contracts: log.info("Etherscan fallback discovered %s token contracts.", len(contracts))
-        except Exception as e:
-            log.warning("Etherscan fallback failed: %s", e)
-
-    if not contracts:
-        log.info("rpc_discover_wallet_tokens: no contracts discovered."); return 0
-
-    found_positive=0
-    for addr in sorted(contracts):
-        try:
-            sym,dec=rpc_get_symbol_decimals(addr)
-            bal=rpc_get_erc20_balance(addr, WALLET_ADDRESS)
-            if bal>EPSILON:
-                _token_balances[addr]=bal
-                _token_meta[addr]={"symbol":sym or addr[:8].upper(),"decimals":dec or 18}
-                found_positive+=1
-        except Exception as e:
-            log.debug("discover balance/meta error %s: %s", addr, e)
-            continue
-    log.info("rpc_discover_wallet_tokens: positive-balance tokens discovered: %s", found_positive)
-    return found_positive
-
-# ---------- Holdings (RPC / History / Merge) ----------
-def gather_all_known_token_contracts():
-    known=set()
-    for k in list(_token_meta.keys()):
-        if isinstance(k,str) and k.startswith("0x"): known.add(k.lower())
-    symbol_to_contract=_build_history_maps()
-    for addr in symbol_to_contract.values():
-        if addr and addr.startswith("0x"): known.add(addr.lower())
-    try:
-        for t in fetch_latest_token_txs(limit=100) or []:
-            addr=(t.get("contractAddress") or "").lower()
-            if addr.startswith("0x"): known.add(addr)
-    except: pass
-    try:
-        if rpc_init():
-            rpc_found=rpc_discover_token_contracts_by_logs(WALLET_ADDRESS, LOG_SCAN_BLOCKS, LOG_SCAN_CHUNK)
-            known |= set(rpc_found or [])
-    except: pass
-    for item in [x.strip().lower() for x in TOKENS.split(",") if x.strip()]:
-        if item.startswith("cronos/"):
-            _,addr=item.split("/",1)
-            if addr.startswith("0x"): known.add(addr)
-    return known
-
-def compute_holdings_usd_via_rpc():
-    total, breakdown, unrealized = 0.0, [], 0.0
-    _=_build_history_maps()
-    cro_amt=0.0
-    if rpc_init():
-        try: cro_amt=rpc_get_native_balance(WALLET_ADDRESS)
-        except: cro_amt=0.0
-    if cro_amt>EPSILON:
-        cro_price=get_price_usd("CRO") or 0.0
-        cro_val=cro_amt*cro_price; total+=cro_val
-        breakdown.append({"token":"CRO","token_addr":None,"amount":cro_amt,"price_usd":cro_price,"usd_value":cro_val})
-        rem_qty=_position_qty.get("CRO",0.0); rem_cost=_position_cost.get("CRO",0.0)
-        if rem_qty>EPSILON and _nonzero(cro_price): unrealized += (cro_amt*cro_price - rem_cost)
-    contracts=gather_all_known_token_contracts()
-    for addr in sorted(list(contracts)):
-        try:
-            bal=rpc_get_erc20_balance(addr, WALLET_ADDRESS)
-            if bal<=EPSILON: continue
-            sym,dec=rpc_get_symbol_decimals(addr)
-            pr=get_price_usd(addr) or 0.0
-            val=bal*pr; total+=val
-            breakdown.append({"token":sym,"token_addr":addr,"amount":bal,"price_usd":pr,"usd_value":val})
-            rem_qty=_position_qty.get(addr,0.0); rem_cost=_position_cost.get(addr,0.0)
-            if rem_qty>EPSILON and _nonzero(pr): unrealized += (bal*pr - rem_cost)
-        except: continue
-    breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
-    return total, breakdown, unrealized
-
-def rebuild_open_positions_from_history():
-    pos_qty, pos_cost = defaultdict(float), defaultdict(float)
-    symbol_to_contract=_build_history_maps()
-
-    def _update(pos_qty,pos_cost,token_key,signed_amount,price_usd):
-        qty=pos_qty[token_key]; cost=pos_cost[token_key]
-        if signed_amount>EPSILON:
-            pos_qty[token_key]=qty+signed_amount
-            pos_cost[token_key]=cost+signed_amount*(price_usd or 0.0)
-        elif signed_amount<-EPSILON and qty>EPSILON:
-            sell_qty=min(-signed_amount, qty)
-            avg_cost=(cost/qty) if qty>EPSILON else (price_usd or 0.0)
-            pos_qty[token_key]=qty-sell_qty
-            pos_cost[token_key]=max(0.0, cost - avg_cost*sell_qty)
-
-    files=[]
-    try:
-        for fn in os.listdir(DATA_DIR):
-            if fn.startswith("transactions_") and fn.endswith(".json"): files.append(fn)
-    except Exception as ex: log.exception("listdir data error: %s", ex)
-    files.sort()
-
-    for fn in files:
-        data=read_json(os.path.join(DATA_DIR,fn), default=None)
-        if not isinstance(data,dict): continue
-        for e in data.get("entries",[]):
-            sym_raw=(e.get("token") or "").strip()
-            addr_raw=(e.get("token_addr") or "").strip().lower()
-            amt=float(e.get("amount") or 0.0)
-            pr=float(e.get("price_usd") or 0.0)
-            symU=sym_raw.upper() if sym_raw else sym_raw
-            if addr_raw and addr_raw.startswith("0x"): key=addr_raw
-            else:
-                mapped=symbol_to_contract.get(sym_raw) or symbol_to_contract.get(symU)
-                key=mapped if (mapped and mapped.startswith("0x")) else (symU or sym_raw or "?")
-            _update(pos_qty,pos_cost,key,amt,pr)
-
-    for k,v in list(pos_qty.items()):
-        if abs(v)<1e-10: pos_qty[k]=0.0
-    return pos_qty, pos_cost
-
-def compute_holdings_usd_from_history_positions():
-    pos_qty,pos_cost=rebuild_open_positions_from_history()
-    total, breakdown, unrealized = 0.0, [], 0.0
-
-    def _sym_for_key(key):
-        if isinstance(key,str) and key.startswith("0x"):
-            return _token_meta.get(key,{}).get("symbol") or key[:8].upper()
-        return str(key)
-
-    def _price_for(key, sym_hint):
-        if isinstance(key,str) and key.startswith("0x"):
-            p=get_price_usd(key)
-        else:
-            sym_l=PRICE_ALIASES.get(sym_hint.lower(), sym_hint.lower())
-            p=get_price_usd(sym_l)
-        if (p is None) or (not p) or (float(p)<=0):
-            p=_history_price_fallback(key if (isinstance(key,str) and key.startswith("0x")) else sym_hint, symbol_hint=sym_hint) or 0.0
-        return float(p or 0.0)
-
-    for key,amt in pos_qty.items():
-        amt=max(0.0,float(amt))
-        if amt<=EPSILON: continue
-        sym=_sym_for_key(key)
-        p=_price_for(key, sym); v=amt*p
-        total+=v
-        breakdown.append({"token":sym,"token_addr": key if (isinstance(key,str) and key.startswith("0x")) else None,
-                          "amount":amt,"price_usd":p,"usd_value":v})
-        cost=pos_cost.get(key,0.0)
-        if amt>EPSILON and _nonzero(p): unrealized += (amt*p - cost)
-
-    for b in breakdown:
-        if b["token"].upper()=="TCRO": pass
-        elif b["token"].upper()=="CRO" or b["token_addr"] is None:
-            b["token"]="CRO"
-
-    breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
-    return total, breakdown, unrealized
-
-def compute_holdings_merged():
-    total_r, br_r, unrl_r = compute_holdings_usd_via_rpc()
-    total_h, br_h, unrl_h = compute_holdings_usd_from_history_positions()
-
-    def _key(b):
-        addr=b.get("token_addr"); sym=(b.get("token") or "").upper()
-        return addr.lower() if (isinstance(addr,str) and addr.startswith("0x")) else sym
-
-    merged={}
-    def _add(b):
-        k=_key(b)
-        if not k: return
-        cur=merged.get(k, {"token":b["token"],"token_addr":b.get("token_addr"),
-                           "amount":0.0,"price_usd":0.0,"usd_value":0.0})
-        cur["token"]=b["token"] or cur["token"]
-        cur["token_addr"]=b.get("token_addr", cur.get("token_addr"))
-        cur["amount"] += float(b.get("amount") or 0.0)
-        pr=float(b.get("price_usd") or 0.0)
-        if pr>0: cur["price_usd"]=pr
-        cur["usd_value"]=cur["amount"]*(cur["price_usd"] or 0.0)
-        merged[k]=cur
-
-    for b in br_h or []: _add(b)
-    for b in br_r or []: _add(b)
-
-    receipts, breakdown, total = [], [], 0.0
-    for rec in merged.values():
-        symU=(rec["token"] or "").upper()
-        if symU in RECEIPT_SYMBOLS or symU=="TCRO":
-            receipts.append(rec); continue
-        if symU=="CRO": rec["token"]="CRO"
-        rec["usd_value"]=float(rec.get("amount",0.0))*float(rec.get("price_usd",0.0) or 0.0)
-        total+=rec["usd_value"]; breakdown.append(rec)
-
-    breakdown.sort(key=lambda b: float(b.get("usd_value",0.0)), reverse=True)
-    unrealized = unrl_r + unrl_h
-    return total, breakdown, unrealized, receipts
-
-# ---------- Day report wrapper ----------
-def build_day_report_text():
-    date_str=ymd()
-    path=data_file_for_today()
-    data=read_json(path, default={"date":date_str,"entries":[],"net_usd_flow":0.0,"realized_pnl":0.0})
-    entries=data.get("entries",[])
-    net_flow=float(data.get("net_usd_flow",0.0))
-    realized_today_total=float(data.get("realized_pnl",0.0))
-    holdings_total, breakdown, unrealized, _receipts = compute_holdings_merged()
-    if not breakdown:
-        holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
-    return _compose_day_report(
-        date_str=date_str, entries=entries, net_flow=net_flow,
-        realized_today_total=realized_today_total, holdings_total=holdings_total,
-        breakdown=breakdown, unrealized=unrealized, data_dir=DATA_DIR
-    )
-
-# ---------- Mini summaries & TX handlers ----------
 def _mini_summary_line(token_key, symbol_shown):
     open_qty=_position_qty.get(token_key,0.0)
     open_cost=_position_cost.get(token_key,0.0)
@@ -691,6 +354,7 @@ def _mini_summary_line(token_key, symbol_shown):
         f"   Avg: ${_format_price((open_cost/open_qty) if open_qty>EPSILON else 0)} | Unreal: ${_format_amount(unreal)}"
     )
 
+# ---------- Handlers: Native CRO & ERC-20 ----------
 def handle_native_tx(tx: dict):
     h=tx.get("hash")
     if not h or h in _seen_tx_hashes: return
@@ -726,25 +390,6 @@ def handle_native_tx(tx: dict):
         "price_usd": price, "usd_value": usd_value, "realized_pnl": realized,
         "from": frm, "to": to
     })
-
-def _remember_token_event(key_tuple):
-    if key_tuple in _seen_token_events: return False
-    _seen_token_events.add(key_tuple); _seen_token_events_q.append(key_tuple)
-    if len(_seen_token_events_q)==_TOKEN_EVENT_LRU_MAX:
-        while len(_seen_token_events)>_TOKEN_EVENT_LRU_MAX:
-            old=_seen_token_events_q.popleft()
-            if old in _seen_token_events: _seen_token_events.remove(old)
-    return True
-
-def _remember_token_hash(h):
-    if not h: return True
-    if h in _seen_token_hashes: return False
-    _seen_token_hashes.add(h); _seen_token_hashes_q.append(h)
-    if len(_seen_token_hashes_q)==_TOKEN_HASH_LRU_MAX:
-        while len(_seen_token_hashes)>_TOKEN_HASH_LRU_MAX:
-            old=_seen_token_hashes_q.popleft()
-            if old in _seen_token_hashes: _seen_token_hashes.remove(old)
-    return True
 
 def handle_erc20_tx(t: dict):
     h=t.get("hash") or ""
@@ -890,10 +535,8 @@ def monitor_tracked_pairs_loop():
                 try: price_val=float(pair.get("priceUsd") or 0)
                 except: price_val=None
                 if price_val and price_val>0:
-                    # keep prev before update to compute proper delta
                     prev=_last_prices.get(s)
                     update_price_history(s, price_val)
-                    # spike check
                     spike_pct=detect_spike(s)
                     if spike_pct is not None:
                         try: vol_h1=float((pair.get("volume") or {}).get("h1") or 0)
@@ -903,7 +546,6 @@ def monitor_tracked_pairs_loop():
                             if _pair_cooldown_ok(f"spike:{s}"):
                                 send_telegram(f"🚨 Spike on {symbol}: {spike_pct:.2f}%\nPrice: ${_format_price(price_val)}")
                                 _price_history[s].clear(); _last_prices[s]=price_val
-                    # price move vs prev
                     if prev and prev>0:
                         delta=(price_val-prev)/prev*100.0
                         if abs(delta)>=PRICE_MOVE_THRESHOLD and _pair_cooldown_ok(f"move:{s}"):
@@ -1103,7 +745,8 @@ def summarize_today_per_asset():
         if prc>0: rec["last_price_seen"]=prc
 
     result=[]
-    _,_,_,_ = compute_holdings_merged()
+    # Ensure positions are up to date for unreal calc
+    _replay_today_cost_basis()
     for key,rec in agg.items():
         if rec["token_addr"]:
             price_now=get_price_usd(rec["token_addr"]) or rec["last_price_seen"]; gkey=rec["token_addr"]
@@ -1148,22 +791,7 @@ def _format_daily_sum_message():
 def build_daily_sum_text() -> str:
     return _format_daily_sum_message()
 
-def format_totals(scope:str):
-    scope=(scope or "all").lower()
-    rows=aggregate_per_asset(_load_entries_for_totals(scope))
-    if not rows: return f"📊 Totals per Asset — {scope.capitalize()}: (no data)"
-    lines=[f"📊 Totals per Asset — {scope.capitalize()}:"]
-    for i,r in enumerate(rows,1):
-        lines.append(
-            f"{i}. {r['asset']}  "
-            f"IN: {_format_amount(r['in_qty'])} (${_format_amount(r['in_usd'])}) | "
-            f"OUT: {_format_amount(r['out_qty'])} (${_format_amount(r['out_usd'])}) | "
-            f"REAL: ${_format_amount(r['realized_usd'])}"
-        )
-    totals_line = f"\nΣύνολο realized: ${_format_amount(sum(float(x['realized_usd']) for x in rows))}"
-    lines.append(totals_line)
-    return "\n".join(lines)
-
+# ---------- Totals (/totals, /totalstoday, /totalsmonth, /pnl) ----------
 def _iter_ledger_files_for_scope(scope:str):
     files=[]
     if scope=="today":
@@ -1195,6 +823,39 @@ def _load_entries_for_totals(scope:str):
             side="IN" if amt>0 else "OUT"
             entries.append({"asset":sym,"side":side,"qty":abs(amt),"usd":usd,"realized_usd":realized})
     return entries
+
+def format_totals(scope:str):
+    scope=(scope or "all").lower()
+    rows=aggregate_per_asset(_load_entries_for_totals(scope))
+    if not rows: return f"📊 Totals per Asset — {scope.capitalize()}: (no data)"
+    lines=[f"📊 Totals per Asset — {scope.capitalize()}:"]
+    for i,r in enumerate(rows,1):
+        lines.append(
+            f"{i}. {r['asset']}  "
+            f"IN: {_format_amount(r['in_qty'])} (${_format_amount(r['in_usd'])}) | "
+            f"OUT: {_format_amount(r['out_qty'])} (${_format_amount(r['out_usd'])}) | "
+            f"REAL: ${_format_amount(r['realized_usd'])}"
+        )
+    totals_line = f"\nΣύνολο realized: ${_format_amount(sum(float(x['realized_usd']) for x in rows))}"
+    lines.append(totals_line)
+    return "\n".join(lines)
+
+# ---------- Day report wrapper ----------
+def build_day_report_text():
+    date_str=ymd()
+    path=data_file_for_today()
+    data=read_json(path, default={"date":date_str,"entries":[],"net_usd_flow":0.0,"realized_pnl":0.0})
+    entries=data.get("entries",[])
+    net_flow=float(data.get("net_usd_flow",0.0))
+    realized_today_total=float(data.get("realized_pnl",0.0))
+    holdings_total, breakdown, unrealized, _receipts = compute_holdings_merged()
+    if not breakdown:
+        holdings_total, breakdown, unrealized = compute_holdings_usd_from_history_positions()
+    return _compose_day_report(
+        date_str=date_str, entries=entries, net_flow=net_flow,
+        realized_today_total=realized_today_total, holdings_total=holdings_total,
+        breakdown=breakdown, unrealized=unrealized, data_dir=DATA_DIR
+    )
 
 # ---------- Wallet monitor loop ----------
 def wallet_monitor_loop():
@@ -1228,7 +889,7 @@ def _tg_api(method: str, **params):
         log.debug("tg api error %s: %s", method, e)
     return None
 
-def get_tracked_pairs():
+def get_tracked_pairs() -> Iterable[str]:
     return list(_tracked_pairs)
 
 def build_diag_text() -> str:
@@ -1237,7 +898,6 @@ def build_diag_text() -> str:
         f"WALLETADDRESS: {WALLET_ADDRESS}\n"
         f"CRONOSRPCURL set: {bool(CRONOS_RPC_URL)}\n"
         f"Etherscan key: {bool(ETHERSCAN_API)}\n"
-        f"LOGSCANBLOCKS={LOG_SCAN_BLOCKS} LOGSCANCHUNK={LOG_SCAN_CHUNK}\n"
         f"TZ={TZ} INTRADAYHOURS={INTRADAY_HOURS} EOD={EOD_HOUR:02d}:{EOD_MINUTE:02d}\n"
         f"Alerts every: {ALERTS_INTERVAL_MIN}m | Pump/Dump: {PUMP_ALERT_24H_PCT}/{DUMP_ALERT_24H_PCT}\n"
         f"Tracked pairs: {', '.join(sorted(_tracked_pairs)) or '(none)'}"
@@ -1253,7 +913,7 @@ def telegram_long_poll_loop():
         build_daily_sum_text=build_daily_sum_text,
         build_day_report_text=build_day_report_text,
         format_totals=format_totals,
-        rpc_discover_wallet_tokens=rpc_discover_wallet_tokens,
+        rpc_discover_wallet_tokens=lambda: gather_all_known_token_contracts() or 0,
         ensure_tracking_pair=ensure_tracking_pair,
         remove_tracking_pair=remove_tracking_pair,
         get_tracked_pairs=get_tracked_pairs,
