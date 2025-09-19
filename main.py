@@ -1,22 +1,12 @@
+# main.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cronos DeFi Sentinel — main.py (FULL, 3 parts)
-Features:
-- RPC snapshot (CRO + ERC-20)
-- Dexscreener pricing (+history fallback)
-- Cost-basis PnL (realized & unrealized)
-- Intraday/EOD reports
-- Alerts (24h pump/dump) & Guard window
-- Telegram long-poll commands:
-  /status, /diag, /rescan
-  /holdings, /show_wallet_assets, /showwalletassets, /show
-  /dailysum, /showdaily, /report
-  /totals, /totalstoday, /totalsmonth
-  /pnl [today|month|all]
-Compatible helpers:
-  utils/http.py, telegram/api.py, reports/day_report.py,
-  reports/ledger.py, reports/aggregates.py
+Cronos DeFi Sentinel — main.py (refactored: commands extracted)
+- Keeps all existing logic from your current file.
+- Extracts Telegram command routing into telegram/commands.py (CommandRouter).
+- Removes 'eps=' kwargs when calling update_cost_basis() to fix TypeError.
+- Preserves tCRO/CRO & RECEIPT_SYMBOLS handling exactly as before.
 """
 
 import os, sys, time, json, threading, logging, signal
@@ -25,6 +15,7 @@ from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
+import requests
 
 # external helpers
 from utils.http import safe_get, safe_json
@@ -32,6 +23,9 @@ from telegram.api import send_telegram
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
 from reports.aggregates import aggregate_per_asset
+
+# NEW: central command router
+from telegram.commands import CommandRouter
 
 # ---------- Bootstrap / TZ ----------
 load_dotenv()
@@ -325,7 +319,7 @@ def _replay_today_cost_basis():
     _position_qty.clear(); _position_cost.clear(); _realized_pnl_today=0.0
     path=data_file_for_today()
     data=read_json(path, default={"date": ymd(),"entries":[],"net_usd_flow":0.0,"realized_pnl":0.0})
-    total_realized=replay_cost_basis_over_entries(_position_qty,_position_cost,data.get("entries",[]),eps=EPSILON)
+    total_realized=replay_cost_basis_over_entries(_position_qty,_position_cost,data.get("entries",[]))
     _realized_pnl_today=float(total_realized)
     data["realized_pnl"]=float(total_realized); write_json(path,data)
 
@@ -680,8 +674,8 @@ def build_day_report_text():
         date_str=date_str, entries=entries, net_flow=net_flow,
         realized_today_total=realized_today_total, holdings_total=holdings_total,
         breakdown=breakdown, unrealized=unrealized, data_dir=DATA_DIR
-)
-# Continue in main_part2.py...
+    )
+
 # ---------- Mini summaries & TX handlers ----------
 def _mini_summary_line(token_key, symbol_shown):
     open_qty=_position_qty.get(token_key,0.0)
@@ -717,7 +711,8 @@ def handle_native_tx(tx: dict):
 
     _token_balances["CRO"]+=sign*amount_cro
     _token_meta["CRO"]={"symbol":"CRO","decimals":18}
-    realized=ledger_update_cost_basis(_position_qty,_position_cost,"CRO",sign*amount_cro,price,eps=EPSILON)
+    # FIX: remove unsupported 'eps' kwarg
+    realized=ledger_update_cost_basis(_position_qty,_position_cost,"CRO",sign*amount_cro,price)
 
     link=CRONOS_TX.format(txhash=h)
     send_telegram(
@@ -785,7 +780,8 @@ def handle_erc20_tx(t: dict):
     if abs(_token_balances[key])<1e-10: _token_balances[key]=0.0
     _token_meta[key]={"symbol":symbol,"decimals":decimals}
 
-    realized=ledger_update_cost_basis(_position_qty,_position_cost,key,sign*amount,(price or 0.0),eps=EPSILON)
+    # FIX: remove unsupported 'eps' kwarg
+    realized=ledger_update_cost_basis(_position_qty,_position_cost,key,sign*amount,(price or 0.0))
     try:
         if _nonzero(price):
             ath_key=token_addr if token_addr else symbol
@@ -836,6 +832,25 @@ def ensure_tracking_pair(chain: str, pair_address: str, meta: dict=None):
     title=f"{sym} ({s})" if sym else s
     send_telegram(f"🆕 Now monitoring pair: {title}\n{ds_link}")
 
+def remove_tracking_pair(slg_or_pair: str) -> bool:
+    """
+    Accepts either full slug 'cronos/<pairAddress>' or just '<pairAddress>'.
+    Returns True if removed.
+    """
+    key = slg_or_pair.strip().lower()
+    if not key:
+        return False
+    if not key.startswith("cronos/"):
+        key = f"cronos/{key}"
+    if key in _tracked_pairs:
+        _tracked_pairs.remove(key)
+        _last_prices.pop(key, None)
+        _last_pair_tx.pop(key, None)
+        _price_history.pop(key, None)
+        _known_pairs_meta.pop(key, None)
+        return True
+    return False
+
 def update_price_history(slg, price):
     hist=_price_history.get(slg) or deque(maxlen=PRICE_WINDOW)
     _price_history[slg]=hist; hist.append(price); _last_prices[slg]=price
@@ -875,7 +890,10 @@ def monitor_tracked_pairs_loop():
                 try: price_val=float(pair.get("priceUsd") or 0)
                 except: price_val=None
                 if price_val and price_val>0:
+                    # keep prev before update to compute proper delta
+                    prev=_last_prices.get(s)
                     update_price_history(s, price_val)
+                    # spike check
                     spike_pct=detect_spike(s)
                     if spike_pct is not None:
                         try: vol_h1=float((pair.get("volume") or {}).get("h1") or 0)
@@ -885,13 +903,13 @@ def monitor_tracked_pairs_loop():
                             if _pair_cooldown_ok(f"spike:{s}"):
                                 send_telegram(f"🚨 Spike on {symbol}: {spike_pct:.2f}%\nPrice: ${_format_price(price_val)}")
                                 _price_history[s].clear(); _last_prices[s]=price_val
-                prev=_last_prices.get(s)
-                if prev and price_val and prev>0:
-                    delta=(price_val-prev)/prev*100.0
-                    if abs(delta)>=PRICE_MOVE_THRESHOLD and _pair_cooldown_ok(f"move:{s}"):
-                        bt=pair.get("baseToken") or {}; symbol=bt.get("symbol") or s
-                        send_telegram(f"📈 Price move on {symbol}: {delta:.2f}%\nPrice: ${_format_price(price_val)} (prev ${_format_price(prev)})")
-                        _last_prices[s]=price_val
+                    # price move vs prev
+                    if prev and prev>0:
+                        delta=(price_val-prev)/prev*100.0
+                        if abs(delta)>=PRICE_MOVE_THRESHOLD and _pair_cooldown_ok(f"move:{s}"):
+                            bt=pair.get("baseToken") or {}; symbol=bt.get("symbol") or s
+                            send_telegram(f"📈 Price move on {symbol}: {delta:.2f}%\nPrice: ${_format_price(price_val)} (prev ${_format_price(prev)})")
+                            _last_prices[s]=price_val
                 last_tx=(pair.get("lastTx") or {}).get("hash")
                 if last_tx:
                     prev_tx=_last_pair_tx.get(s)
@@ -1126,7 +1144,26 @@ def _format_daily_sum_message():
     lines.append(f"*Σύνολο net flow σήμερα:* ${_format_amount(tot_flow)}")
     if _nonzero(tot_unrl): lines.append(f"*Σύνολο unreal (open τώρα):* ${_format_amount(tot_unrl)}")
     return "\n".join(lines)
-    # ---------- Totals (today|month|all) ----------
+
+def build_daily_sum_text() -> str:
+    return _format_daily_sum_message()
+
+def format_totals(scope:str):
+    scope=(scope or "all").lower()
+    rows=aggregate_per_asset(_load_entries_for_totals(scope))
+    if not rows: return f"📊 Totals per Asset — {scope.capitalize()}: (no data)"
+    lines=[f"📊 Totals per Asset — {scope.capitalize()}:"]
+    for i,r in enumerate(rows,1):
+        lines.append(
+            f"{i}. {r['asset']}  "
+            f"IN: {_format_amount(r['in_qty'])} (${_format_amount(r['in_usd'])}) | "
+            f"OUT: {_format_amount(r['out_qty'])} (${_format_amount(r['out_usd'])}) | "
+            f"REAL: ${_format_amount(r['realized_usd'])}"
+        )
+    totals_line = f"\nΣύνολο realized: ${_format_amount(sum(float(x['realized_usd']) for x in rows))}"
+    lines.append(totals_line)
+    return "\n".join(lines)
+
 def _iter_ledger_files_for_scope(scope:str):
     files=[]
     if scope=="today":
@@ -1159,22 +1196,6 @@ def _load_entries_for_totals(scope:str):
             entries.append({"asset":sym,"side":side,"qty":abs(amt),"usd":usd,"realized_usd":realized})
     return entries
 
-def format_totals(scope:str):
-    scope=(scope or "all").lower()
-    rows=aggregate_per_asset(_load_entries_for_totals(scope))
-    if not rows: return f"📊 Totals per Asset — {scope.capitalize()}: (no data)"
-    lines=[f"📊 Totals per Asset — {scope.capitalize()}:"]
-    for i,r in enumerate(rows,1):
-        lines.append(
-            f"{i}. {r['asset']}  "
-            f"IN: {_format_amount(r['in_qty'])} (${_format_amount(r['in_usd'])}) | "
-            f"OUT: {_format_amount(r['out_qty'])} (${_format_amount(r['out_usd'])}) | "
-            f"REAL: ${_format_amount(r['realized_usd'])}"
-        )
-    totals_line = f"\nΣύνολο realized: ${_format_amount(sum(float(x['realized_usd']) for x in rows))}"
-    lines.append(totals_line)
-    return "\n".join(lines)
-
 # ---------- Wallet monitor loop ----------
 def wallet_monitor_loop():
     send_telegram("📡 Wallet monitor started.")
@@ -1198,8 +1219,6 @@ def wallet_monitor_loop():
             time.sleep(1)
 
 # ---------- Telegram long-poll ----------
-import requests
-
 def _tg_api(method: str, **params):
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
@@ -1209,9 +1228,38 @@ def _tg_api(method: str, **params):
         log.debug("tg api error %s: %s", method, e)
     return None
 
+def get_tracked_pairs():
+    return list(_tracked_pairs)
+
+def build_diag_text() -> str:
+    return (
+        "🔧 Diagnostics\n"
+        f"WALLETADDRESS: {WALLET_ADDRESS}\n"
+        f"CRONOSRPCURL set: {bool(CRONOS_RPC_URL)}\n"
+        f"Etherscan key: {bool(ETHERSCAN_API)}\n"
+        f"LOGSCANBLOCKS={LOG_SCAN_BLOCKS} LOGSCANCHUNK={LOG_SCAN_CHUNK}\n"
+        f"TZ={TZ} INTRADAYHOURS={INTRADAY_HOURS} EOD={EOD_HOUR:02d}:{EOD_MINUTE:02d}\n"
+        f"Alerts every: {ALERTS_INTERVAL_MIN}m | Pump/Dump: {PUMP_ALERT_24H_PCT}/{DUMP_ALERT_24H_PCT}\n"
+        f"Tracked pairs: {', '.join(sorted(_tracked_pairs)) or '(none)'}"
+    )
+
 def telegram_long_poll_loop():
     if not TELEGRAM_BOT_TOKEN:
         log.warning("No TELEGRAM_BOT_TOKEN; telegram loop disabled."); return
+
+    router = CommandRouter(
+        send_telegram=send_telegram,
+        compute_holdings_merged=compute_holdings_merged,
+        build_daily_sum_text=build_daily_sum_text,
+        build_day_report_text=build_day_report_text,
+        format_totals=format_totals,
+        rpc_discover_wallet_tokens=rpc_discover_wallet_tokens,
+        ensure_tracking_pair=ensure_tracking_pair,
+        remove_tracking_pair=remove_tracking_pair,
+        get_tracked_pairs=get_tracked_pairs,
+        build_diag_text=build_diag_text,
+    )
+
     offset=None
     send_telegram("🤖 Telegram command handler online.")
     while not shutdown_event.is_set():
@@ -1223,96 +1271,13 @@ def telegram_long_poll_loop():
                 msg=upd.get("message") or {}
                 chat_id=str(((msg.get("chat") or {}).get("id") or ""))
                 if TELEGRAM_CHAT_ID and str(TELEGRAM_CHAT_ID)!=chat_id:
-                    # Ignore other chats if a specific chat is set
                     continue
                 text=(msg.get("text") or "").strip()
                 if not text: continue
-                _handle_command(text)
+                router.handle(text)
         except Exception as e:
             log.debug("telegram poll error: %s", e)
             time.sleep(2)
-
-# ---------- Commands ----------
-def _fmt_holdings_text():
-    total, breakdown, unrealized, receipts = compute_holdings_merged()
-    if not breakdown:
-        return "📦 Κενά holdings."
-    lines=["*📦 Holdings (merged):*"]
-    for b in breakdown:
-        lines.append(f"• {b['token']}: {_format_amount(b['amount'])}  @ ${_format_price(b.get('price_usd',0))}  = ${_format_amount(b.get('usd_value',0))}")
-    if receipts:
-        lines.append("\n*Receipts:*")
-        for r in receipts:
-            lines.append(f"• {r['token']}: {_format_amount(r['amount'])}")
-    lines.append(f"\nΣύνολο: ${_format_amount(total)}")
-    if _nonzero(unrealized):
-        lines.append(f"Unrealized: ${_format_amount(unrealized)}")
-    return "\n".join(lines)
-
-def _handle_command(text: str):
-    t=text.strip()
-    low=t.lower()
-    if low.startswith("/status"):
-        send_telegram("✅ Running. Wallet monitor, Dex monitor, Alerts & Guard active.")
-    elif low.startswith("/diag") or low.startswith("/status"):
-        send_telegram(
-            "🔧 Diagnostics\n"
-            f"WALLETADDRESS: {WALLET_ADDRESS}\n"
-            f"CRONOSRPCURL set: {bool(CRONOS_RPC_URL)}\n"
-            f"Etherscan key: {bool(ETHERSCAN_API)}\n"
-            f"LOGSCANBLOCKS={LOG_SCAN_BLOCKS} LOGSCANCHUNK={LOG_SCAN_CHUNK}\n"
-            f"TZ={TZ} INTRADAYHOURS={INTRADAY_HOURS} EOD={EOD_HOUR:02d}:{EOD_MINUTE:02d}\n"
-            f"Alerts every: {ALERTS_INTERVAL_MIN}m | Pump/Dump: {PUMP_ALERT_24H_PCT}/{DUMP_ALERT_24H_PCT}\n"
-            f"Tracked pairs: {', '.join(sorted(_tracked_pairs)) or '(none)'}"
-        )
-    elif low.startswith("/rescan"):
-        cnt=rpc_discover_wallet_tokens()
-        send_telegram(f"🔄 Rescan done. Positive tokens: {cnt}")
-    elif low.startswith("/holdings") or low.startswith("/show_wallet_assets") or low.startswith("/showwalletassets") or low=="/show":
-        send_telegram(_fmt_holdings_text())
-    elif low.startswith("/dailysum") or low.startswith("/showdaily"):
-        send_telegram(_format_daily_sum_message())
-    elif low.startswith("/report"):
-        send_telegram(build_day_report_text())
-    elif low.startswith("/totals"):
-        parts=low.split()
-        scope="all"
-        if len(parts)>1 and parts[1] in ("today","month","all"):
-            scope=parts[1]
-        send_telegram(format_totals(scope))
-    elif low.startswith("/totalstoday"):
-        send_telegram(format_totals("today"))
-    elif low.startswith("/totalsmonth"):
-        send_telegram(format_totals("month"))
-    elif low.startswith("/pnl"):
-        # alias to totals summary by scope (realized)
-        parts=low.split()
-        scope=parts[1] if len(parts)>1 and parts[1] in ("today","month","all") else "all"
-        send_telegram(format_totals(scope))
-    elif low.startswith("/watch "):
-        # simple add/rm/list using DEX_PAIRS env seed (in-memory only)
-        try:
-            _, rest = low.split(" ",1)
-            if rest.startswith("add "):
-                pair=rest.split(" ",1)[1].strip().lower()
-                if pair.startswith("cronos/"):
-                    ensure_tracking_pair("cronos", pair.split("/",1)[1])
-                    send_telegram(f"👁 Added {pair}")
-                else:
-                    send_telegram("Use format cronos/<pairAddress>")
-            elif rest.startswith("rm "):
-                pair=rest.split(" ",1)[1].strip().lower()
-                if pair in _tracked_pairs:
-                    _tracked_pairs.remove(pair); send_telegram(f"🗑 Removed {pair}")
-                else: send_telegram("Pair not tracked.")
-            elif rest.strip()=="list":
-                send_telegram("👁 Tracked:\n"+"\n".join(sorted(_tracked_pairs)) if _tracked_pairs else "None.")
-            else:
-                send_telegram("Usage: /watch add <cronos/pair> | /watch rm <cronos/pair> | /watch list")
-        except Exception as e:
-            send_telegram(f"Watch error: {e}")
-    else:
-        send_telegram("❓ Commands: /status /diag /rescan /holdings /show /dailysum /report /totals [today|month|all] /totalstoday /totalsmonth /pnl [scope] /watch ...")
 
 # ---------- Schedulers (Intraday/EOD) ----------
 def _scheduler_loop():
@@ -1323,12 +1288,11 @@ def _scheduler_loop():
             now=now_dt()
             # Intraday
             if _last_intraday_sent<=0 or (time.time()-_last_intraday_sent)>=INTRADAY_HOURS*3600:
-                send_telegram(_format_daily_sum_message()); _last_intraday_sent=time.time()
+                send_telegram(build_daily_sum_text()); _last_intraday_sent=time.time()
             # EOD
             if now.hour==EOD_HOUR and now.minute==EOD_MINUTE:
                 send_telegram(build_day_report_text())
-                # wait a minute to avoid duplicates
-                time.sleep(65)
+                time.sleep(65)  # avoid duplicates
         except Exception as e:
             log.debug("scheduler error: %s", e)
         for _ in range(20):
@@ -1344,7 +1308,6 @@ def _graceful_exit(signum, frame):
 def main():
     load_ath()
     send_telegram("🟢 Starting Cronos DeFi Sentinel.")
-
     # seed discovery
     threading.Thread(target=discovery_loop, name="discovery", daemon=True).start()
     # monitors
