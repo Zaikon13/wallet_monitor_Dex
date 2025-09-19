@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-This canvas is reserved for the live view of your repository's canonical main.py
-Repo: Zaikon13/wallet_monitor_Dex
-Path: /main.py
-
-👉 Paste here the current content from GitHub (Raw view) if it doesn't auto-populate.
-Once it's in, I will apply the exact EOD scheduler patch on top (idempotent),
-without changing anything else.
-
-Notes:
-- We keep CRO vs tCRO policy intact (no remapping here).
-- We do NOT rewrite the file; only apply the queued patch if you ask me to.
-- Comments with `# TODO:` are optional ideas, not active changes.
+Cronos DeFi Sentinel — main.py (FULL, 3 parts)
+Features:
+- RPC snapshot (CRO + ERC-20)
+- Dexscreener pricing (+history fallback)
+- Cost-basis PnL (realized & unrealized)
+- Intraday/EOD reports
+- Alerts (24h pump/dump) & Guard window
+- Telegram long-poll commands:
+  /status, /diag, /rescan
+  /holdings, /show_wallet_assets, /showwalletassets, /show
+  /dailysum, /showdaily, /report
+  /totals, /totalstoday, /totalsmonth
+  /pnl [today|month|all]
+Compatible helpers:
+  utils/http.py, telegram/api.py, reports/day_report.py,
+  reports/ledger.py, reports/aggregates.py
 """
 
-# Paste the current main.py content from GitHub below this line.
 import os, sys, time, json, threading, logging, signal
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
-import schedule
 
 # external helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
-# Backward-compatible alias (startup/EOD patches expect send_telegram_message)
-send_telegram_message = send_telegram
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
 from reports.aggregates import aggregate_per_asset
@@ -680,44 +680,8 @@ def build_day_report_text():
         date_str=date_str, entries=entries, net_flow=net_flow,
         realized_today_total=realized_today_total, holdings_total=holdings_total,
         breakdown=breakdown, unrealized=unrealized, data_dir=DATA_DIR
-    )
-
-# ---------- EOD Daily Report (function + scheduler helper) ----------
-# This section covers EOD daily report build & send.
-# Nothing άλλο χρειάζεται να προστεθεί εκτός αν αλλάξουμε requirements.
-
-def send_daily_report():
-    try:
-        text = build_day_report_text()
-        # Telegram API already handles escaping/chunking inside telegram/api.py
-        send_telegram_message(f"📒 Daily Report
-{text}")
-    except Exception as e:
-        logging.exception("Failed to build or send daily report: %s", e)
-        send_telegram_message("⚠️ Failed to generate daily report.")
-
-# Optional helper thread; call start_schedulers() from your main bootstrap (part2)
-# to arm the EOD job and keep schedule.run_pending() ticking.
-# If you already have a scheduler loop in part2, you can ignore this helper.
-
-def start_schedulers():
-    try:
-        hh = max(0, min(23, int(EOD_HOUR)))
-        mm = max(0, min(59, int(EOD_MINUTE)))
-        eod_time = f"{hh:02d}:{mm:02d}"
-        schedule.every().day.at(eod_time).do(send_daily_report)
-        log.info("EOD scheduler armed at %s", eod_time)
-    except Exception as ex:
-        log.exception("Failed to arm EOD scheduler: %s", ex)
-    # Run loop (non-blocking suggestion: spawn as a thread in part2)
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(1)
-        except Exception:
-            time.sleep(1)
-
-# Continue in main_part2.py.....
+)
+# Continue in main_part2.py...
 # ---------- Mini summaries & TX handlers ----------
 def _mini_summary_line(token_key, symbol_shown):
     open_qty=_position_qty.get(token_key,0.0)
@@ -1390,8 +1354,6 @@ def main():
     threading.Thread(target=guard_monitor_loop, name="guard", daemon=True).start()
     threading.Thread(target=telegram_long_poll_loop, name="telegram", daemon=True).start()
     threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True).start()
-    # ---- NEW: EOD schedule helper ----
-    threading.Thread(target=start_schedulers, name="eod_scheduler", daemon=True).start()
 
     # keep alive
     while not shutdown_event.is_set():
