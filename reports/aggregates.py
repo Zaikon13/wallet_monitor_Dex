@@ -1,46 +1,101 @@
 # -*- coding: utf-8 -*-
-from collections import defaultdict
+from __future__ import annotations
+
 from decimal import Decimal
+from typing import Iterable, Mapping, MutableMapping
 
-def aggregate_per_asset(entries):
+
+def _as_decimal(value: object) -> Decimal:
+    """Coerce *value* into :class:`~decimal.Decimal` safely."""
+
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def aggregate_per_asset(entries: Iterable[Mapping[str, object]] | None):
+    """Aggregate trade entries per asset.
+
+    Parameters
+    ----------
+    entries:
+        Iterable of dictionaries describing fills. Each entry may contain the
+        keys ``asset``, ``side`` (``"IN"`` or ``"OUT"``), ``qty``, ``usd``, and
+        ``realized_usd``.
+
+    Returns
+    -------
+    list[dict[str, Decimal | int]]
+        Aggregated metrics per asset including totals for quantities, USD
+        values, realized PnL, net deltas, and transaction counts.
     """
-    entries: list of {asset, side(IN/OUT), qty, usd, realized_usd}
-    Returns list rows with:
-      asset, in_qty, in_usd, out_qty, out_usd, realized_usd, net_qty, net_usd, tx_count
-    """
-    acc = {}
-    for e in entries or []:
-        asset = (e.get("asset") or "?").upper()
-        side  = (e.get("side")  or "IN").upper()
-        qty   = Decimal(str(e.get("qty") or 0))
-        usd   = Decimal(str(e.get("usd") or 0))
-        real  = Decimal(str(e.get("realized_usd") or 0))
-        cur = acc.get(asset, {
-            "asset": asset,
-            "in_qty": Decimal("0"), "in_usd": Decimal("0"),
-            "out_qty": Decimal("0"), "out_usd": Decimal("0"),
-            "realized_usd": Decimal("0"),
-            "tx_count": 0
-        })
-        if side == "IN":
-            cur["in_qty"] += qty; cur["in_usd"] += usd
+
+    totals: dict[str, MutableMapping[str, Decimal | int]] = {}
+
+    for entry in entries or []:
+        asset = str(entry.get("asset") or "?").upper()
+        bucket = totals.setdefault(
+            asset,
+            {
+                "asset": asset,
+                "in_qty": Decimal("0"),
+                "in_usd": Decimal("0"),
+                "out_qty": Decimal("0"),
+                "out_usd": Decimal("0"),
+                "realized_usd": Decimal("0"),
+                "tx_count": 0,
+            },
+        )
+
+        side = str(entry.get("side") or "IN").upper()
+        qty = _as_decimal(entry.get("qty"))
+        usd = _as_decimal(entry.get("usd"))
+        realized = _as_decimal(entry.get("realized_usd"))
+
+        if side == "OUT":
+            bucket["out_qty"] += qty
+            bucket["out_usd"] += usd
         else:
-            cur["out_qty"] += qty; cur["out_usd"] += (usd if usd < 0 else -usd)  # negatives keep sign
-        cur["realized_usd"] += real
-        cur["tx_count"] += 1
-        acc[asset] = cur
+            bucket["in_qty"] += qty
+            bucket["in_usd"] += usd
 
-    rows=[]
-    for a, r in acc.items():
-        net_qty = r["in_qty"] - r["out_qty"]
-        net_usd = r["in_usd"] + r["out_usd"]
-        rows.append({
-            "asset": a,
-            "in_qty": float(r["in_qty"]), "in_usd": float(r["in_usd"]),
-            "out_qty": float(r["out_qty"]), "out_usd": float(r["out_usd"]),
-            "realized_usd": float(r["realized_usd"]),
-            "net_qty": float(net_qty), "net_usd": float(net_usd),
-            "tx_count": int(r["tx_count"])
-        })
-    rows.sort(key=lambda x: abs(x["net_usd"]) + abs(x["in_usd"]) + abs(x["out_usd"]), reverse=True)
-    return rows
+        bucket["realized_usd"] += realized
+        bucket["tx_count"] = int(bucket["tx_count"]) + 1
+
+    results = []
+    for asset, bucket in totals.items():
+        in_qty = bucket["in_qty"]
+        out_qty = bucket["out_qty"]
+        in_usd = bucket["in_usd"]
+        out_usd = bucket["out_usd"]
+        net_qty = in_qty - out_qty
+        net_usd = in_usd - out_usd
+
+        results.append(
+            {
+                "asset": asset,
+                "in_qty": in_qty,
+                "in_usd": in_usd,
+                "out_qty": out_qty,
+                "out_usd": out_usd,
+                "net_qty": net_qty,
+                "net_usd": net_usd,
+                "realized_usd": bucket["realized_usd"],
+                "tx_count": int(bucket["tx_count"]),
+            }
+        )
+
+    results.sort(
+        key=lambda row: (
+            abs(row["net_usd"])
+            + abs(row["in_usd"])
+            + abs(row["out_usd"])
+        ),
+        reverse=True,
+    )
+    return results
