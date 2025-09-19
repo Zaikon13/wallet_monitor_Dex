@@ -29,19 +29,6 @@ from zoneinfo import ZoneInfo
 # external helpers
 from utils.http import safe_get, safe_json
 from telegram.api import send_telegram
-
-
-# --- Optional helpers (safe) ---
-try:
-    from core.holdings import get_wallet_snapshot, format_snapshot_lines
-except Exception:
-    def get_wallet_snapshot(_addr: str): return None
-    def format_snapshot_lines(_snap): return []
-
-try:
-    from core.alerts import notify_error
-except Exception:
-    def notify_error(_context: str, _err: Exception): pass
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
 from reports.aggregates import aggregate_per_asset
@@ -1358,29 +1345,7 @@ def main():
     load_ath()
     send_telegram("🟢 Starting Cronos DeFi Sentinel.")
 
-    
-# Startup connectivity ping
-try:
-    send_telegram("✅ Cronos DeFi Sentinel started and is online.")
-except Exception as e:
-    logging.exception("Startup Telegram ping failed")
-    try: notify_error("Startup ping", e)
-    except Exception: pass
-
-# Initial holdings snapshot (safe)
-try:
-    if WALLET_ADDRESS:
-        snap = get_wallet_snapshot(WALLET_ADDRESS)
-        lines = format_snapshot_lines(snap) if snap else []
-        if lines:
-            send_telegram("💰 Holdings:\n" + "\n".join(lines))
-        else:
-            send_telegram("💰 Holdings: (empty)")
-except Exception as e:
-    logging.exception("Initial holdings snapshot failed")
-    try: notify_error("Initial holdings snapshot", e)
-    except Exception: pass
-# seed discovery
+    # seed discovery
     threading.Thread(target=discovery_loop, name="discovery", daemon=True).start()
     # monitors
     threading.Thread(target=wallet_monitor_loop, name="wallet", daemon=True).start()
