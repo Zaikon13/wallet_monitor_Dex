@@ -1,62 +1,175 @@
-from collections import defaultdict
-from decimal import Decimal
-from typing import List, Dict, Any, Optional
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cronos DeFi Sentinel — main orchestrator (integrated)
+- Env load & validation
+- Telegram boot ping + command dispatcher
+- PriceWatcher loop (Dexscreener-backed pricing via core.pricing)
+- WalletMonitor loop (on-chain tx fetch + ledger + alerts)
+- Schedulers: EOD + optional Intraday
+- Graceful shutdown
+"""
+from __future__ import annotations
+import os
+import sys
+import time
+import logging
+import signal
+from decimal import getcontext
+from typing import Optional
+
+from dotenv import load_dotenv
+
+# --- Precision ---
+getcontext().prec = 28
+
+# --- Imports from repo ---
+from core.config import apply_env_aliases, validate_env
+from core.wallet_monitor import make_wallet_monitor
+from core.watch import make_from_env
+from core.wallet_monitor import make_wallet_monitor
+from reports.scheduler import start_eod_scheduler, run_pending
+from telegram.api import send_telegram_message, get_updates
+from telegram.commands import dispatch
+
+# --- Globals ---
+_state_lock = None
+_shutdown = False
+_updates_offset: Optional[int] = None
+_watcher = None
+_wallet_mon = None
+_wallet_mon = None
 
 
-def aggregate_per_asset(entries: List[Dict[str, Any]], wallet: Optional[str] = None) -> List[Dict[str, Decimal]]:
-    """Aggregate entries per asset, optionally filtered by wallet.
-    Storage invariant: we *do not* mix at storage; aggregation happens here (report layer).
-    Each entry is expected to have: wallet, asset, side (IN/OUT), qty, usd, realized_usd
-    """
-    acc: Dict[str, Dict[str, Decimal]] = {}
-    for e in entries or []:
-        if wallet and (e.get("wallet") or "").lower() != wallet.lower():
-            continue
-        asset = (e.get("asset") or "?").upper()
-        side = (e.get("side") or "IN").upper()
-        qty = Decimal(str(e.get("qty") or 0))
-        usd = Decimal(str(e.get("usd") or 0))
-        real = Decimal(str(e.get("realized_usd") or 0))
-        cur = acc.get(
-            asset,
-            {
-                "asset": asset,
-                "in_qty": Decimal("0"),
-                "in_usd": Decimal("0"),
-                "out_qty": Decimal("0"),
-                "out_usd": Decimal("0"),
-                "realized_usd": Decimal("0"),
-                "tx_count": 0,
-            },
-        )
-        if side == "IN":
-            cur["in_qty"] += qty
-            cur["in_usd"] += usd
-        else:
-            cur["out_qty"] += qty
-            cur["out_us"] = cur.get("out_usd", Decimal("0"))  # compat safeguard
-            cur["out_usd"] += usd
-        cur["realized_usd"] += real
-        cur["tx_count"] += 1
-        acc[asset] = cur
-
-    rows: List[Dict[str, Decimal]] = []
-    for a, r in acc.items():
-        r["net_qty"] = r["in_qty"] - r["out_qty"]
-        r["net_usd"] = r["in_usd"] - r["out_usd"]
-        rows.append(r)
-    return rows
+# ---------- Logging ----------
+def _setup_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
-def totals(rows: List[Dict[str, Decimal]]) -> Dict[str, Decimal]:
-    z = {k: Decimal("0") for k in ["in_qty","out_qty","net_qty","in_usd","out_usd","net_usd","realized_usd","tx_count"]}
-    for r in rows:
-        z["in_qty"] += r.get("in_qty", Decimal("0"))
-        z["out_qty"] += r.get("out_qty", Decimal("0"))
-        z["net_qty"] += r.get("net_qty", Decimal("0"))
-        z["in_usd"] += r.get("in_usd", Decimal("0"))
-        z["out_usd"] += r.get("out_usd", Decimal("0"))
-        z["net_usd"] += r.get("net_usd", Decimal("0"))
-        z["realized_usd"] += r.get("realized_usd", Decimal("0"))
-        z["tx_count"] += r.get("tx_count", 0)
-    return z
+# ---------- Signals ----------
+def _handle_sigterm(signum, frame):  # noqa: ARG001
+    global _shutdown
+    logging.info("Signal received: %s — shutting down gracefully…", signum)
+    _shutdown = True
+
+
+# ---------- Telegram inbound ----------
+def _poll_telegram_once() -> None:
+    global _updates_offset
+    try:
+        resp = get_updates(offset=_updates_offset, timeout=15) or {}
+        if not resp.get("ok", True):
+            logging.warning("telegram.get_updates not ok: %s", resp)
+            return
+        for upd in resp.get("result", []):
+            _updates_offset = max(_updates_offset or 0, upd.get("update_id", 0) + 1)
+            msg = upd.get("message") or upd.get("edited_message") or {}
+            if not msg:
+                continue
+            chat = msg.get("chat") or {}
+            chat_id = chat.get("id")
+            text = msg.get("text")
+            if not text:
+                continue
+            try:
+                reply = dispatch(text, chat_id)
+                if reply:
+                    send_telegram_message(reply)
+            except Exception as e:
+                logging.exception("dispatch failed: %s", e)
+    except Exception as e:
+        logging.debug("telegram inbound poll failed: %s", e)
+
+
+# ---------- Boot ----------
+def boot_init() -> None:
+    global _state_lock, _watcher, _wallet_mon
+    load_dotenv()
+    _setup_logging()
+    apply_env_aliases()
+
+    try:
+        ok, _ = validate_env(strict=False)
+        if not ok:
+            logging.warning("[env] Environment incomplete; check warnings above.")
+    except Exception as e:
+        logging.warning("[env] Validation error: %s", e)
+
+    try:
+        send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
+    except Exception as e:
+        logging.warning("Telegram boot ping failed: %s", e)
+
+    try:
+        at = start_eod_scheduler()
+        logging.info("EOD scheduler armed at %s local time", at)
+    except Exception as e:
+        logging.warning("EOD scheduler init failed: %s", e)
+
+    _watcher = make_from_env()
+    _wallet_mon = make_wallet_monitor()  # wallet tx monitor (dedup + ledger + alerts)
+    _wallet_mon = make_wallet_monitor()
+
+    try:
+        import threading
+        _state_lock = threading.Lock()
+    except Exception:
+        _state_lock = None
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
+
+
+# ---------- Main loop ----------
+def main() -> int:
+    boot_init()
+    interval = int(os.getenv("WALLET_POLL", "15") or 15)
+
+    while not _shutdown:
+        loop_start = time.time()
+        try:
+            if _state_lock:
+                with _state_lock:
+                    _watcher.poll_once()
+
+                    if _wallet_mon:
+
+                        _wallet_mon.poll_once()
+                    _wallet_mon.poll_once()
+            else:
+                _watcher.poll_once()
+
+                if _wallet_mon:
+
+                    _wallet_mon.poll_once()
+                _wallet_mon.poll_once()
+
+            run_pending()
+            _poll_telegram_once()
+
+        except Exception as e:
+            logging.exception("main loop error: %s", e)
+
+        elapsed = time.time() - loop_start
+        sleep_for = max(0.5, interval - elapsed)
+        t0 = time.time()
+        while not _shutdown and (time.time() - t0) < sleep_for:
+            time.sleep(0.5)
+
+    logging.info("Shutdown complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        logging.exception("fatal: %s", e)
+        try:
+            send_telegram_message(f"💥 Fatal error: {e}")
+        except Exception:
+            pass
+        sys.exit(1)
