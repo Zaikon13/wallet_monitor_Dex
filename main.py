@@ -1,3 +1,4 @@
+
 # main.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -40,6 +41,9 @@ def _init_tz(tz_str: str | None):
     os.environ["TZ"] = tz
     try:
         import time as _t
+from reports.scheduler import start_eod_scheduler, run_pending
+from core.alerts import notify_error
+from core.watch import PriceWatcher, make_from_env
         if hasattr(_t, "tzset"):
             _t.tzset()
     except Exception:
@@ -373,6 +377,7 @@ def rpc_init():
     try:
         from web3 import Web3
         WEB3=Web3(Web3.HTTPProvider(CRONOS_RPC_URL, request_kwargs={"timeout":15}))
+_watcher = make_from_env()
         ok=WEB3.is_connected()
         if not ok: log.warning("Web3 not connected.")
         return ok
