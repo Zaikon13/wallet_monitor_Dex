@@ -1,6 +1,7 @@
-name: Repo Snapshot
+name: Repo Snapshot (CODEX)
+
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     branches: [ main ]
 
@@ -8,66 +9,124 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install deps
-        run: pip install requests
-
-      - name: Run snapshot (GitHub API, no git needed)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+      - name: Repo info
+        id: info
         run: |
-          python - <<'PY'
-          from __future__ import annotations
-          import os, base64, requests
+          echo "OWNER=Zaikon13" >> $GITHUB_ENV
+          echo "REPO=wallet_monitor_Dex" >> $GITHUB_ENV
+          echo "API=https://api.github.com" >> $GITHUB_ENV
 
-          OWNER="Zaikon13"; REPO="wallet_monitor_Dex"; API="https://api.github.com"
-          H={"Accept":"application/vnd.github+json","User-Agent":"codex-pull/1.0","Authorization":f"Bearer {os.getenv('GITHUB_TOKEN','')}"}
-          def jget(u,p=None): r=requests.get(u,headers=H,params=p,timeout=30); r.raise_for_status(); return r.json()
-          info=jget(f"{API}/repos/{OWNER}/{REPO}")
-          branch=info.get("default_branch") or "main"
-          ref=jget(f"{API}/repos/{OWNER}/{REPO}/git/refs/heads/{branch}")
-          sha=ref["object"]["sha"]
-          tree=jget(f"{API}/repos/{OWNER}/{REPO}/git/trees/{sha}", params={"recursive":"1"})
-          rows=[]
-          for n in tree.get("tree",[]):
-            typ=n["type"]; path=n["path"]; s=(n.get("sha") or "")[:7]; sz=n.get("size") or "-"
-            rows.append(f"{typ:4} {str(sz):>10}  {s:7}  {path}")
-          rows.sort(key=lambda s:s.split()[-1])
-          open("_gh_tree.txt","w",encoding="utf-8").write("\n".join(rows))
+      - name: Resolve default branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ env.OWNER }}
+          REPO:  ${{ env.REPO }}
+          API:   ${{ env.API }}
+        run: |
+          set -e
+          hdr="-H 'Accept: application/vnd.github+json' -H 'Authorization: Bearer ${GH_TOKEN}' -H 'User-Agent: codex-gh-actions'"
+          branch=$(bash -lc "curl -sS ${hdr} ${API}/repos/${OWNER}/${REPO} | jq -r '.default_branch // \"main\"'")
+          echo "branch=${branch}" >> $GITHUB_OUTPUT
 
-          want={"main.py","requirements.txt","core/tz.py","core/config.py","core/signals/server.py",
-                "core/wallet_monitor.py","core/watch.py","core/holdings.py","core/guards.py",
-                "core/providers/cronos.py","reports/scheduler.py","reports/day_report.py",
-                "telegram/api.py","telegram/dispatcher.py","telegram/formatters.py"}
-          idx={n["path"]:n for n in tree.get("tree",[]) if n["type"]=="blob"}
-          with open("_gh_critical.txt","w",encoding="utf-8") as f:
-            f.write("CRITICAL FILES — PRESENCE\n")
-            for p in sorted(want):
-              if p in idx:
-                f.write(f"[OK]  {p}  ({idx[p].get('size')} bytes)\n")
-              else:
-                f.write(f"[MISS] {p}\n")
-            f.write("\nHEADS:\n")
-            for p in sorted(want):
-              if p not in idx: continue
-              blob=jget(f"{API}/repos/{OWNER}/{REPO}/git/blobs/{idx[p]['sha']}")
-              if blob.get("encoding")!="base64": continue
-              raw=base64.b64decode(blob.get("content",""))
-              head=raw[:1600].decode("utf-8","replace")
-              f.write(f"\n----- {p} -----\n{head}\n")
-          PY
+      - name: Resolve commit SHA
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ env.OWNER }}
+          REPO:  ${{ env.REPO }}
+          API:   ${{ env.API }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          set -e
+          hdr="-H 'Accept: application/vnd.github+json' -H 'Authorization: Bearer ${GH_TOKEN}' -H 'User-Agent: codex-gh-actions'"
+          # Try ref; fallback commits API
+          sha=$(bash -lc "curl -sS ${hdr} ${API}/repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH} | jq -r '.object.sha // empty'")
+          if [ -z "${sha}" ] || [ "${sha}" = "null" ]; then
+            sha=$(bash -lc "curl -sS ${hdr} ${API}/repos/${OWNER}/${REPO}/commits/${BRANCH} | jq -r '.sha'")
+          fi
+          echo "sha=${sha}" >> $GITHUB_OUTPUT
+
+      - name: Fetch full tree (recursive)
+        id: tree
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ env.OWNER }}
+          REPO:  ${{ env.REPO }}
+          API:   ${{ env.API }}
+          SHA:   ${{ steps.sha.outputs.sha }}
+        run: |
+          set -e
+          hdr="-H 'Accept: application/vnd.github+json' -H 'Authorization: Bearer ${GH_TOKEN}' -H 'User-Agent: codex-gh-actions'"
+          curl -sS ${hdr} "${API}/repos/${OWNER}/${REPO}/git/trees/${SHA}?recursive=1" | jq . > _gh_tree.json
+          # Pretty tree text
+          jq -r '.tree[] | "\(.type) \(.size // "-") \(.sha[0:7]) \(.path)"' _gh_tree.json \
+            | sort -k4 > _gh_tree.txt
+
+      - name: Check critical files + heads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ env.OWNER }}
+          REPO:  ${{ env.REPO }}
+          API:   ${{ env.API }}
+        run: |
+          set -e
+          cat > _critical_list.txt <<'LIST'
+          main.py
+          requirements.txt
+          core/tz.py
+          core/config.py
+          core/signals/server.py
+          core/wallet_monitor.py
+          core/watch.py
+          core/holdings.py
+          core/guards.py
+          core/providers/cronos.py
+          reports/scheduler.py
+          reports/day_report.py
+          telegram/api.py
+          telegram/dispatcher.py
+          telegram/formatters.py
+          LIST
+
+          declare -A present
+          while IFS= read -r p; do present["$p"]=MISS; done < _critical_list.txt
+
+          # Build quick index of blobs
+          jq -r '.tree[] | select(.type=="blob") | "\(.path) \(.sha)"' _gh_tree.json > _blobs.txt
+
+          echo "CRITICAL FILES — PRESENCE" > _gh_critical.txt
+          while IFS= read -r line; do
+            path=$(echo "$line" | awk '{print $1}')
+            sha=$(echo "$line" | awk '{print $2}')
+            if grep -qx "$path" _critical_list.txt; then
+              present["$path"]="OK $sha"
+            fi
+          done < _blobs.txt
+
+          while IFS= read -r p; do
+            echo "[${present[$p]/ /] } $p" | sed 's/\[/[/' | sed 's/]_/] /' >> _gh_critical.txt
+          done < _critical_list.txt
+
+          echo -e "\nCRITICAL FILE HEADS (first ~80 lines each):" >> _gh_critical.txt
+          hdr=(-H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" -H "User-Agent: codex-gh-actions")
+          while IFS= read -r p; do
+            sha=$(awk -v f="$p" '$1==f{print $2}' _blobs.txt | head -n1)
+            [ -z "$sha" ] && continue
+            echo -e "\n----- $p -----" >> _gh_critical.txt
+            # Get blob, decode base64 content, print head
+            curl -sS "${hdr[@]}" "${API}/repos/${OWNER}/${REPO}/git/blobs/${sha}" \
+              | jq -r '.content // ""' \
+              | tr -d '\n' \
+              | base64 -d 2>/dev/null \
+              | head -n 80 >> _gh_critical.txt || true
+          done < _critical_list.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: repo-snapshot
+          name: repo-codex-snapshot
           path: |
+            _gh_tree.json
             _gh_tree.txt
             _gh_critical.txt
