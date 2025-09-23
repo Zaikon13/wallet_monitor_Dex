@@ -1,131 +1,216 @@
-name: Cordex Diag
+# scripts/codex_diag.py
+from __future__ import annotations
+import os, sys, json, time, logging, platform, importlib, socket
+from typing import Any, Dict, List, Tuple
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/cordex-diag.yml"
-      - "scripts/cordex_diag.py"
-      - "requirements.txt"
-      - "main.py"
-      - "core/**"
-      - "reports/**"
-      - "telegram/**"
-      - "utils/**"
+RESULT: Dict[str, Any] = {"ok": True, "checks": {}, "notes": []}
 
-jobs:
-  diag:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # commit στο repo
-      issues: write     # δημιουργία/ενημέρωση issue
+def _set(name: str, ok: bool, **meta):
+    RESULT["checks"][name] = {"ok": bool(ok), **meta}
+    if not ok:
+        RESULT["ok"] = False
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default) or ""
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+def check_python():
+    ver = sys.version.split()[0]
+    _set("python.version", ver >= "3.10", version=ver)
 
-      - name: Install deps (best-effort)
-        run: |
-          python -V
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          pip install pipdeptree || true
+def check_env_required():
+    # προσαρμόζεις αν θέλεις αυστηρότερα
+    required = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "WALLET_ADDRESS", "CRONOS_RPC_URL")
+    missing = [k for k in required if not _env(k)]
+    _set("env.required", len(missing) == 0, missing=missing)
 
-      - name: Run Cordex Diag
-        env:
-          TZ: ${{ secrets.TZ }}
-          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ETHERSCAN_API: ${{ secrets.ETHERSCAN_API }}
-          RPC_URL: ${{ secrets.RPC_URL }}
-          DEX_PAIRS: ${{ secrets.DEX_PAIRS }}
-          PRICE_MOVE_THRESHOLD: ${{ secrets.PRICE_MOVE_THRESHOLD }}
-          INTRADAY_HOURS: ${{ secrets.INTRADAY_HOURS }}
-          EOD_TIME: ${{ secrets.EOD_TIME }}
-        run: |
-          python scripts/cordex_diag.py --mask-secrets --try-import main.py core telegram reports utils
+def check_imports():
+    mods = ["requests", "python_dotenv", "schedule", "flask"]
+    status = {}
+    ok = True
+    for m in mods:
+        try:
+            mod = importlib.import_module(m.replace("-", "_"))
+            ver = getattr(mod, "__version__", None)
+            status[m] = {"import": True, "version": ver}
+        except Exception as e:
+            ok = False
+            status[m] = {"import": False, "error": str(e)}
+    _set("imports.runtime_libs", ok, libs=status)
 
-      - name: Publish diag into repo (.cordex/latest)
-        run: |
-          set -e
-          mkdir -p .cordex/latest
-          cp diag_report.md .cordex/latest/ || true
-          cp diag_report.json .cordex/latest/ || true
-          cp diag_tree.txt .cordex/latest/ || true
-          cp diag_imports.log .cordex/latest/ || true
+def check_repo_modules():
+    to_check = [
+        "core.config",
+        "core.tz",
+        "core.rpc",
+        "core.pricing",
+        "core.holdings",
+        "core.wallet_monitor",
+        "core.guards",
+        "core.watch",
+        "core.providers.cronos",
+        "core.signals.server",
+        "reports.scheduler",
+        "reports.aggregates",
+        "telegram.api",
+        "telegram.dispatcher",
+    ]
+    status = {}
+    ok = True
+    for m in to_check:
+        try:
+            mod = importlib.import_module(m)
+            status[m] = {"import": True}
+        except Exception as e:
+            ok = False
+            status[m] = {"import": False, "error": str(e)}
+    _set("imports.project_modules", ok, modules=status)
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- .cordex/latest; then
-            git add .cordex/latest
-            git commit -m "Cordex diag: ${GITHUB_RUN_NUMBER} (${GITHUB_SHA})"
-            git push
-          fi
+def check_rpc():
+    import json as _json, urllib.request as req
+    url = _env("CRONOS_RPC_URL")
+    if not url:
+        _set("network.rpc", False, error="CRONOS_RPC_URL missing")
+        return
+    payload = _json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}).encode()
+    try:
+        r = req.Request(url, data=payload, headers={"Content-Type":"application/json"})
+        with req.urlopen(r, timeout=8) as resp:
+            ok = resp.status == 200
+            body = resp.read(256).decode(errors="ignore")
+        _set("network.rpc", ok, sample=body)
+    except Exception as e:
+        _set("network.rpc", False, error=str(e))
 
-      - name: Save Job Summary
-        run: |
-          echo "## Cordex Diag Summary" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f diag_report.md ]; then
-            cat diag_report.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "_No diag_report.md produced._" >> "$GITHUB_STEP_SUMMARY"
-          fi
+def check_cronoscan():
+    import urllib.parse as up, urllib.request as req
+    base = _env("CRONOSSCAN_BASE") or "https://api.cronoscan.com/api"
+    key = _env("CRONOSCAN_API") or _env("ETHERSCAN_API")
+    q = {"module":"stats","action":"cronowei"}
+    if key: q["apikey"] = key
+    url = base + "?" + up.urlencode(q)
+    try:
+        with req.urlopen(url, timeout=8) as r:
+            ok = (r.status == 200)
+            sample = r.read(160).decode(errors="ignore")
+        _set("network.cronoscan", ok, url=base, sample=sample[:160])
+    except Exception as e:
+        _set("network.cronoscan", False, url=base, error=str(e))
 
-      - name: Create or update issue "Cordex Diag - latest"
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const title = 'Cordex Diag - latest';
-            let body = '_No diag_report.md produced._';
-            if (fs.existsSync('diag_report.md')) {
-              body = fs.readFileSync('diag_report.md', 'utf8');
-            }
+def check_telegram():
+    import urllib.request as req
+    token = _env("TELEGRAM_BOT_TOKEN")
+    if not token:
+        _set("network.telegram", False, error="TELEGRAM_BOT_TOKEN missing")
+        return
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        with req.urlopen(url, timeout=8) as r:
+            ok = (r.status == 200)
+            _set("network.telegram", ok, status=r.status)
+    except Exception as e:
+        _set("network.telegram", False, error=str(e))
 
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const ref = process.env.GITHUB_REF_NAME || context.ref?.replace('refs/heads/','') || 'main';
-            const baseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/.cordex/latest`;
+def check_signals_health():
+    # θα πετύχει μόνο αν τρέχει ήδη ο HTTP server στο ίδιο container
+    bind = _env("SIGNALS_BIND") or "0.0.0.0:8080"
+    host, port = (bind.split(":",1)+["8080"])[:2]
+    host = "127.0.0.1" if host in ("0.0.0.0","::") else host
+    url = f"http://{host}:{port}/healthz"
+    try:
+        import urllib.request as req
+        with req.urlopen(url, timeout=3) as r:
+            ok = (r.status == 200)
+            _set("network.signals_health", ok, url=url, status=r.status)
+    except Exception as e:
+        _set("network.signals_health", False, url=url, error=str(e))
 
-            const appendix = `
----
-**Raw files**
-- [diag_report.md](${baseUrl}/diag_report.md)
-- [diag_report.json](${baseUrl}/diag_report.json)
-- [diag_tree.txt](${baseUrl}/diag_tree.txt)
-- [diag_imports.log](${baseUrl}/diag_imports.log)
-`;
+def check_watch_and_monitor():
+    ok = True
+    info = {}
+    # watcher
+    try:
+        mod = importlib.import_module("core.watch")
+        mf  = getattr(mod, "make_from_env", None)
+        if callable(mf):
+            w = mf()
+            has_poll = hasattr(w, "poll_once")
+            info["watcher"] = {"make_from_env": True, "has_poll_once": bool(has_poll)}
+        else:
+            ok = False
+            info["watcher"] = {"make_from_env": False}
+    except Exception as e:
+        ok = False
+        info["watcher"] = {"error": str(e)}
+    # wallet monitor
+    try:
+        from core.wallet_monitor import make_wallet_monitor
+        from core.providers.cronos import fetch_wallet_txs
+        mon = make_wallet_monitor(provider=fetch_wallet_txs)
+        info["wallet_monitor"] = {"make_wallet_monitor": True, "type": type(mon).__name__}
+    except Exception as e:
+        ok = False
+        info["wallet_monitor"] = {"error": str(e)}
+    _set("app.watch_and_monitor", ok, info=info)
 
-            const fullBody = body + appendix;
+def check_scheduler_bindings():
+    ok = True
+    info = {}
+    try:
+        from reports.scheduler import start_eod_scheduler, run_pending
+        info["start_eod_scheduler"] = callable(start_eod_scheduler)
+        info["run_pending"] = callable(run_pending)
+        ok = info["start_eod_scheduler"] and info["run_pending"]
+    except Exception as e:
+        ok = False
+        info["error"] = str(e)
+    _set("app.scheduler_bindings", ok, info=info)
 
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open'
-            });
+def check_dispatcher_contract():
+    ok = True
+    info = {}
+    try:
+        import telegram.dispatcher as d
+        has_dispatch = callable(getattr(d, "dispatch", None))
+        has__dispatch = callable(getattr(d, "_dispatch", None))
+        info = {"dispatch": has_dispatch, "_dispatch": has__dispatch}
+        ok = has_dispatch or has__dispatch
+    except Exception as e:
+        ok = False
+        info = {"error": str(e)}
+    _set("app.dispatcher_contract", ok, info=info)
 
-            const existing = issues.find(i => i.title === title);
-            if (existing) {
-              await github.rest.issues.update({
-                owner, repo, issue_number: existing.number, body: fullBody
-              });
-            } else {
-              await github.rest.issues.create({
-                owner, repo, title, body: fullBody
-              });
-            }
+def check_runtime_env():
+    runtime = {
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "tz": _env("TZ") or "UTC",
+        "railway": {
+            "service": _env("RAILWAY_SERVICE_NAME"),
+            "env": _env("RAILWAY_ENVIRONMENT"),
+            "region": _env("RAILWAY_REGION"),
+        },
+    }
+    _set("runtime.env", True, info=runtime)
 
-      - name: Upload artifact (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cordex-diag
-          path: |
-            diag_report.md
-            diag_report.json
-            diag_imports.log
-            diag_tree.txt
-          if-no-files-found: warn
+def main(argv: List[str]) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+    check_runtime_env()
+    check_python()
+    check_env_required()
+    check_imports()
+    check_repo_modules()
+    check_rpc()
+    check_cronoscan()
+    check_telegram()
+    check_dispatcher_contract()
+    check_scheduler_bindings()
+    check_watch_and_monitor()
+    check_signals_health()
+
+    print(json.dumps(RESULT, ensure_ascii=False, indent=2))
+    # Exit 0 if everything is ok, else 1 (useful for CI/Railway health)
+    return 0 if RESULT["ok"] else 1
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
