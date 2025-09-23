@@ -2,17 +2,12 @@
 import os, sys, time, logging, signal, requests
 from dotenv import load_dotenv
 
-# ---- Config / Validation ----
 from core.config import apply_env_aliases, validate_env
-
-# ---- Scheduler ----
 from reports.scheduler import start_eod_scheduler, run_pending
-
-# ---- Telegram ----
 from telegram.api import send_telegram_message
-import telegram.dispatcher as tdisp  # we'll call functions defensively
+import telegram.dispatcher as tdisp
 
-# ---- Watcher (safe fallback if not implemented) ----
+# Watcher (safe fallback)
 try:
     from core.watch import make_from_env as _make_from_env
 except Exception:
@@ -20,13 +15,12 @@ except Exception:
         def poll_once(self): return 0
     def _make_from_env(): return _NoopWatcher()
 
-# ---- Holdings (safe fallback if not implemented) ----
+# Holdings (safe fallback)
 try:
     from core.holdings import get_wallet_snapshot as _get_wallet_snapshot
 except Exception:
     def _get_wallet_snapshot(_wallet: str) -> dict: return {}
 
-# ---- Wallet monitor / Providers / Signals ----
 from core.wallet_monitor import make_wallet_monitor
 from core.providers.cronos import fetch_wallet_txs
 from core.signals.server import start_signals_server_if_enabled
@@ -35,7 +29,6 @@ from core.guards import set_holdings
 _shutdown = False
 _updates_offset = None
 
-
 def _setup_logging():
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -43,17 +36,11 @@ def _setup_logging():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-
 def _handle(_sig, _frm):
     global _shutdown
     _shutdown = True
 
-
 def _dispatch_safe(text: str, chat_id=None):
-    """
-    Call telegram.dispatcher.dispatch(text, chat_id) if it exists;
-    otherwise fall back to _dispatch(text). Always return a reply or None.
-    """
     fn = getattr(tdisp, "dispatch", None)
     if callable(fn):
         return fn(text, chat_id)
@@ -62,11 +49,10 @@ def _dispatch_safe(text: str, chat_id=None):
         fn2(text)
     return None
 
-
 def _poll_telegram_once():
     global _updates_offset
     try:
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
         if not token:
             return
         url = f"https://api.telegram.org/bot{token}/getUpdates"
@@ -94,14 +80,16 @@ def _poll_telegram_once():
     except Exception as e:
         logging.debug("telegram poll failed: %s", e)
 
-
 def main() -> int:
     load_dotenv()
     apply_env_aliases()
     validate_env(strict=False)
     _setup_logging()
 
-    send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
+    try:
+        send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
+    except Exception:
+        logging.exception("failed to send startup message")
 
     try:
         start_eod_scheduler()
@@ -140,9 +128,7 @@ def main() -> int:
         except Exception as e:
             logging.exception("loop error: %s", e)
         time.sleep(max(0.5, poll - (time.time() - t0)))
-
     return 0
-
 
 if __name__ == "__main__":
     try:
