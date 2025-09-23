@@ -1,37 +1,37 @@
-"""Simple Telegram command dispatcher.
-Returns plain text (Markdown-friendly) for recognized commands.
-Main loop should call `dispatch(text)` and send the returned string.
-"""
-from __future__ import annotations
-from typing import Optional
+# telegram/dispatcher.py
+from core.tz import now_local
+from telegram.api import send_telegram_message
+from telegram.formatters import escape
 
-from telegram.commands import (
-    handle_holdings,
-    handle_show,
-    handle_showdaily,
-)
+COMMAND_PREFIX = "/"
+_handlers = {}
 
-ALIASES = {
-    "/holdings": handle_holdings,
-    "/show_wallet_assets": handle_holdings,
-    "/showwalletassets": handle_holdings,
-    "/show": handle_show,
-    "/status": handle_show,
-    "/report": handle_showdaily,
-    "/showdaily": handle_showdaily,
-    "/dailysum": handle_showdaily,
-}
+def register(cmd):
+    def _wrap(fn):
+        _handlers[cmd] = fn
+        return fn
+    return _wrap
 
+@register("start")
+@register("help")
+def _help():
+    send_telegram_message("Bot online. Use /status")
 
-def dispatch(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    t = text.strip().split()[0].lower()
-    func = ALIASES.get(t)
-    if not func:
-        return None
-    try:
-        return func()
-    except Exception as e:
-        return f"⚠️ Command failed: {e}"
-      
+@register("status")
+def _status():
+    ts = now_local().strftime("%Y-%m-%d %H:%M:%S %Z")
+    send_telegram_message(escape(f"🟢 Online: {ts}"))
+
+def _dispatch(text: str):
+    if not text or not text.startswith(COMMAND_PREFIX):
+        return False
+    cmd = text[1:].split()[0].lower()
+    fn = _handlers.get(cmd)
+    if fn:
+        fn()
+        return True
+    return False
+
+def dispatch(text: str, chat_id=None):
+    _dispatch(text)
+    return None
