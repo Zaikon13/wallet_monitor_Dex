@@ -1,0 +1,64 @@
+# railway.toml
+
+# ---- Build ----
+[build]
+# Προεπιλογή builder: Railpack/Nixpacks (auto-detects Python)
+# Αν θες explicit:
+builder = "NIXPACKS"
+# Ξανακάνε deploy όταν αλλάζουν αυτά τα paths
+watchPaths = ["**/*.py", "requirements.txt", ".github/workflows/*.yml"]
+
+# ---- Deploy ----
+[deploy]
+startCommand    = "python main.py"
+restartPolicy   = "ON_FAILURE"
+maxRetries      = 10
+
+# Healthcheck: χρησιμοποιεί τον HTTP server των signals
+# (φρόντισε να είναι ενεργό το SIGNALS_HTTP=1)
+healthcheckPath = "/healthz"
+
+# ---- Service / Runtime ----
+[service]
+name   = "worker"
+region = "eu-west"   # Amsterdam
+
+# ---- Resources (προτεινόμενα) ----
+[resources]
+cpu    = "0.5"       # vCPU
+memory = "512Mi"     # RAM
+
+# ---- Env (defaults που ΔΕΝ είναι μυστικά) ----
+[env]
+TZ                     = "Europe/Athens"
+WALLET_POLL            = "15"
+HOLDINGS_REFRESH_SEC   = "60"
+SIGNALS_HTTP           = "1"          # για healthcheck
+SIGNALS_BIND           = "0.0.0.0:8080"
+LOG_LEVEL              = "INFO"
+CRONOS_RPC_URL         = "https://cronos-evm-rpc.publicnode.com"
+DISCOVER_ENABLED       = "true"
+DISCOVER_QUERY         = "cronos"
+DISCOVER_REQUIRE_WCRO_QUOTE = "true"
+DISCOVER_POLL          = "120"
+DISCOVER_LIMIT         = "10"
+DISCOVER_MAX_PAIR_AGE_HOURS = "24"
+DISCOVER_MIN_LIQ_USD   = "30000"
+DISCOVER_MIN_VOL24_USD = "5000"
+DISCOVER_MIN_ABS_CHANGE_PCT = "10"
+DISCOVER_MIN_CHG_H1_PCT = "10"
+DISCOVER_MIN_CHG_H4_PCT = "10"
+DISCOVER_MIN_CHG_H6_PCT = "10"
+ALERTS_INTERVAL_MINUTES = "15"
+PRICE_MOVE_THRESHOLD   = "5"
+PRICE_WINDOW           = "3"
+GUARD_WINDOW_MIN       = "60"
+GUARD_PUMP_PCT         = "20"
+GUARD_DROP_PCT         = "-12"
+GUARD_TRAIL_DROP_PCT   = "-8"
+PUMP_ALERT_24H_PCT     = "20"
+DUMP_ALERT_24H_PCT     = "-15"
+MIN_VOLUME_FOR_ALERT   = "0"
+INTRADAY_HOURS         = "3"
+EOD_TIME               = "23:59"
+PYTHONUNBUFFERED       = "1"          # καλύτερα logs στα containers
