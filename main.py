@@ -5,14 +5,16 @@ Cronos DeFi Sentinel — main orchestrator (integrated)
 - Env load & validation
 - Telegram boot ping + command dispatcher
 - PriceWatcher loop (Dexscreener-backed pricing via core.pricing)
+- WalletMonitor loop (real-time tx feed → ledger + alerts)
 - Schedulers: EOD + optional Intraday
 - Graceful shutdown
 
 Assumptions about modules available in repo:
   core.config        → apply_env_aliases, validate_env
   core.watch         → PriceWatcher, make_from_env
+  core.wallet_monitor→ WalletMonitor, make_wallet_monitor
   reports.scheduler  → start_eod_scheduler, run_pending
-  telegram.api       → send_telegram_message, (optional) get_updates(long-poll)
+  telegram.api       → send_telegram_message, get_updates(long-poll)
   telegram.dispatcher→ dispatch(text, chat_id)
 
 Notes:
@@ -26,7 +28,7 @@ import time
 import logging
 import signal
 from decimal import getcontext
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -36,6 +38,7 @@ getcontext().prec = 28
 # --- Imports from our tree ---
 from core.config import apply_env_aliases, validate_env
 from core.watch import make_from_env
+from core.wallet_monitor import make_wallet_monitor
 from reports.scheduler import start_eod_scheduler, run_pending
 from telegram.api import send_telegram_message
 from telegram.dispatcher import dispatch
@@ -45,6 +48,7 @@ _state_lock = None  # lazy created to avoid threading import unless needed
 _shutdown = False
 _updates_offset: Optional[int] = None
 _watcher = None
+_wallet_mon = None
 
 
 # ---------- Logging ----------
@@ -103,7 +107,7 @@ def _poll_telegram_once() -> None:
 # ---------- Boot ----------
 
 def boot_init() -> None:
-    global _state_lock, _watcher
+    global _state_lock, _watcher, _wallet_mon
     load_dotenv()
     _setup_logging()
     apply_env_aliases()
@@ -129,8 +133,9 @@ def boot_init() -> None:
     except Exception as e:  # noqa: BLE001
         logging.warning("EOD scheduler init failed: %s", e)
 
-    # Watcher
+    # Watchers
     _watcher = make_from_env()
+    _wallet_mon = make_wallet_monitor()  # provider can be wired to real RPC fetcher later
 
     # Locks & signals
     try:
@@ -147,17 +152,20 @@ def boot_init() -> None:
 def main() -> int:
     boot_init()
     interval = int(os.getenv("WALLET_POLL", "15") or 15)
-    last_report_t = time.time()
 
     while not _shutdown:
         loop_start = time.time()
         try:
-            # Price watcher (Dexscreener-backed)
+            # Price watcher + Wallet monitor
             if _state_lock:
                 with _state_lock:
                     _watcher.poll_once()
+                    if _wallet_mon:
+                        _wallet_mon.poll_once()
             else:
                 _watcher.poll_once()
+                if _wallet_mon:
+                    _wallet_mon.poll_once()
 
             # Schedulers (EOD / intraday)
             run_pending()
