@@ -1,4 +1,4 @@
-# main.py
+# main.py (header + early start for /healthz)
 import os, sys, time, logging, signal, requests
 from dotenv import load_dotenv
 
@@ -86,6 +86,13 @@ def main() -> int:
     validate_env(strict=False)
     _setup_logging()
 
+    # START THE HTTP SERVER ASAP so /healthz is live for Railway
+    try:
+        logging.info("RAILWAY PORT=%s", os.getenv("PORT"))
+        start_signals_server_if_enabled()
+    except Exception as e:
+        logging.warning("signals server error: %s", e)
+
     try:
         send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
     except Exception:
@@ -98,11 +105,6 @@ def main() -> int:
 
     watcher = _make_from_env()
     wallet_mon = make_wallet_monitor(provider=fetch_wallet_txs)
-
-    try:
-        start_signals_server_if_enabled()
-    except Exception as e:
-        logging.warning("signals server error: %s", e)
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
