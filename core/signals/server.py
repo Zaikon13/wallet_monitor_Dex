@@ -25,9 +25,11 @@ def create_app():
     return app
 
 def start_signals_server_if_enabled():
-    enable = str(os.getenv("SIGNALS_HTTP", "0")).lower() in {"1", "true", "yes"}
-    if not enable:
-        logging.info("signals HTTP disabled (set SIGNALS_HTTP=1 to enable)")
+    # Auto-enable if Railway gives PORT, or if explicitly enabled
+    auto_on = bool(os.getenv("PORT"))
+    flag_on = str(os.getenv("SIGNALS_HTTP", "0")).lower() in {"1", "true", "yes"}
+    if not (auto_on or flag_on):
+        logging.info("signals HTTP disabled (set SIGNALS_HTTP=1 or rely on PORT)")
         return None
 
     port = int(os.getenv("PORT") or os.getenv("SIGNALS_PORT") or "8080")
