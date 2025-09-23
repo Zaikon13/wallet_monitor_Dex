@@ -1,60 +1,23 @@
-from collections import defaultdict
 from decimal import Decimal
-from typing import List, Dict, Any, Optional
-
-def aggregate_per_asset(entries: List[Dict[str, Any]], wallet: Optional[str] = None) -> List[Dict[str, Decimal]]:
-    """Aggregate entries per asset, optionally filtered by wallet.
-    Storage invariant: ΔΕΝ κάνουμε mixing στο storage· το mixing γίνεται μόνο εδώ στο report layer.
-    Κάθε entry: wallet, asset, side(IN/OUT), qty, usd, realized_usd.
-    """
-    acc: Dict[str, Dict[str, Decimal]] = {}
-    for e in entries or []:
-        if wallet and (e.get("wallet") or "").lower() != wallet.lower():
-            continue
-        asset = (e.get("asset") or "?").upper()
-        side = (e.get("side") or "IN").upper()
-        qty = Decimal(str(e.get("qty") or 0))
-        usd = Decimal(str(e.get("usd") or 0))
-        real = Decimal(str(e.get("realized_usd") or 0))
-
-        cur = acc.get(
-            asset,
-            {
-                "asset": asset,
-                "in_qty": Decimal("0"),
-                "in_usd": Decimal("0"),
-                "out_qty": Decimal("0"),
-                "out_usd": Decimal("0"),
-                "realized_usd": Decimal("0"),
-                "tx_count": 0,
-            },
-        )
-        if side == "IN":
-            cur["in_qty"] += qty
-            cur["in_usd"] += usd
-        else:
-            cur["out_qty"] += qty
-            cur["out_usd"] += usd
-        cur["realized_usd"] += real
-        cur["tx_count"] += 1
-        acc[asset] = cur
-
-    rows: List[Dict[str, Decimal]] = []
-    for _, r in acc.items():
-        r["net_qty"] = r["in_qty"] - r["out_qty"]
-        r["net_usd"] = r["in_usd"] - r["out_usd"]
-        rows.append(r)
+def _D(x): return Decimal(str(x or 0))
+def aggregate_per_asset(entries, wallet=None):
+    acc={}
+    for e in entries:
+        if wallet and (e.get("wallet") or "").lower()!=wallet.lower(): continue
+        a=(e.get("asset") or "?").upper()
+        acc.setdefault(a, {"in_qty":_D(0),"out_qty":_D(0),"in_usd":_D(0),"out_usd":_D(0),"realized_usd":_D(0)})
+        side=(e.get("side") or "").upper(); qty=_D(e.get("qty")); usd=_D(e.get("usd"))
+        if side=="IN": acc[a]["in_qty"]+=qty; acc[a]["in_usd"]+=usd
+        elif side=="OUT": acc[a]["out_qty"]+=qty; acc[a]["out_usd"]+=usd
+        acc[a]["realized_usd"]+=_D(e.get("realized_usd"))
+    rows=[]
+    for a,v in acc.items():
+        netq=v["in_qty"]-v["out_qty"]; netu=v["in_usd"]-v["out_usd"]
+        rows.append({"asset":a, **{k:str(vv) for k,vv in v.items()}, "net_qty":str(netq), "net_usd":str(netu)})
     return rows
-
-def totals(rows: List[Dict[str, Decimal]]) -> Dict[str, Decimal]:
-    z = {k: Decimal("0") for k in ["in_qty","out_qty","net_qty","in_usd","out_usd","net_usd","realized_usd","tx_count"]}
+def totals(rows):
+    from decimal import Decimal
+    t={k:Decimal("0") for k in ["in_qty","out_qty","in_usd","out_usd","net_qty","net_usd","realized_usd"]}
     for r in rows:
-        z["in_qty"] += r.get("in_qty", Decimal("0"))
-        z["out_qty"] += r.get("out_qty", Decimal("0"))
-        z["net_qty"] += r.get("net_qty", Decimal("0"))
-        z["in_usd"] += r.get("in_usd", Decimal("0"))
-        z["out_usd"] += r.get("out_usd", Decimal("0"))
-        z["net_usd"] += r.get("net_usd", Decimal("0"))
-        z["realized_usd"] += r.get("realized_usd", Decimal("0"))
-        z["tx_count"] += r.get("tx_count", 0)
-    return z
+        for k in t: t[k]+=Decimal(str(r.get(k) or 0))
+    return {k:str(v) for k,v in t.items()}
