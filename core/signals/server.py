@@ -13,8 +13,8 @@ def create_app():
 
     @app.post("/signal")
     def signal_in():
-        from core.signals.adapter import ingest_signal
         try:
+            from core.signals.adapter import ingest_signal
             data = request.get_json(force=True, silent=True) or {}
             out = ingest_signal(data)
             return jsonify({"ok": bool(out), "action": (out or {}).get("guard_action")})
@@ -30,11 +30,12 @@ def start_signals_server_if_enabled():
         logging.info("signals HTTP disabled (set SIGNALS_HTTP=1 to enable)")
         return None
 
-    # Prefer Railway's PORT if present
     port = int(os.getenv("PORT") or os.getenv("SIGNALS_PORT") or "8080")
-    host = (os.getenv("SIGNALS_HOST") or (os.getenv("SIGNALS_BIND") or "0.0.0.0:")).split(":")[0] or "0.0.0.0"
+    host_env = os.getenv("SIGNALS_HOST") or os.getenv("SIGNALS_BIND") or "0.0.0.0"
+    host = host_env.split(":")[0] or "0.0.0.0"
 
     app = create_app()
+
     def run():
         logging.info("starting signals HTTP on %s:%s", host, port)
         app.run(host=host, port=port, debug=False, use_reloader=False)
