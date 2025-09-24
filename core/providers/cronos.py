@@ -1,60 +1,34 @@
-# core/providers/cronos.py
 from __future__ import annotations
-import os, logging
+from typing import List, Dict
 from decimal import Decimal
-from typing import Any, Optional
+from core.providers.etherscan_like import account_txlist, account_tokentx
 
-try:
-    import requests
-except Exception:
-    requests = None  # type: ignore
+def _D(x): return Decimal(str(x or 0))
 
-RPC_URL = os.getenv("CRONOS_RPC_URL", "https://cronos-evm-rpc.publicnode.com").strip()
-NATIVE_DECIMALS = 18
-
-def _rpc_call(method: str, params: list[Any]) -> Optional[dict]:
-    if requests is None:
-        logging.warning("requests not available for RPC")
-        return None
-    try:
-        r = requests.post(
-            RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            logging.warning("RPC error on %s: %s", method, data["error"])
-            return None
-        return data
-    except Exception as e:
-        logging.warning("RPC %s failed: %s", method, e)
-        return None
-
-def get_native_balance(address: str) -> Decimal:
-    """
-    Returns CRO balance as Decimal(CRO), never raises. 0 on error.
-    """
-    try:
-        rs = _rpc_call("eth_getBalance", [address, "latest"])
-        if not rs: return Decimal("0")
-        hexwei = (rs.get("result") or "0x0").lower()
-        wei = int(hexwei, 16)
-        return Decimal(wei) / (Decimal(10) ** NATIVE_DECIMALS)
-    except Exception:
-        return Decimal("0")
-
-def erc20_balance_of(contract: str, address: str) -> int:
-    """
-    balanceOf(address) → uint256 (raw wei). Returns 0 on error.
-    """
-    try:
-        # function selector keccak("balanceOf(address)")[:4] = 0x70a08231
-        selector = "0x70a08231000000000000000000000000" + address.lower().replace("0x", "")
-        rs = _rpc_call("eth_call", [{"to": contract, "data": selector}, "latest"])
-        if not rs: return 0
-        raw = (rs.get("result") or "0x0")
-        return int(raw, 16)
-    except Exception:
-        return 0
+def fetch_wallet_txs(address: str) -> List[Dict[str, object]]:
+    txs = (account_txlist(address) or {}).get("result") or []
+    toks = (account_tokentx(address) or {}).get("result") or []
+    by_hash = {}
+    for t in toks:
+        by_hash.setdefault(t.get("hash"), []).append(t)
+    out = []
+    for tx in txs:
+        h=tx.get("hash")
+        xfers = by_hash.get(h, [])
+        if xfers:
+            legs = []
+            for tr in xfers:
+                amt = _D(tr.get("value")) / (Decimal(10) ** int(tr.get("tokenDecimal") or 18))
+                sym = (tr.get("tokenSymbol") or "?").upper()
+                side = "IN" if (tr.get("to","") or "").lower()==address.lower() else "OUT"
+                legs.append({"side":side, "asset":sym, "qty": str(amt), "price_usd": None, "usd": None})
+            if any(l["side"]=="IN" for l in legs) and any(l["side"]=="OUT" for l in legs):
+                out.append({"txid":h, "time": int(tx.get("timeStamp") or 0), "side":"SWAP", "legs":legs})
+                continue
+            for l in legs:
+                out.append({"txid":h, "time": int(tx.get("timeStamp") or 0), "side":l["side"], "asset":l["asset"], "qty": l["qty"], "price_usd": None, "usd": None})
+        else:
+            val = _D(tx.get("value")) / Decimal(10) ** 18
+            side = "IN" if (tx.get("to","") or "").lower()==address.lower() else "OUT"
+            out.append({"txid":h, "time": int(tx.get("timeStamp") or 0), "side":side, "asset":"CRO", "qty": str(val), "price_usd": None, "usd": None})
+    return out
