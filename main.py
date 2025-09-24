@@ -34,9 +34,9 @@ from utils.http import safe_get, safe_json
 from telegram.api import send_telegram, escape_md
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import (
-    append_ledger,
-    update_cost_basis as ledger_update_cost_basis,
-    replay_cost_basis_over_entries,
+append_ledger,
+update_cost_basis as ledger_update_cost_basis,
+replay_cost_basis_over_entries,
 )
 from reports.aggregates import aggregate_per_asset
 
