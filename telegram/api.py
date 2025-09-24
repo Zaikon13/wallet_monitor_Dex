@@ -47,7 +47,9 @@ def send_telegram(
     """
     global _last_message_text, _last_message_ts
 
-    if parse_mode == "MarkdownV2":
+    mode = parse_mode or None
+
+    if mode == "MarkdownV2":
         text = escape_md(text)
 
     if dedupe and _last_message_text == text and _last_message_ts is not None:
@@ -64,8 +66,8 @@ def send_telegram(
         "text": text,
         "disable_web_page_preview": True,
     }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
+    if mode:
+        payload["parse_mode"] = mode
 
     ok, status_code, response = _post(payload)
     if ok:
