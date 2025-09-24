@@ -1,86 +1,81 @@
-# main.py
-# Cronos DeFi Sentinel — drop-in aligned to your repo
-# Clean imports only; no non-existent symbols.
-
-import os
-import time
-import logging
-from decimal import Decimal, getcontext
+import os, sys, time, logging, signal, requests
 from dotenv import load_dotenv
-
-# ---- Internal imports (that exist in your repo) ----
+from reports.scheduler import start_eod_scheduler, run_pending
+from telegram.api import send_telegram_message
+from telegram.dispatcher import dispatch
+from core.watch import make_from_env
+from core.wallet_monitor import make_wallet_monitor
+from core.providers.cronos import fetch_wallet_txs
+from core.signals.server import start_signals_server_if_enabled
 from core.holdings import get_wallet_snapshot
-from core.alerts import check_pair_alert
-from reports.day_report import build_day_report_text
-from telegram.api import telegram_long_poll_loop, send_telegram
-from utils.http import safe_get, safe_json
+from core.guards import set_holdings
 
-# ---- Precision / context settings ----
-getcontext().prec = 28
-load_dotenv()
+_shutdown=False
+_updates_offset=None
 
-# ---- Logging ----
-log = logging.getLogger("main")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+def _setup_logging():
+    level=os.getenv("LOG_LEVEL","INFO").upper()
+    logging.basicConfig(level=getattr(logging, level, logging.INFO),
+                        format="%(asctime)s %(levelname)s %(message)s")
 
-def _env_float(key: str, default: float) -> float:
+def _handle(sig, frm):
+    global _shutdown; _shutdown=True
+
+def _poll_telegram_once():
+    global _updates_offset
     try:
-        return float(os.getenv(key, str(default)) or default)
-    except Exception:
-        return default
+        token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+        if not token: return
+        url=f"https://api.telegram.org/bot{token}/getUpdates"
+        params={"timeout": 10}
+        if _updates_offset is not None: params["offset"]=_updates_offset
+        r=requests.get(url, params=params, timeout=15)
+        resp=r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False}
+        if not resp.get("ok", True): return
+        for upd in resp.get("result", []):
+            _updates_offset = max(_updates_offset or 0, upd.get("update_id", 0) + 1)
+            msg=upd.get("message") or upd.get("edited_message") or {}
+            if not msg: continue
+            chat_id=(msg.get("chat") or {}).get("id"); text=msg.get("text")
+            if not text: continue
+            reply=dispatch(text, chat_id)
+            if reply: send_telegram_message(reply)
+    except Exception as e:
+        logging.debug("telegram poll failed: %s", e)
 
-def _env_list(key: str) -> list[str]:
-    raw = os.getenv(key, "") or ""
-    return [x.strip() for x in raw.split(",") if x.strip()]
+def main()->int:
+    load_dotenv(); _setup_logging()
+    send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
+    try: start_eod_scheduler()
+    except Exception as e: logging.warning("EOD scheduler error: %s", e)
+    watcher=make_from_env()
+    wallet_mon=make_wallet_monitor(provider=fetch_wallet_txs)
+    try: start_signals_server_if_enabled()
+    except Exception as e: logging.warning("signals server error: %s", e)
+    signal.signal(signal.SIGTERM, _handle); signal.signal(signal.SIGINT, _handle)
+    holdings_refresh = int(os.getenv("HOLDINGS_REFRESH_SEC","60") or 60); last_hold=0.0
+    wallet=os.getenv("WALLET_ADDRESS","")
+    poll=int(os.getenv("WALLET_POLL","15") or 15)
+    while not _shutdown:
+        t0=time.time()
+        try:
+            watcher.poll_once()
+            wallet_mon.poll_once()
+            run_pending()
+            if time.time()-last_hold >= holdings_refresh:
+                snap=get_wallet_snapshot(wallet) or {}
+                set_holdings(set(snap.keys()))
+                last_hold=time.time()
+            _poll_telegram_once()
+        except Exception as e:
+            logging.exception("loop error: %s", e)
+        time.sleep(max(0.5, poll - (time.time()-t0)))
+    return 0
 
-# ---- Main loop ----
-def run():
-    log.info("🟢 Starting Cronos DeFi Sentinel")
-
-    WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
-    RPC = os.getenv("RPC", "")
-    DEX_PAIRS = _env_list("DEX_PAIRS")
-    PRICE_MOVE_THRESHOLD = _env_float("PRICE_MOVE_THRESHOLD", 0.0)
-    INTRADAY_HOURS = _env_float("INTRADAY_HOURS", 1.0)
-
-    try:
-        while True:
-            # Snapshot wallet (core.holdings)
-            try:
-                # Support both signatures: (address) or (address, rpc)
-                try:
-                    snapshot = get_wallet_snapshot(WALLET_ADDRESS, RPC)
-                except TypeError:
-                    snapshot = get_wallet_snapshot(WALLET_ADDRESS)
-                log.info("Snapshot taken.")
-            except Exception:
-                log.exception("Failed to snapshot wallet")
-                snapshot = {"assets": [], "timestamp": None}
-
-            # Build + send report
-            try:
-                report = build_day_report_text(snapshot)
-                send_telegram(report)
-            except Exception:
-                log.exception("Failed to build/send report")
-
-            # Pair alerts
-            try:
-                for pair in DEX_PAIRS:
-                    alert = check_pair_alert(pair, PRICE_MOVE_THRESHOLD)
-                    if alert:
-                        send_telegram(alert)
-            except Exception:
-                log.exception("Pair alerts scan failed")
-
-            # Sleep cadence
-            sleep_s = max(60, int(INTRADAY_HOURS * 3600))
-            time.sleep(sleep_s)
-
-    except KeyboardInterrupt:
-        log.warning("🛑 Keyboard interrupt received. Shutting down.")
-    except Exception:
-        log.exception("Unexpected error in main loop")
-
-if __name__ == "__main__":
-    run()
+if __name__=="__main__":
+    try: sys.exit(main())
+    except Exception as e:
+        logging.exception("fatal: %s", e)
+        try: send_telegram_message(f"💥 Fatal error: {e}")
+        except Exception: pass
+        sys.exit(1)
