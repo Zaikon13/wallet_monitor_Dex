@@ -235,7 +235,8 @@ def _send_intraday_update() -> None:
         return
 
     if not snapshot:
-        send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
+        # Do not return an unterminated string; send a clear diagnostic message
+        send_telegram("❌ Empty snapshot (no balances).", dedupe=False)
         return
 
     if signature and signature == _last_intraday_signature:
