@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -8,6 +9,22 @@ from .formatters import escape_md
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+def _resolve_dedup_window(raw: str) -> float:
+    if not raw:
+        return 60.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.debug("invalid TG_DEDUP_WINDOW_SEC value: %s", raw)
+        return 60.0
+    return max(0.0, value)
+
+
+DEDUP_WINDOW_SEC = _resolve_dedup_window(os.getenv("TG_DEDUP_WINDOW_SEC", "").strip())
+_last_message_text: Optional[str] = None
+_last_message_ts: Optional[float] = None
 
 
 def _post(payload: Dict[str, Any]) -> Tuple[bool, int, Any]:
@@ -20,14 +37,23 @@ def _post(payload: Dict[str, Any]) -> Tuple[bool, int, Any]:
     return response.ok, response.status_code, response.text
 
 
-def send_telegram(text: str, parse_mode: Optional[str] = None) -> Tuple[bool, int, Any]:
+def send_telegram(
+    text: str, parse_mode: Optional[str] = None, dedupe: bool = True
+) -> Tuple[bool, int, Any]:
     """Send a Telegram message.
 
     Defaults to plain text. When MarkdownV2 is explicitly requested, escape the
     payload before sending it to Telegram.
     """
+    global _last_message_text, _last_message_ts
+
     if parse_mode == "MarkdownV2":
         text = escape_md(text)
+
+    if dedupe and _last_message_text == text and _last_message_ts is not None:
+        window = DEDUP_WINDOW_SEC
+        if window > 0 and (time.monotonic() - _last_message_ts) < window:
+            return True, 0, "deduped"
 
     if not TOKEN or not CHAT_ID:
         logging.info("[telegram] %s", text)
@@ -41,7 +67,11 @@ def send_telegram(text: str, parse_mode: Optional[str] = None) -> Tuple[bool, in
     if parse_mode:
         payload["parse_mode"] = parse_mode
 
-    return _post(payload)
+    ok, status_code, response = _post(payload)
+    if ok:
+        _last_message_text = text
+        _last_message_ts = time.monotonic()
+    return ok, status_code, response
 
 
 def send_telegram_message(text: str) -> None:
