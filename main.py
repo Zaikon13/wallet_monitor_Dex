@@ -1,356 +1,277 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Cronos DeFi Sentinel — main.py (stabilized, modular, aligned to current repo)
-
-- Uses existing modules exactly as present in the repo:
-  core.config, core.rpc, core.pricing, core.holdings, core.alerts, core.tz
-  reports.day_report, reports.aggregates, reports.ledger
-  telegram.api, telegram.formatters, telegram.dispatcher, telegram.commands
-  utils.http
-
-- Startup: applies env aliases, validates env (with local fallback if core.config.validate_env is missing),
-  configures logging, sends a single Telegram "online" message.
-
-- Concurrency: thread-safe shared dictionaries via RLock for price state; EOD scheduler runs safely.
-- Alerts: uses core.alerts.notify_*; fixes price-delta logic (read prev before write).
-- EOD: imports build_day_report_text and sends daily report at configured EOD_TIME.
-
-Assumptions:
-- Repo structure matches the tree you provided; no new files introduced.
-- This file avoids making breaking changes to other modules. Where a function might not exist yet
-  (e.g., core.config.validate_env), a local fallback is used so the program still boots cleanly.
-"""
-
-from __future__ import annotations
+# main.py
+# Wallet Monitor — runtime-stable launcher wired to the repo’s actual APIs.
+# - Plain-text Telegram sends (no MarkdownV2).
+# - TG long-poll thread.
+# - Intraday tick -> snapshot -> day report to Telegram.
+# - EOD day report & weekly report schedulers.
+# - Health ping.
+# - Defensive calls: tolerate differing call signatures and missing optional pieces.
 
 import os
-import sys
-import json
 import time
-import logging
 import threading
-from decimal import Decimal
-from typing import Dict, Any, Optional, Tuple, List
+import logging
+from decimal import Decimal, getcontext
 
-# Third-party
+getcontext().prec = 28
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("main")
+
+# ── Repo APIs that EXIST (per your exports) ─────────────────────────────────────
 try:
-    import schedule  # type: ignore
-except Exception:
-    schedule = None  # Scheduler is optional; EOD task will be skipped if missing
+    from core.holdings import get_wallet_snapshot                    # OK
+except Exception as e:
+    get_wallet_snapshot = None
+    log.error("core.holdings.get_wallet_snapshot unavailable: %s", e)
 
-# --- Repo modules (as-is) ---
-from core.config import apply_env_aliases
 try:
-    from core.config import validate_env as _validate_env  # may be missing in current repo
+    from core.runtime_state import update_snapshot, note_tick         # OK
+except Exception as e:
+    def update_snapshot(_): pass
+    def note_tick(): pass
+    log.warning("core.runtime_state helpers unavailable: %s", e)
+
+try:
+    from core.providers.cronos import fetch_wallet_txs                # OK (optional use)
 except Exception:
-    _validate_env = None
+    fetch_wallet_txs = None
 
-from core import rpc as core_rpc
-from core import pricing as core_pricing
-from core import holdings as core_holdings
-from core import tz as core_tz
+try:
+    from core.watch import make_from_env                              # OK (optional use)
+except Exception:
+    make_from_env = None
 
-from core.alerts import notify_error, notify_alert
+try:
+    from reports.day_report import build_day_report_text              # OK
+except Exception as e:
+    build_day_report_text = None
+    log.error("reports.day_report.build_day_report_text unavailable: %s", e)
 
-from reports.day_report import build_day_report_text
+try:
+    from reports.weekly import build_weekly_report_text               # OK
+except Exception:
+    build_weekly_report_text = None
 
-from telegram.api import send_telegram_message
-# Commands/dispatcher are present but polling loop is assumed elsewhere;
-# this main focuses on schedulers + monitoring loops integration.
-# from telegram.dispatcher import register_handlers  # if needed
-# from telegram.commands import ...  # handlers used by dispatcher
+try:
+    from reports.scheduler import run_pending as scheduler_run_pending  # OK (optional)
+except Exception:
+    scheduler_run_pending = None
 
-# --- Constants / Env ---
-APP_NAME = "Cronos DeFi Sentinel"
-DEFAULT_TZ = os.getenv("TZ", "Europe/Athens")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+try:
+    from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop  # OK
+except Exception as e:
+    send_telegram = None
+    send_telegram_messages = None
+    telegram_long_poll_loop = None
+    log.error("telegram.api unavailable: %s", e)
 
-# EOD_TIME may exist in env defaults memory; fallback to "23:59"
-EOD_TIME = os.getenv("EOD_TIME", "23:59")
+try:
+    import schedule  # python-schedule
+except Exception as e:
+    schedule = None
+    log.error("schedule module not available: %s", e)
 
-# Alert thresholds (keep existing names; read if present)
-PRICE_MOVE_THRESHOLD = Decimal(str(os.getenv("PRICE_MOVE_THRESHOLD", "5")))  # pct
-GUARD_WINDOW_MIN = int(os.getenv("GUARD_WINDOW_MIN", os.getenv("GUARD_WINDOW_MINUTES", "60")))
+# ── ENV helpers ────────────────────────────────────────────────────────────────
+def _env_str(k: str, default: str = "") -> str:
+    v = os.getenv(k)
+    return v if v not in (None, "") else default
 
-# Poll intervals
-WALLET_POLL_SEC = int(os.getenv("WALLET_POLL", "15"))
-DEX_POLL_SEC = int(os.getenv("DEX_POLL", "60"))
-
-# Logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-# --- Logging setup ---
-def setup_logging() -> None:
-    level = getattr(logging, LOG_LEVEL, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        stream=sys.stdout,
-    )
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-
-# --- Local fallback for validate_env (if missing in core.config) ---
-def _fallback_validate_env() -> None:
-    """
-    Minimal env validation if core.config.validate_env is absent.
-    Required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WALLET_ADDRESS, CRONOS_RPC_URL
-    """
-    required = [
-        "TELEGRAM_BOT_TOKEN",
-        "TELEGRAM_CHAT_ID",
-        "WALLET_ADDRESS",
-        "CRONOS_RPC_URL",
-    ]
-    missing = [k for k in required if not os.getenv(k)]
-    if missing:
-        msg = f"Missing required environment variables: {', '.join(missing)}"
-        logging.error(msg)
-        # Best-effort notification (if token/chat present)
-        try:
-            send_telegram_message(f"⚠️ {APP_NAME} failed to start: {msg}")
-        except Exception:
-            pass
-        raise SystemExit(2)
-
-
-def validate_env() -> None:
-    if _validate_env is not None:
-        _validate_env()
-    else:
-        _fallback_validate_env()
-
-
-# --- Thread-safe shared state for prices ---
-_prices_lock = threading.RLock()
-_last_prices: Dict[str, Decimal] = {}          # symbol -> last seen price
-_price_history: Dict[str, List[Tuple[float, Decimal]]] = {}  # symbol -> [(epoch, price), ...]
-
-def _d(x: Any) -> Decimal:
+def _env_float(k: str, default: float) -> float:
     try:
-        return Decimal(str(x))
+        return float(os.getenv(k, str(default)) or default)
     except Exception:
-        return Decimal("0")
+        return default
 
+def _start_thread(target, name: str):
+    t = threading.Thread(target=target, name=name, daemon=True)
+    t.start()
+    return t
 
-# --- Price utilities ---
-def get_symbol_price_usd(symbol: str) -> Optional[Decimal]:
-    """
-    Use core.pricing.get_price_usd with graceful handling.
-    """
+# ── Core ops ───────────────────────────────────────────────────────────────────
+def _safe_send(msg: str):
     try:
-        p = core_pricing.get_price_usd(symbol)
-        if p is None:
-            return None
-        return _d(p)
+        if send_telegram:
+            return send_telegram(msg)
+        log.warning("Telegram not available: %r", msg)
+        return False, "no-telegram"
     except Exception as e:
-        notify_error("pricing.get_price_usd", e)
-        return None
+        log.exception("Telegram send failed: %s", e)
+        return False, str(e)
 
-
-def update_price_state(symbol: str, price: Decimal, ts: Optional[float] = None) -> Optional[Decimal]:
-    """
-    Update price history safely and return % change from previous if available.
-    Fixes the regression: compute delta BEFORE writing the new price.
-    """
-    if ts is None:
-        ts = time.time()
-    with _prices_lock:
-        prev = _last_prices.get(symbol)
-        # Update history
-        hist = _price_history.setdefault(symbol, [])
-        hist.append((ts, price))
-        # Compute delta BEFORE overwrite
-        pct = None
-        if prev is not None and prev > 0:
-            try:
-                pct = (price - prev) / prev * Decimal("100")
-            except Exception:
-                pct = None
-        # Write the new price after computing delta
-        _last_prices[symbol] = price
-        return pct
-
-
-def maybe_alert_price_move(symbol: str, pct_move: Optional[Decimal]) -> None:
-    """
-    If pct_move crosses threshold, send alert. Uses PRICE_MOVE_THRESHOLD from env.
-    """
-    if pct_move is None:
+def _safe_send_many(parts):
+    if not parts:
         return
-    try:
-        thr = PRICE_MOVE_THRESHOLD
-    except Exception:
-        thr = Decimal("5")
-    try:
-        if pct_move >= thr:
-            notify_alert(f"{symbol} pumped {pct_move:.2f}%")
-        elif pct_move <= -thr:
-            notify_alert(f"{symbol} dumped {pct_move:.2f}%")
-    except Exception as e:
-        notify_error("maybe_alert_price_move", e)
+    if send_telegram_messages:
+        try:
+            return send_telegram_messages(parts)
+        except Exception:
+            log.exception("send_telegram_messages failed; falling back to singles")
+    for p in parts:
+        _safe_send(p)
 
-
-# --- Snapshot / Holdings ---
-def get_holdings_snapshot() -> Dict[str, Dict[str, Any]]:
-    """
-    Delegates to core.holdings.get_wallet_snapshot() if available.
-    Ensures CRO vs tCRO are not merged; core.holdings already respects this invariant.
-    """
-    try:
-        snap = core_holdings.get_wallet_snapshot()
-        return snap or {}
-    except Exception as e:
-        notify_error("holdings.get_wallet_snapshot", e)
+def _snapshot():
+    """Return latest wallet snapshot as dict; tolerate different signatures."""
+    if not get_wallet_snapshot:
         return {}
-
-
-# --- EOD report task ---
-def send_daily_report() -> None:
-    """
-    Build and send the daily report via Telegram.
-    Fully wrapped with exception handling; never raises.
-    """
+    addr = _env_str("WALLET_ADDRESS", "")
+    rpc  = _env_str("RPC", "")
     try:
-        text = build_day_report_text()
-        # Build function should return plain text; telegram.api will escape as needed
-        send_telegram_message(f"📒 Daily Report\n{text}")
-    except Exception as e:
-        logging.exception("Failed to build or send daily report")
         try:
-            send_telegram_message("⚠️ Failed to generate daily report.")
-        except Exception:
-            pass
-        notify_error("send_daily_report", e)
-
-
-# --- Wallet monitor loop (lightweight placeholder using current modules) ---
-def wallet_monitor_loop(stop_event: threading.Event) -> None:
-    """
-    Lightweight loop:
-    - polls wallet snapshot for primary symbols
-    - fetches prices and updates price state
-    - triggers price move alerts when threshold is crossed
-
-    Uses only repo-present helpers to avoid cross-file API mismatches.
-    """
-    symbols_to_track: List[str] = []
-    last_symbol_scan = 0.0
-
-    while not stop_event.is_set():
-        t0 = time.time()
-        try:
-            # Refresh tracked symbols every 60s based on current snapshot
-            if t0 - last_symbol_scan > 60:
-                snapshot = get_holdings_snapshot()
-                symbols_to_track = sorted(list(snapshot.keys()))
-                last_symbol_scan = t0
-
-            # Update prices for tracked symbols
-            for sym in symbols_to_track:
-                p = get_symbol_price_usd(sym)
-                if p is None:
-                    continue
-                pct = update_price_state(sym, p, ts=t0)
-                maybe_alert_price_move(sym, pct)
-
-        except Exception as e:
-            notify_error("wallet_monitor_loop", e)
-
-        # sleep
-        time.sleep(max(1, WALLET_POLL_SEC))
-
-
-# --- Scheduler thread ---
-def scheduler_loop(stop_event: threading.Event) -> None:
-    """
-    Runs schedule.run_pending() periodically if 'schedule' is available.
-    """
-    if schedule is None:
-        logging.warning("schedule module not available; EOD task disabled.")
-        return
-
-    # Bind EOD job once at startup
+            snap = get_wallet_snapshot(addr, rpc)
+        except TypeError:
+            snap = get_wallet_snapshot(addr)
+    except Exception:
+        log.exception("get_wallet_snapshot failed")
+        snap = {}
     try:
-        schedule.clear("eod")
+        update_snapshot(snap)
     except Exception:
         pass
-    try:
-        schedule.every().day.at(EOD_TIME).do(send_daily_report).tag("eod")
-        logging.info(f"EOD daily report scheduled at {EOD_TIME}")
-    except Exception as e:
-        notify_error("scheduler_bind_eod", e)
+    return snap
 
-    while not stop_event.is_set():
+# ── Reports ────────────────────────────────────────────────────────────────────
+def _day_report_text(snap):
+    if not build_day_report_text:
+        return "No day report available."
+    try:
         try:
-            schedule.run_pending()
-        except Exception as e:
-            notify_error("scheduler.run_pending", e)
+            return build_day_report_text(snap)
+        except TypeError:
+            return build_day_report_text()
+    except Exception:
+        log.exception("build_day_report_text failed")
+        return "Failed to build day report."
+
+def _weekly_report_text():
+    if not build_weekly_report_text:
+        return "No weekly report available."
+    try:
+        return build_weekly_report_text()
+    except Exception:
+        log.exception("build_weekly_report_text failed")
+        return "Failed to build weekly report."
+
+# ── Workers ────────────────────────────────────────────────────────────────────
+def _schedule_worker():
+    """Drives both python-schedule and optional reports.scheduler.run_pending."""
+    if not schedule and not scheduler_run_pending:
+        log.error("No scheduler available; skipping schedule worker")
+        return
+    while True:
+        try:
+            if schedule:
+                schedule.run_pending()
+            if scheduler_run_pending:
+                try:
+                    scheduler_run_pending()
+                except Exception:
+                    log.exception("reports.scheduler.run_pending error")
+        except Exception:
+            log.exception("schedule worker error")
         time.sleep(1)
 
+def _tg_longpoll_worker():
+    if callable(telegram_long_poll_loop):
+        try:
+            telegram_long_poll_loop()
+        except Exception:
+            log.exception("telegram long-poll loop crashed")
+    else:
+        log.warning("telegram_long_poll_loop missing; skipping TG thread")
 
-# --- Startup helpers ---
-def _send_startup_ping() -> None:
+def _intraday_tick():
+    """One cycle: snapshot -> day report -> send."""
     try:
-        send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
-    except Exception as e:
-        logging.warning(f"Telegram startup message failed: {e}")
+        snap = _snapshot()
+        txt  = _day_report_text(snap)
+        if not txt:
+            txt = "No updates."
+        # Chunk if extremely long
+        if len(txt) > 3500 and send_telegram_messages:
+            # naive chunking on paragraphs
+            parts, acc = [], []
+            size = 0
+            for line in txt.splitlines():
+                size += len(line) + 1
+                acc.append(line)
+                if size > 3000:
+                    parts.append("\n".join(acc)); acc=[]; size=0
+            if acc: parts.append("\n".join(acc))
+            _safe_send_many(parts)
+        else:
+            _safe_send("🕒 Intraday Update\n" + txt)
+        try:
+            note_tick()
+        except Exception:
+            pass
+    except Exception:
+        log.exception("intraday tick error")
+        _safe_send("⚠️ runtime error (intraday)")
 
+# ── Main ───────────────────────────────────────────────────────────────────────
+def run():
+    log.info("🟢 Starting Wallet Monitor")
 
-def bootstrap() -> Tuple[threading.Event, List[threading.Thread]]:
-    """
-    Boot sequence:
-    - Apply env aliases
-    - Validate env (with fallback)
-    - Config logging
-    - Startup ping
-    - Start background threads (wallet monitor, scheduler)
-    """
-    apply_env_aliases()
-    validate_env()
-    setup_logging()
+    # TG long-poll
+    _start_thread(_tg_longpoll_worker, "tg-long-poll")
 
-    logging.info(f"Starting {APP_NAME}")
-    _send_startup_ping()
+    # Startup ping
+    _safe_send("✅ Cronos DeFi Sentinel started and is online.")
 
-    stop_event = threading.Event()
-    threads: List[threading.Thread] = []
+    # Scheduling
+    if schedule:
+        EOD_TIME   = _env_str("EOD_TIME", "23:59")
+        HEALTH_MIN = int(_env_float("HEALTH_MIN", 30))
+        WEEKLY_DOW = _env_str("WEEKLY_DOW", "SUN").upper()
+        WEEKLY_TIME= _env_str("WEEKLY_TIME", "18:00")
 
-    # Wallet monitor
-    t_wallet = threading.Thread(
-        target=wallet_monitor_loop, args=(stop_event,), name="wallet-monitor", daemon=True
-    )
-    t_wallet.start()
-    threads.append(t_wallet)
+        # EOD day report
+        try:
+            schedule.every().day.at(EOD_TIME).do(lambda: (_safe_send("📒 Daily Report\n" + _day_report_text(_snapshot())), True))
+            log.info("daily report scheduled at %s", EOD_TIME)
+        except Exception:
+            log.exception("bind EOD failed")
 
-    # Scheduler
-    t_sched = threading.Thread(
-        target=scheduler_loop, args=(stop_event,), name="scheduler", daemon=True
-    )
-    t_sched.start()
-    threads.append(t_sched)
-
-    return stop_event, threads
-
-
-def main() -> None:
-    stop_event, threads = bootstrap()
-    try:
-        # keep main thread alive
-        while True:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        logging.info("Shutdown requested, stopping threads...")
-        stop_event.set()
-        for t in threads:
+        # Weekly report (simple: fire every day at WEEKLY_TIME; guard inside for DOW)
+        def _weekly_job():
             try:
-                t.join(timeout=5.0)
+                import datetime as _dt
+                dow = _dt.datetime.now().strftime("%a").upper()  # e.g., 'SUN'
+                if dow == WEEKLY_DOW:
+                    _safe_send("🗓 Weekly Report\n" + _weekly_report_text())
             except Exception:
-                pass
-        logging.info("Stopped.")
+                log.exception("weekly job failed")
+            return True
+        try:
+            schedule.every().day.at(WEEKLY_TIME).do(_weekly_job)
+            log.info("weekly report scheduled every %s at %s", WEEKLY_DOW, WEEKLY_TIME)
+        except Exception:
+            log.exception("bind weekly failed")
 
+        # Health ping
+        try:
+            schedule.every(HEALTH_MIN).minutes.do(lambda: (_safe_send("✅ alive"), True))
+            log.info("health ping scheduled every %s minute(s)", HEALTH_MIN)
+        except Exception:
+            log.exception("bind health failed")
+
+        # Start schedule worker
+        _start_thread(_schedule_worker, "schedule-worker")
+    else:
+        log.error("python-schedule unavailable; timers disabled")
+
+    # First tick then loop
+    try:
+        _intraday_tick()
+    except Exception:
+        log.exception("first tick failed")
+
+    INTRADAY_HOURS = _env_float("INTRADAY_HOURS", 1.0)
+    sleep_s = max(60, int(INTRADAY_HOURS * 3600))
+    while True:
+        _intraday_tick()
+        log.info("sleeping %ss until next tick", sleep_s)
+        time.sleep(sleep_s)
 
 if __name__ == "__main__":
-    main()
+    run()
