@@ -1,7 +1,6 @@
 # main.py
 # Cronos DeFi Sentinel — minimal, repo-aligned entrypoint
-# This section covers: clean imports, boot loop, snapshot → report → alerts, Telegram send, graceful shutdown.
-# Nothing else is added or changed beyond import/name normalization.
+# Clean imports only (no ghost symbols)
 
 import os
 import sys
@@ -17,19 +16,7 @@ from decimal import Decimal, getcontext
 
 from dotenv import load_dotenv
 
-# ---- Internal imports (aligned with repo) ----
-from core.config import (
-    DATA_DIR,
-    LOCK,
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
-    WALLET_ADDRESS,
-    RPC,
-    TZ,
-    INTRADAY_HOURS,
-    DEX_PAIRS,
-    PRICE_MOVE_THRESHOLD,
-)
+# ---- Internal imports (aligned with actual repo) ----
 from core.rpc import snapshot_wallet
 from core.holdings import get_wallet_snapshot
 from core.alerts import check_pair_alert
@@ -54,30 +41,33 @@ def run():
 
     try:
         while True:
-            with LOCK:
-                # Snapshot (RPC state of wallet)
-                snapshot = snapshot_wallet(WALLET_ADDRESS, RPC)
-                log.info("Snapshot taken at %s", snapshot.get("timestamp"))
+            # Snapshot (RPC state of wallet)
+            snapshot = snapshot_wallet(os.getenv("WALLET_ADDRESS", ""), os.getenv("RPC", ""))
+            log.info("Snapshot taken at %s", snapshot.get("timestamp"))
 
-                # Build & send daily-style text for current snapshot
-                report = build_day_report_text(snapshot)
-                try:
-                    send_telegram(report)
-                except Exception:
-                    log.exception("Failed to send snapshot report to Telegram")
+            # Build & send daily-style text for current snapshot
+            report = build_day_report_text(snapshot)
+            try:
+                send_telegram(report)
+            except Exception:
+                log.exception("Failed to send snapshot report to Telegram")
 
-                # Pair alerts (per-pair check; only send if alert text is returned)
-                try:
-                    for pair in DEX_PAIRS:
-                        alert = check_pair_alert(pair, PRICE_MOVE_THRESHOLD)
-                        if alert:
-                            send_telegram(alert)
-                except Exception:
-                    log.exception("Pair alerts scan failed")
+            # Pair alerts (per-pair check; only send if alert text is returned)
+            try:
+                pairs = (os.getenv("DEX_PAIRS", "") or "").split(",")
+                threshold = float(os.getenv("PRICE_MOVE_THRESHOLD", "0") or 0)
+                for pair in pairs:
+                    if not pair:
+                        continue
+                    alert = check_pair_alert(pair, threshold)
+                    if alert:
+                        send_telegram(alert)
+            except Exception:
+                log.exception("Pair alerts scan failed")
 
             # Sleep for configured intraday cadence
             try:
-                sleep_s = max(60, int(INTRADAY_HOURS * 3600))
+                sleep_s = max(60, int(float(os.getenv("INTRADAY_HOURS", "1")) * 3600))
             except Exception:
                 sleep_s = 3600
             time.sleep(sleep_s)
