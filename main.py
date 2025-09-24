@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cronos DeFi Sentinel — main.py (holdings-compatible)
-- Compatible with etherscan_like snapshot shape:
-  { "SYM": {"qty": "123.45" or "?", "price_usd": "0.1234" or None, "usd": "12.34" or None}, ... }
-- Keeps your existing structure: schedule, watcher, wallet_monitor, telegram long-poll.
-- Adds diagnostics when snapshot is empty (RPC/env hints if available).
+Cronos DeFi Sentinel — main.py (unified, <1000 lines)
+- Compatible with new telegram/dispatcher.py & commands.py
+- Tolerant to etherscan_like snapshot shape (qty/amount, usd/value_usd/usd_value, price/price_usd)
+- Diagnostics on empty snapshot (RPC block, wallet, CRO probe)
+- Uses alerts if core.alerts is available (notify_error/notify_alert)
+- Keeps existing watcher + wallet monitor + scheduler flow
 """
+
+from __future__ import annotations
 
 import logging
 import os
@@ -20,22 +23,36 @@ from typing import Optional, Tuple
 import schedule
 from dotenv import load_dotenv
 
+# ---- Core imports ----
 from core.guards import set_holdings
-from core.holdings import get_wallet_snapshot  # your etherscan_like-compatible function
-from core.providers.cronos import fetch_wallet_txs  # used by wallet monitor factory
+from core.holdings import get_wallet_snapshot
+from core.providers.cronos import fetch_wallet_txs
 from core.runtime_state import note_tick, update_snapshot
 from core.watch import make_from_env
 from core.wallet_monitor import make_wallet_monitor
 from reports.day_report import build_day_report_text
 from reports.weekly import build_weekly_report_text
 from reports.scheduler import run_pending
-from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop
+from telegram.api import (
+    send_telegram,
+    send_telegram_messages,
+    telegram_long_poll_loop,
+)
 from telegram.dispatcher import dispatch
 
-# Optional: extra diagnostics if present in your repo
-try:
+# Optional alerts wiring
+try:  # pragma: no cover
+    from core.alerts import notify_error, notify_alert  # type: ignore
+except Exception:  # fallback no-op wrappers
+    def notify_error(context: str, err: Exception):
+        logging.error("%s: %s", context, err)
+    def notify_alert(text: str):
+        logging.warning(text)
+
+# Optional diagnostics helpers
+try:  # pragma: no cover
     from core.providers.cronos import ping_block_number, get_native_balance, rpc_url  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:  # graceful fallbacks
     def ping_block_number():
         return None
     def get_native_balance(_addr: str):
@@ -43,7 +60,8 @@ except Exception:  # pragma: no cover
     def rpc_url() -> str:
         return os.getenv("CRONOS_RPC_URL", "")
 
-try:
+# Optional signals server
+try:  # pragma: no cover
     from core.signals.server import start_signals_server_if_enabled
 except ModuleNotFoundError:  # pragma: no cover
     def start_signals_server_if_enabled():
@@ -64,8 +82,8 @@ def _env_str(name: str, default: str = "") -> str:
     raw = os.getenv(name)
     if raw is None:
         return default
-    value = raw.strip()
-    return value if value else default
+    v = raw.strip()
+    return v if v else default
 
 
 def _env_float(name: str, default: float) -> float:
@@ -95,16 +113,16 @@ def _handle_shutdown(sig, frm):
     global _shutdown
     _shutdown = True
     try:
-        send_telegram("🛑 Sentinel stopping...", dedupe=False)
+        notify_alert("Sentinel stopping...")
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# Safe numeric parsing (handles str, None, '?')
+# Safe numeric parsing for mixed payload shapes
 # ---------------------------------------------------------------------------
 
-def _to_decimal(x) -> Decimal:
+def _to_dec(x) -> Decimal:
     if x is None:
         return Decimal("0")
     if isinstance(x, (int, float, Decimal)):
@@ -121,18 +139,14 @@ def _to_decimal(x) -> Decimal:
         return Decimal("0")
 
 
-def _payload_to_qty_usd(payload: dict) -> Tuple[Decimal, Decimal]:
-    """
-    Accepts etherscan_like payload with keys {'qty','usd','price_usd'} as strings/None/'?'
-    Returns (qty_dec, usd_dec) always as Decimals.
-    """
-    if not isinstance(payload, dict):
+def _payload_qty_usd(p: dict) -> Tuple[Decimal, Decimal]:
+    """Accepts payloads with keys: qty/amount, usd/value_usd/usd_value, price/price_usd."""
+    if not isinstance(p, dict):
         return Decimal("0"), Decimal("0")
-    qty = _to_decimal(payload.get("qty") or payload.get("amount"))
-    usd = _to_decimal(payload.get("usd") or payload.get("value_usd") or payload.get("usd_value"))
+    qty = _to_dec(p.get("amount", p.get("qty", 0)))
+    usd = _to_dec(p.get("usd") or p.get("value_usd") or p.get("usd_value"))
     if usd == 0:
-        # compute from qty * price if provided
-        px = _to_decimal(payload.get("price_usd"))
+        px = _to_dec(p.get("price") or p.get("price_usd"))
         if px != 0 and qty != 0:
             try:
                 usd = (qty * px).quantize(Decimal("0.0001"))
@@ -141,21 +155,17 @@ def _payload_to_qty_usd(payload: dict) -> Tuple[Decimal, Decimal]:
     return qty, usd
 
 
-# ---------------------------------------------------------------------------
-# Snapshot signature & diagnostics
-# ---------------------------------------------------------------------------
-
 def _snapshot_signature(snapshot: dict) -> tuple:
-    """
-    Hashable signature based on symbol + normalized qty/usd strings.
-    Works with stringy values (e.g., '0.0', '0', '?').
-    """
     items = []
-    for symbol, payload in sorted(snapshot.items()):
-        qty, usd = _payload_to_qty_usd(payload)
-        items.append((symbol, str(qty), str(usd)))
+    for sym, payload in sorted(snapshot.items()):
+        q, u = _payload_qty_usd(payload)
+        items.append((sym, str(q), str(u)))
     return tuple(items)
 
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
 
 def _diagnostics_empty_snapshot(addr: str) -> str:
     lines = ["🧾 Holdings", "❌ Empty snapshot", ""]
@@ -172,8 +182,9 @@ def _diagnostics_empty_snapshot(addr: str) -> str:
     except Exception:
         lines.append("• CRO balance probe: (error)")
     lines.append("")
-    lines.append("Tip: TOKENS_ADDRS / TOKENS_DECIMALS help ERC-20 visibility.")
-    return "\n".join(lines)
+    lines.append("Tip: set TOKENS_ADDRS / TOKENS_DECIMALS for ERC-20 balances.")
+    return "
+".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -189,21 +200,17 @@ def _send_daily_report() -> None:
             wallet=_wallet_address,
             snapshot=snapshot,
         )
+        send_telegram_messages([report])
     except Exception as exc:
-        logging.exception("daily report generation failed: %s", exc)
-        send_telegram("⚠️ Failed to generate daily report.", dedupe=False)
-        return
-    send_telegram_messages([report])
+        notify_error("daily report generation", exc)
 
 
 def _send_weekly_report(days: int = 7) -> None:
     try:
         report = build_weekly_report_text(days=days, wallet=_wallet_address)
+        send_telegram_messages([report])
     except Exception as exc:
-        logging.exception("weekly report generation failed: %s", exc)
-        send_telegram("⚠️ Failed to generate weekly report.", dedupe=False)
-        return
-    send_telegram_messages([report])
+        notify_error("weekly report generation", exc)
 
 
 def _send_health_ping() -> None:
@@ -214,7 +221,7 @@ def _send_health_ping() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Intraday update (tolerant to string/bare values)
+# Intraday
 # ---------------------------------------------------------------------------
 
 def _send_intraday_update() -> None:
@@ -224,8 +231,7 @@ def _send_intraday_update() -> None:
         update_snapshot(snapshot, time.time())
         signature = _snapshot_signature(snapshot)
     except Exception as exc:
-        logging.exception("intraday snapshot failed: %s", exc)
-        send_telegram("⚠️ Failed to refresh snapshot.", dedupe=False)
+        notify_error("intraday snapshot", exc)
         return
 
     if not snapshot:
@@ -233,7 +239,10 @@ def _send_intraday_update() -> None:
         return
 
     if signature and signature == _last_intraday_signature:
-        send_telegram("⌛ cooldown")
+        try:
+            send_telegram("⌛ cooldown")
+        except Exception:
+            pass
         return
 
     _last_intraday_signature = signature
@@ -241,28 +250,26 @@ def _send_intraday_update() -> None:
     total_usd = Decimal("0")
     top_symbol = None
     top_value = Decimal("0")
-
     for symbol, payload in snapshot.items():
-        _, usd = _payload_to_qty_usd(payload)
+        _, usd = _payload_qty_usd(payload)
         total_usd += usd
         if usd > top_value:
-            top_symbol = symbol
-            top_value = usd
+            top_symbol, top_value = symbol, usd
 
-    lines = ["🕒 Intraday Update"]
     try:
         total_str = f"{float(total_usd):,.2f}"
     except Exception:
         total_str = str(total_usd)
 
-    lines.append(f"Assets: {len(snapshot)} | Total ≈ ${total_str}")
+    lines = ["🕒 Intraday Update", f"Assets: {len(snapshot)} | Total ≈ ${total_str}"]
     if top_symbol:
         try:
             top_str = f"{float(top_value):,.2f}"
         except Exception:
             top_str = str(top_value)
         lines.append(f"Top: {top_symbol.upper()} ≈ ${top_str}")
-    send_telegram_messages(["\n".join(lines)])
+    send_telegram_messages(["
+".join(lines)])
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +297,13 @@ def _schedule_weekly_job(dow: str, at_time: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Telegram long-poll thread (existing implementation hook)
+# Telegram long-poll thread
 # ---------------------------------------------------------------------------
 
 def _start_telegram_thread() -> None:
     if not callable(telegram_long_poll_loop):
         return
-    tg_thread = threading.Thread(target=telegram_long_poll_loop, args=(dispatch,), daemon=True)
-    tg_thread.start()
+    threading.Thread(target=telegram_long_poll_loop, args=(dispatch,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +315,6 @@ def main() -> int:
     load_dotenv()
     _setup_logging()
 
-    # Log essentials so misconfig is visible
     _wallet_address = _env_str("WALLET_ADDRESS", "")
     logging.info("WALLET_ADDRESS=%s", _wallet_address or "(missing)")
     logging.info("CRONOS_RPC_URL=%s", rpc_url() or "(missing)")
@@ -354,11 +359,11 @@ def main() -> int:
     else:
         logging.info("intraday updates disabled")
 
-    # Watchers / monitors
+    # Watchers
     watcher = make_from_env()
     wallet_mon = make_wallet_monitor(provider=fetch_wallet_txs)
 
-    # Optional signals server
+    # Signals server (optional)
     try:
         start_signals_server_if_enabled()
     except Exception as exc:
@@ -384,11 +389,9 @@ def main() -> int:
             note_tick()
             run_pending()
 
-            # Refresh holdings and expose set of symbols (even if qty='?')
             if time.time() - last_hold >= holdings_refresh:
                 snapshot = get_wallet_snapshot(_wallet_address) or {}
                 update_snapshot(snapshot, time.time())
-                # set_holdings expects a set of identifiers; tolerate '?' and strings
                 try:
                     set_holdings(set(snapshot.keys()))
                 except Exception as e:
@@ -403,13 +406,12 @@ def main() -> int:
             global _last_error_ts
             if now - _last_error_ts >= 120:
                 try:
-                    send_telegram("⚠️ runtime error (throttled)", dedupe=False)
+                    notify_error("runtime loop", exc)
                 except Exception:
                     pass
                 _last_error_ts = now
 
-        sleep_for = max(0.5, _env_float("WALLET_POLL", 15.0) - (time.time() - t0))
-        time.sleep(sleep_for)
+        time.sleep(max(0.5, _env_float("WALLET_POLL", 15.0) - (time.time() - t0)))
     return 0
 
 
@@ -419,7 +421,7 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception("fatal: %s", exc)
         try:
-            send_telegram(f"💥 Fatal error: {exc}")
+            notify_error("fatal", exc)
         except Exception:
             pass
         sys.exit(1)
