@@ -1,199 +1,134 @@
-from __future__ import annotations
-
-"""
-Cronos DeFi Sentinel — main.py (FULL, 3 parts)
-
-Features:
-- RPC snapshot (CRO + ERC-20)
-- Dexscreener pricing (+history fallback)
-- Cost-basis PnL (realized & unrealized)
-- Intraday/EOD reports
-- Alerts (24h pump/dump) & Guard window
-- Telegram long-poll commands:
-  /status, /diag, /rescan
-  /holdings, /show_wallet_assets, /showwalletassets, /show
-  /dailysum, /showdaily, /report
-  /totals, /totalstoday, /totalsmonth
-  /pnl [today|month|all]
-
-Compatible helpers:
-  utils/http.py, telegram/api.py, reports/day_report.py,
-  reports/ledger.py, reports/aggregates.py
-"""
-
-# =====================================
-# PART I — Bootstrap & Imports
-# =====================================
-import argparse
 import logging
 import os
+import signal
 import sys
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Optional
 
-# Optional .env
-try:  # pragma: no cover
-    from dotenv import load_dotenv  # type: ignore
-except Exception:  # pragma: no cover
-    def load_dotenv(*_a, **_k):
-        return False
+import schedule
+from dotenv import load_dotenv
 
-load_dotenv()
-
-# Core config/state
-from core.config import apply_env_aliases, validate_env
-from core.runtime_state import note_tick, update_snapshot
+from core.config import apply_env_aliases, require_env
 from core.holdings import get_wallet_snapshot
-from core.wallet_monitor import make_wallet_monitor
-from core.providers.cronos import fetch_wallet_txs
-from core.signals.server import start_signals_server_if_enabled
-
-# Reports & PnL
+from core.runtime_state import note_tick, update_snapshot
+from core.watch import make_from_env
 from reports.day_report import build_day_report_text
-from reports.ledger import update_cost_basis
+from reports.scheduler import EOD_TIME, run_pending
+from telegram.api import send_telegram_message, telegram_long_poll_loop
+from telegram.dispatcher import dispatch
 
-# Telegram I/O
-from telegram.api import send_telegram, telegram_long_poll_loop
+try:
+    from core.signals.server import start_signals_server_if_enabled
+except ModuleNotFoundError:
+    def start_signals_server_if_enabled():
+        logging.warning("signals server disabled: Flask missing")
 
-
-# =====================================
-# PART II — Services, Dispatcher & Runners
-# =====================================
-
-def _bootstrap_logging() -> None:
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+_shutdown = False
+_wallet_address: Optional[str] = None
 
 
-def _bootstrap_env(strict: bool = False) -> None:
-    apply_env_aliases()
-    ok, warns = validate_env(strict=strict)
-    for w in warns:
-        logging.warning(w)
-    if not ok:
-        logging.warning("Environment not fully configured; some features may be disabled.")
+def _env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default)
 
 
-# --- Command aliases over telegram.commands ---
-from telegram import commands as tcmd
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) == "1"
 
 
-def _alias(text: str) -> List[str]:
-    """Return replies for supported command aliases."""
-    txt = (text or "").strip()
-    if not txt:
-        return []
-    parts = txt.split()
-    cmd = parts[0].lower()
-    args = parts[1:]
-
-    if cmd in {"/status"}:
-        return [tcmd.handle_status()]
-    if cmd in {"/diag"}:
-        return [tcmd.handle_diag()]
-    if cmd in {"/rescan"}:
-        snap = get_wallet_snapshot()
-        update_snapshot(snap, time.time())
-        try:
-            update_cost_basis()
-        except Exception as exc:
-            logging.debug("cost basis update failed: %s", exc)
-        return ["Rescan completed."]
-
-    if cmd in {"/holdings", "/show_wallet_assets", "/showwalletassets", "/show"}:
-        return [tcmd.handle_holdings()]
-
-    if cmd in {"/dailysum", "/showdaily", "/report"}:
-        return [tcmd.handle_daily()]
-
-    if cmd in {"/totals", "/totalstoday", "/totalsmonth"}:
-        return [tcmd.handle_totals()]
-
-    if cmd == "/pnl":
-        scope = args[0].lower() if args else None
-        if scope in {"today", "month", "all"}:
-            return [tcmd.handle_pnl(scope)]
-        return [tcmd.handle_pnl(args[0]) if args else tcmd.handle_pnl(None)]
-
-    return []
+def graceful_shutdown(signum=None, frame=None):
+    global _shutdown
+    logging.info(f"Shutting down due to signal {signum}")
+    _shutdown = True
 
 
-def _tg_loop_worker() -> None:
-    telegram_long_poll_loop(_alias)
-
-
-def _start_thread(target: Callable[[], None], name: str) -> threading.Thread:
-    t = threading.Thread(target=target, name=name, daemon=True)
+def start_watchdog():
+    def loop():
+        while not _shutdown:
+            time.sleep(60)
+            logging.info("🫀 Alive watchdog ping")
+    t = threading.Thread(target=loop, daemon=True)
     t.start()
-    return t
 
 
-def _single_poll_and_report() -> int:
-    mon = make_wallet_monitor(provider=fetch_wallet_txs)
-    polled = mon.poll_once()
-    snap = get_wallet_snapshot()
-    update_snapshot(snap, time.time())
-    text = build_day_report_text(
-        intraday=False, wallet=os.getenv("WALLET_ADDRESS", ""), snapshot=snap
-    )
-    print(text)
-    return 0 if polled >= 0 else 1
+def send_startup_ping():
+    send_telegram_message("✅ Cronos DeFi Sentinel started and is online.")
 
 
-def _diag_print() -> int:
-    print("Cronos DeFi Sentinel — quick diagnostics…")
-    _bootstrap_env(False)
-    print("Env validation completed. If warnings above, check .env.")
-    return 0
+def send_daily_report():
+    try:
+        text = build_day_report_text()
+        send_telegram_message(f"📒 Daily Report\n{text}")
+    except Exception as e:
+        logging.exception("Failed to build or send daily report")
+        send_telegram_message("⚠️ Failed to generate daily report.")
 
 
-# =====================================
-# PART III — CLI Entrypoint
-# =====================================
+def main_loop():
+    global _wallet_address
+    logging.info("Starting Cronos DeFi Sentinel")
+    if os.path.exists(".env"):
+        load_dotenv(".env")
+    apply_env_aliases()
+    _wallet_address = require_env("WALLET_ADDRESS")
 
-def main(argv: Optional[List[str]] = None) -> int:
-    argv = argv if argv is not None else sys.argv[1:]
+    start_signals_server_if_enabled()
+    send_startup_ping()
+    start_watchdog()
 
-    parser = argparse.ArgumentParser(prog="Cronos DeFi Sentinel")
-    parser.add_argument("--once", action="store_true", help="Single poll + snapshot + print daily")
-    parser.add_argument("--diag", action="store_true", help="Quick diagnostics and exit")
-    args = parser.parse_args(argv)
+    logging.info(f"Monitoring wallet: {_wallet_address}")
+    schedule.every().day.at(EOD_TIME).do(send_daily_report)
 
-    _bootstrap_logging()
-    _bootstrap_env(False)
-
-    if args.diag:
-        return _diag_print()
-    if args.once:
-        return _single_poll_and_report()
-
-    # Long-running mode
-    start_signals_server_if_enabled()  # HTTP /healthz + /signal (guard window)
-    _start_thread(_tg_loop_worker, "tg-long-poll")
-
-    mon = make_wallet_monitor(provider=fetch_wallet_txs)
-    poll_s = max(5, int(os.getenv("WALLET_POLL_INTERVAL", "30") or 30))
-    logging.info("Poll interval: %ss", poll_s)
-
-    while True:
+    monitor = make_wallet_monitor(_wallet_address)
+    while not _shutdown:
         try:
+            monitor.tick()
             note_tick()
-            mon.poll_once()
-            snap = get_wallet_snapshot()
-            update_snapshot(snap, time.time())
-        except Exception as exc:  # pragma: no cover
-            logging.debug("main loop error: %s", exc, exc_info=True)
-            try:
-                send_telegram(f"⚠️ runtime error: {exc}")
-            except Exception:
-                pass
-        finally:
-            time.sleep(poll_s)
+            run_pending()
+            time.sleep(15)
+        except Exception as e:
+            logging.exception("Tick failure")
+            send_telegram_message(f"❌ Tick failure: {e}")
+            time.sleep(15)
+
+
+def cli_diag():
+    snapshot = get_wallet_snapshot()
+    print("\n==== WALLET SNAPSHOT ====")
+    for sym, info in snapshot.items():
+        print(f"{sym:8} {info['amount']:>15,.4f}   ≈ {info['usd_value']:>10,.2f} USD")
+
+
+def cli_once():
+    snapshot = update_snapshot()
+    print("\n==== UPDATED SNAPSHOT ====")
+    for sym, info in snapshot.items():
+        print(f"{sym:8} {info['amount']:>15,.4f}   ≈ {info['usd_value']:>10,.2f} USD")
+    print("\n==== DAILY REPORT ====")
+    print(build_day_report_text())
+
+
+def make_wallet_monitor(wallet_address: str):
+    from core.providers.cronos import fetch_wallet_txs
+    from core.wallet_monitor import make_wallet_monitor
+    return make_wallet_monitor(wallet_address, fetch_wallet_txs)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    signal.signal(signal.SIGINT, graceful_shutdown)
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+
+    if len(sys.argv) > 1:
+        match sys.argv[1]:
+            case "--once":
+                cli_once()
+            case "--diag":
+                cli_diag()
+            case _:  # Unknown CLI arg
+                print("Unknown argument")
+                sys.exit(1)
+    else:
+        threading.Thread(target=telegram_long_poll_loop, daemon=True).start()
+        dispatch()  # long-poll Telegram bot commands
+        main_loop()
