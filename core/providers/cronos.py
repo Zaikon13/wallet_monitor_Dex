@@ -13,7 +13,7 @@ def _coerce_tx_list(data: Any) -> List[Dict[str, object]]:
     resp = safe_json(data) or {}
     txs = resp.get("result") or resp.get("txs") or []
     if not isinstance(txs, list):
-        return []
+        txs = []
     out: List[Dict[str, object]] = []
     for item in txs:
         if isinstance(item, dict):
@@ -34,6 +34,8 @@ def fetch_wallet_txs(address: str) -> List[Dict[str, object]]:
 
     by_hash: Dict[str, List[Dict[str, object]]] = {}
     for t in toks:
+        if not isinstance(t, dict):
+            continue
         by_hash.setdefault(t.get("hash"), []).append(t)
 
     out: List[Dict[str, object]] = []
