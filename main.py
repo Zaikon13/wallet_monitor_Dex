@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cronos DeFi Sentinel — main.py (drop-in)
-- Συμβατό με το τρέχον repository (imports/ροές όπως έστειλες).
-- Προσθέτει διαγνωστικά όταν το snapshot είναι κενό (για να φύγει το "❌ Empty snapshot").
-- Πιο ανθεκτικό intraday update (όχι spam cooldown, στέλνει χρήσιμες πληροφορίες).
-- Logs για βασικά envs στην εκκίνηση.
+Cronos DeFi Sentinel — main.py (compact)
+- Keeps your existing orchestration (schedule, watcher, wallet_monitor, telegram_long_poll_loop).
+- Adds robust diagnostics when holdings snapshot is empty (RPC block, CRO probe, key envs).
+- Safer intraday cooldown & informative updates.
+- Logs essential envs at startup.
 
-Δεν απαιτεί αλλαγές σε άλλα αρχεία. Αν όμως /holdings συνεχίζει να δείχνει "Empty snapshot",
-θα λάβεις στο Telegram αναλυτικά diagnostics (RPC block, wallet, CRO probe).
+Compatible with your current modules:
+  core.*, reports.*, telegram.*, utils.*, etc.
 """
 
 import logging
@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 from core.guards import set_holdings
 from core.holdings import get_wallet_snapshot
-from core.providers.cronos import fetch_wallet_txs  # as-is στο repo σου
+from core.providers.cronos import fetch_wallet_txs  # used by wallet monitor factory
 from core.runtime_state import note_tick, update_snapshot
 from core.watch import make_from_env
 from core.wallet_monitor import make_wallet_monitor
@@ -34,7 +34,7 @@ from reports.scheduler import run_pending
 from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop
 from telegram.dispatcher import dispatch
 
-# --- Προαιρετικά helpers από cronos provider για diagnostics ---
+# Optional diagnostics (if helpers exist in your repo)
 try:
     from core.providers.cronos import ping_block_number, get_native_balance, rpc_url  # type: ignore
 except Exception:  # pragma: no cover
@@ -99,10 +99,11 @@ def _handle_shutdown(sig, frm):
 
 
 # ---------------------------------------------------------------------------
-# Snapshot signature (για cooldown spam προστασία)
+# Snapshot signature (to avoid spam when identical)
 # ---------------------------------------------------------------------------
 
 def _snapshot_signature(snapshot: dict) -> tuple:
+    """Builds a hashable signature from snapshot payload values used by intraday."""
     items = []
     for symbol, payload in sorted(snapshot.items()):
         qty = payload.get("qty") or payload.get("amount") or "0"
@@ -117,7 +118,7 @@ def _snapshot_signature(snapshot: dict) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Diagnostics
+# Diagnostics helpers
 # ---------------------------------------------------------------------------
 
 def _diagnostics_empty_snapshot(addr: str) -> str:
@@ -140,7 +141,7 @@ def _diagnostics_empty_snapshot(addr: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reports senders
+# Report senders
 # ---------------------------------------------------------------------------
 
 def _send_daily_report() -> None:
@@ -174,7 +175,7 @@ def _send_health_ping() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Intraday update (ανθεκτικό + diagnostics όταν κενό)
+# Intraday update (resilient + diagnostics for empty)
 # ---------------------------------------------------------------------------
 
 def _send_intraday_update() -> None:
@@ -189,12 +190,12 @@ def _send_intraday_update() -> None:
         return
 
     if not snapshot:
-        # Μην αφήσουμε να μείνει σιωπηλό — στείλε diagnostics μία φορά ανά κύκλο.
+        # Emit diagnostics instead of a bare "Empty snapshot"
         send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
         return
 
     if signature and signature == _last_intraday_signature:
-        # Ήπιο cooldown (όχι spam). Αν προτιμάς σιωπή, απλά return.
+        # Gentle cooldown (non-spam). If you prefer silence, just `return`.
         send_telegram("⌛ cooldown")
         return
 
@@ -250,7 +251,7 @@ def _schedule_weekly_job(dow: str, at_time: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Telegram long-poll thread (υφιστάμενη υλοποίηση σου)
+# Telegram long-poll thread (existing implementation hook)
 # ---------------------------------------------------------------------------
 
 def _start_telegram_thread() -> None:
@@ -269,7 +270,7 @@ def main() -> int:
     load_dotenv()
     _setup_logging()
 
-    # Log βασικών envs για να ξέρεις τι τρέχει κάθε φορά
+    # Log essential envs on startup (so we can see misconfig quickly)
     _wallet_address = _env_str("WALLET_ADDRESS", "")
     logging.info("WALLET_ADDRESS=%s", _wallet_address or "(missing)")
     logging.info("CRONOS_RPC_URL=%s", rpc_url() or "(missing)")
@@ -342,15 +343,17 @@ def main() -> int:
             wallet_mon.poll_once()
             note_tick()
             run_pending()
+
+            # Update holdings/state periodically
             if time.time() - last_hold >= holdings_refresh:
                 snapshot = get_wallet_snapshot(_wallet_address) or {}
-                # Ακόμα και αν είναι κενό, κάνε update_state για να ξέρουμε ότι έγινε προσπάθεια
                 update_snapshot(snapshot, time.time())
                 set_holdings(set(snapshot.keys()))
-                # Αν κενό, στείλε diagnostics μια φορά ανά κύκλο refresh
+                # If empty, emit diagnostics once per refresh interval
                 if not snapshot:
                     send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
                 last_hold = time.time()
+
         except Exception as exc:
             logging.exception("loop error: %s", exc)
             now = time.monotonic()
@@ -358,6 +361,8 @@ def main() -> int:
             if now - _last_error_ts >= 120:
                 send_telegram("⚠️ runtime error (throttled)", dedupe=False)
                 _last_error_ts = now
+
+        # keep cadence stable
         sleep_for = max(0.5, _env_float("WALLET_POLL", 15.0) - (time.time() - t0))
         time.sleep(sleep_for)
     return 0
