@@ -178,9 +178,7 @@ def _diagnostics_empty_snapshot(addr: str) -> str:
         lines.append("• CRO balance probe: (error)")
     lines.append("")
     lines.append("Tip: set TOKENS_ADDRS / TOKENS_DECIMALS for ERC-20 balances.")
-    return "
-".join(lines)
-
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Report senders
