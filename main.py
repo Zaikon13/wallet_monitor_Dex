@@ -266,9 +266,7 @@ def _send_intraday_update() -> None:
         except Exception:
             top_str = str(top_value)
         lines.append(f"Top: {top_symbol.upper()} ≈ ${top_str}")
-    send_telegram_messages(["
-".join(lines)])
-
+    send_telegram_messages(["/n".join(lines)])
 
 # ---------------------------------------------------------------------------
 # Weekly schedule helper
