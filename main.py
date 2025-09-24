@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cronos DeFi Sentinel — main.py (drop-in)
+- Συμβατό με το τρέχον repository (imports/ροές όπως έστειλες).
+- Προσθέτει διαγνωστικά όταν το snapshot είναι κενό (για να φύγει το "❌ Empty snapshot").
+- Πιο ανθεκτικό intraday update (όχι spam cooldown, στέλνει χρήσιμες πληροφορίες).
+- Logs για βασικά envs στην εκκίνηση.
+
+Δεν απαιτεί αλλαγές σε άλλα αρχεία. Αν όμως /holdings συνεχίζει να δείχνει "Empty snapshot",
+θα λάβεις στο Telegram αναλυτικά diagnostics (RPC block, wallet, CRO probe).
+"""
+
 import logging
 import os
 import signal
@@ -11,7 +24,7 @@ from dotenv import load_dotenv
 
 from core.guards import set_holdings
 from core.holdings import get_wallet_snapshot
-from core.providers.cronos import fetch_wallet_txs
+from core.providers.cronos import fetch_wallet_txs  # as-is στο repo σου
 from core.runtime_state import note_tick, update_snapshot
 from core.watch import make_from_env
 from core.wallet_monitor import make_wallet_monitor
@@ -20,6 +33,17 @@ from reports.weekly import build_weekly_report_text
 from reports.scheduler import run_pending
 from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop
 from telegram.dispatcher import dispatch
+
+# --- Προαιρετικά helpers από cronos provider για diagnostics ---
+try:
+    from core.providers.cronos import ping_block_number, get_native_balance, rpc_url  # type: ignore
+except Exception:  # pragma: no cover
+    def ping_block_number():
+        return None
+    def get_native_balance(_addr: str):
+        return 0
+    def rpc_url() -> str:
+        return os.getenv("CRONOS_RPC_URL", "")
 
 try:
     from core.signals.server import start_signals_server_if_enabled
@@ -33,6 +57,10 @@ _last_error_ts = float("-inf")
 _last_intraday_signature: Optional[tuple] = None
 _wallet_address: Optional[str] = None
 
+
+# ---------------------------------------------------------------------------
+# Env helpers & logging
+# ---------------------------------------------------------------------------
 
 def _env_str(name: str, default: str = "") -> str:
     raw = os.getenv(name)
@@ -57,23 +85,63 @@ def _setup_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
+
+# ---------------------------------------------------------------------------
+# Shutdown
+# ---------------------------------------------------------------------------
 
 def _handle_shutdown(sig, frm):
     global _shutdown
     _shutdown = True
 
 
+# ---------------------------------------------------------------------------
+# Snapshot signature (για cooldown spam προστασία)
+# ---------------------------------------------------------------------------
+
 def _snapshot_signature(snapshot: dict) -> tuple:
     items = []
     for symbol, payload in sorted(snapshot.items()):
         qty = payload.get("qty") or payload.get("amount") or "0"
-        usd = payload.get("usd") or payload.get("value_usd") or "0"
+        usd = (
+            payload.get("usd")
+            or payload.get("value_usd")
+            or payload.get("usd_value")
+            or "0"
+        )
         items.append((symbol, str(qty), str(usd)))
     return tuple(items)
 
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+def _diagnostics_empty_snapshot(addr: str) -> str:
+    lines = ["🧾 Holdings", "❌ Empty snapshot", ""]
+    lines.append(f"• WALLET_ADDRESS: {addr or '(missing)'}")
+    lines.append(f"• CRONOS_RPC_URL: {rpc_url() or '(missing)'}")
+    try:
+        bn = ping_block_number()
+        lines.append(f"• RPC block: {bn if bn is not None else '(no response)'}")
+    except Exception:
+        lines.append("• RPC block: (error)")
+    try:
+        cro = get_native_balance(addr) if addr else 0
+        lines.append(f"• CRO balance probe: {cro}")
+    except Exception:
+        lines.append("• CRO balance probe: (error)")
+    lines.append("")
+    lines.append("Tip: set TOKENS_ADDRS / TOKENS_DECIMALS for ERC-20 balances.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Reports senders
+# ---------------------------------------------------------------------------
 
 def _send_daily_report() -> None:
     try:
@@ -105,6 +173,10 @@ def _send_health_ping() -> None:
     send_telegram("✅ alive", dedupe=False)
 
 
+# ---------------------------------------------------------------------------
+# Intraday update (ανθεκτικό + diagnostics όταν κενό)
+# ---------------------------------------------------------------------------
+
 def _send_intraday_update() -> None:
     global _last_intraday_signature
     try:
@@ -116,17 +188,29 @@ def _send_intraday_update() -> None:
         send_telegram("⚠️ Failed to refresh snapshot.", dedupe=False)
         return
 
+    if not snapshot:
+        # Μην αφήσουμε να μείνει σιωπηλό — στείλε diagnostics μία φορά ανά κύκλο.
+        send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
+        return
+
     if signature and signature == _last_intraday_signature:
+        # Ήπιο cooldown (όχι spam). Αν προτιμάς σιωπή, απλά return.
         send_telegram("⌛ cooldown")
         return
 
     _last_intraday_signature = signature
+
     total_usd = 0.0
     top_symbol = None
     top_value = 0.0
     for symbol, payload in snapshot.items():
         try:
-            usd = float(payload.get("usd") or payload.get("value_usd") or 0.0)
+            usd = float(
+                payload.get("usd")
+                or payload.get("value_usd")
+                or payload.get("usd_value")
+                or 0.0
+            )
         except (TypeError, ValueError):
             usd = 0.0
         total_usd += usd
@@ -140,6 +224,10 @@ def _send_intraday_update() -> None:
         lines.append(f"Top: {top_symbol.upper()} ≈ ${top_value:,.2f}")
     send_telegram_messages(["\n".join(lines)])
 
+
+# ---------------------------------------------------------------------------
+# Weekly schedule helper
+# ---------------------------------------------------------------------------
 
 def _schedule_weekly_job(dow: str, at_time: str) -> None:
     mapper = {
@@ -161,6 +249,10 @@ def _schedule_weekly_job(dow: str, at_time: str) -> None:
         logging.warning("weekly schedule error: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Telegram long-poll thread (υφιστάμενη υλοποίηση σου)
+# ---------------------------------------------------------------------------
+
 def _start_telegram_thread() -> None:
     if not callable(telegram_long_poll_loop):
         return
@@ -168,15 +260,23 @@ def _start_telegram_thread() -> None:
     tg_thread.start()
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     global _wallet_address
     load_dotenv()
     _setup_logging()
 
+    # Log βασικών envs για να ξέρεις τι τρέχει κάθε φορά
+    _wallet_address = _env_str("WALLET_ADDRESS", "")
+    logging.info("WALLET_ADDRESS=%s", _wallet_address or "(missing)")
+    logging.info("CRONOS_RPC_URL=%s", rpc_url() or "(missing)")
+
     send_telegram("✅ Cronos DeFi Sentinel started and is online.")
 
-    _wallet_address = _env_str("WALLET_ADDRESS", "")
-
+    # EOD
     eod_time = _env_str("EOD_TIME", "23:59")
     try:
         schedule.every().day.at(eod_time).do(_send_daily_report)
@@ -185,10 +285,12 @@ def main() -> int:
     else:
         logging.info("daily report scheduled at %s", eod_time)
 
+    # Weekly
     weekly_dow = _env_str("WEEKLY_DOW", "SUN")
     weekly_time = _env_str("WEEKLY_TIME", "18:00")
     _schedule_weekly_job(weekly_dow, weekly_time)
 
+    # Health ping
     health_min = _env_float("HEALTH_MIN", 30.0)
     if health_min > 0:
         interval = max(1, int(health_min))
@@ -201,6 +303,7 @@ def main() -> int:
     else:
         logging.info("health ping disabled")
 
+    # Intraday
     intraday_hours = _env_float("INTRADAY_HOURS", 1.0)
     if intraday_hours > 0:
         try:
@@ -210,22 +313,28 @@ def main() -> int:
     else:
         logging.info("intraday updates disabled")
 
+    # Watchers
     watcher = make_from_env()
     wallet_mon = make_wallet_monitor(provider=fetch_wallet_txs)
 
+    # Signals server (optional)
     try:
         start_signals_server_if_enabled()
     except Exception as exc:
         logging.warning("signals server error: %s", exc)
 
+    # Shutdown signals
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
+    # Periodic holdings refresh for guards
     holdings_refresh = int(os.getenv("HOLDINGS_REFRESH_SEC", "60") or 60)
     last_hold = 0.0
 
+    # Start Telegram polling
     _start_telegram_thread()
 
+    # Main loop
     while not _shutdown:
         t0 = time.time()
         try:
@@ -235,8 +344,12 @@ def main() -> int:
             run_pending()
             if time.time() - last_hold >= holdings_refresh:
                 snapshot = get_wallet_snapshot(_wallet_address) or {}
+                # Ακόμα και αν είναι κενό, κάνε update_state για να ξέρουμε ότι έγινε προσπάθεια
                 update_snapshot(snapshot, time.time())
                 set_holdings(set(snapshot.keys()))
+                # Αν κενό, στείλε diagnostics μια φορά ανά κύκλο refresh
+                if not snapshot:
+                    send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
                 last_hold = time.time()
         except Exception as exc:
             logging.exception("loop error: %s", exc)
