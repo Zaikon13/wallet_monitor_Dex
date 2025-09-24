@@ -1,0 +1,32 @@
+name: Manual Backup
+
+on:
+  workflow_dispatch: {}   # μόνο manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Timestamp
+        id: ts
+        run: echo "ts=$(date -u +%Y-%m-%dT%H-%M-%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Create git bundle (full repo incl. tags)
+        run: |
+          git fetch --all --tags
+          git bundle create wallet_monitor_Dex_${{ steps.ts.outputs.ts }}.bundle --all
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-monitor-backup_${{ steps.ts.outputs.ts }}
+          path: wallet_monitor_Dex_${{ steps.ts.outputs.ts }}.bundle
+          retention-days: 30
