@@ -1,23 +1,14 @@
 # main.py
-# Cronos DeFi Sentinel — minimal, repo-aligned entrypoint
-# Clean imports only (no ghost symbols)
+# Cronos DeFi Sentinel — drop-in aligned to your repo
+# Clean imports only; no non-existent symbols.
 
 import os
-import sys
 import time
-import json
-import threading
 import logging
-import signal
-import random
-from collections import deque, defaultdict
-from datetime import datetime, timedelta
 from decimal import Decimal, getcontext
-
 from dotenv import load_dotenv
 
-# ---- Internal imports (aligned with actual repo) ----
-from core.rpc import snapshot_wallet
+# ---- Internal imports (that exist in your repo) ----
 from core.holdings import get_wallet_snapshot
 from core.alerts import check_pair_alert
 from reports.day_report import build_day_report_text
@@ -30,53 +21,66 @@ load_dotenv()
 
 # ---- Logging ----
 log = logging.getLogger("main")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)) or default)
+    except Exception:
+        return default
+
+def _env_list(key: str) -> list[str]:
+    raw = os.getenv(key, "") or ""
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
 # ---- Main loop ----
 def run():
     log.info("🟢 Starting Cronos DeFi Sentinel")
 
+    WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
+    RPC = os.getenv("RPC", "")
+    DEX_PAIRS = _env_list("DEX_PAIRS")
+    PRICE_MOVE_THRESHOLD = _env_float("PRICE_MOVE_THRESHOLD", 0.0)
+    INTRADAY_HOURS = _env_float("INTRADAY_HOURS", 1.0)
+
     try:
         while True:
-            # Snapshot (RPC state of wallet)
-            snapshot = snapshot_wallet(os.getenv("WALLET_ADDRESS", ""), os.getenv("RPC", ""))
-            log.info("Snapshot taken at %s", snapshot.get("timestamp"))
-
-            # Build & send daily-style text for current snapshot
-            report = build_day_report_text(snapshot)
+            # Snapshot wallet (core.holdings)
             try:
+                # Support both signatures: (address) or (address, rpc)
+                try:
+                    snapshot = get_wallet_snapshot(WALLET_ADDRESS, RPC)
+                except TypeError:
+                    snapshot = get_wallet_snapshot(WALLET_ADDRESS)
+                log.info("Snapshot taken.")
+            except Exception:
+                log.exception("Failed to snapshot wallet")
+                snapshot = {"assets": [], "timestamp": None}
+
+            # Build + send report
+            try:
+                report = build_day_report_text(snapshot)
                 send_telegram(report)
             except Exception:
-                log.exception("Failed to send snapshot report to Telegram")
+                log.exception("Failed to build/send report")
 
-            # Pair alerts (per-pair check; only send if alert text is returned)
+            # Pair alerts
             try:
-                pairs = (os.getenv("DEX_PAIRS", "") or "").split(",")
-                threshold = float(os.getenv("PRICE_MOVE_THRESHOLD", "0") or 0)
-                for pair in pairs:
-                    if not pair:
-                        continue
-                    alert = check_pair_alert(pair, threshold)
+                for pair in DEX_PAIRS:
+                    alert = check_pair_alert(pair, PRICE_MOVE_THRESHOLD)
                     if alert:
                         send_telegram(alert)
             except Exception:
                 log.exception("Pair alerts scan failed")
 
-            # Sleep for configured intraday cadence
-            try:
-                sleep_s = max(60, int(float(os.getenv("INTRADAY_HOURS", "1")) * 3600))
-            except Exception:
-                sleep_s = 3600
+            # Sleep cadence
+            sleep_s = max(60, int(INTRADAY_HOURS * 3600))
             time.sleep(sleep_s)
 
     except KeyboardInterrupt:
         log.warning("🛑 Keyboard interrupt received. Shutting down.")
     except Exception:
         log.exception("Unexpected error in main loop")
-
 
 if __name__ == "__main__":
     run()
