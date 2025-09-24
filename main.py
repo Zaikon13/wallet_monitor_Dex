@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cronos DeFi Sentinel — main.py (compact)
-- Keeps your existing orchestration (schedule, watcher, wallet_monitor, telegram_long_poll_loop).
-- Adds robust diagnostics when holdings snapshot is empty (RPC block, CRO probe, key envs).
-- Safer intraday cooldown & informative updates.
-- Logs essential envs at startup.
-
-Compatible with your current modules:
-  core.*, reports.*, telegram.*, utils.*, etc.
+Cronos DeFi Sentinel — main.py (with core.alerts integration)
+- Uses core.alerts.notify_error / notify_alert for consistent alerting
+- Keeps your existing orchestration and imports (schedule, watcher, wallet_mon, telegram long-poll)
+- Adds diagnostics when holdings snapshot is empty (RPC block, CRO probe, key envs)
 """
 
 import logging
@@ -22,6 +18,7 @@ from typing import Optional
 import schedule
 from dotenv import load_dotenv
 
+from core.alerts import notify_error, notify_alert
 from core.guards import set_holdings
 from core.holdings import get_wallet_snapshot
 from core.providers.cronos import fetch_wallet_txs  # used by wallet monitor factory
@@ -34,7 +31,7 @@ from reports.scheduler import run_pending
 from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop
 from telegram.dispatcher import dispatch
 
-# Optional diagnostics (if helpers exist in your repo)
+# Optional diagnostics (if helpers exist)
 try:
     from core.providers.cronos import ping_block_number, get_native_balance, rpc_url  # type: ignore
 except Exception:  # pragma: no cover
@@ -47,7 +44,7 @@ except Exception:  # pragma: no cover
 
 try:
     from core.signals.server import start_signals_server_if_enabled
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
+except ModuleNotFoundError:  # pragma: no cover
     def start_signals_server_if_enabled():
         logging.warning("signals server disabled: Flask missing")
 
@@ -96,6 +93,7 @@ def _setup_logging() -> None:
 def _handle_shutdown(sig, frm):
     global _shutdown
     _shutdown = True
+    notify_alert("Sentinel stopping...")
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +101,6 @@ def _handle_shutdown(sig, frm):
 # ---------------------------------------------------------------------------
 
 def _snapshot_signature(snapshot: dict) -> tuple:
-    """Builds a hashable signature from snapshot payload values used by intraday."""
     items = []
     for symbol, payload in sorted(snapshot.items()):
         qty = payload.get("qty") or payload.get("amount") or "0"
@@ -153,25 +150,25 @@ def _send_daily_report() -> None:
             wallet=_wallet_address,
             snapshot=snapshot,
         )
+        send_telegram_messages([report])
     except Exception as exc:
-        logging.exception("daily report generation failed: %s", exc)
-        send_telegram("⚠️ Failed to generate daily report.", dedupe=False)
-        return
-    send_telegram_messages([report])
+        notify_error("daily report generation", exc)
 
 
 def _send_weekly_report(days: int = 7) -> None:
     try:
         report = build_weekly_report_text(days=days, wallet=_wallet_address)
+        send_telegram_messages([report])
     except Exception as exc:
-        logging.exception("weekly report generation failed: %s", exc)
-        send_telegram("⚠️ Failed to generate weekly report.", dedupe=False)
-        return
-    send_telegram_messages([report])
+        notify_error("weekly report generation", exc)
 
 
 def _send_health_ping() -> None:
-    send_telegram("✅ alive", dedupe=False)
+    # Health is an informational ping; if it fails, we don't escalate
+    try:
+        send_telegram("✅ alive", dedupe=False)
+    except Exception as exc:
+        logging.debug("health ping failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -185,18 +182,20 @@ def _send_intraday_update() -> None:
         update_snapshot(snapshot, time.time())
         signature = _snapshot_signature(snapshot)
     except Exception as exc:
-        logging.exception("intraday snapshot failed: %s", exc)
-        send_telegram("⚠️ Failed to refresh snapshot.", dedupe=False)
+        notify_error("intraday snapshot", exc)
         return
 
     if not snapshot:
-        # Emit diagnostics instead of a bare "Empty snapshot"
+        # Emit diagnostics (informational) so we can debug config/RPC quickly
         send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
         return
 
     if signature and signature == _last_intraday_signature:
-        # Gentle cooldown (non-spam). If you prefer silence, just `return`.
-        send_telegram("⌛ cooldown")
+        # Gentle cooldown; not an error
+        try:
+            send_telegram("⌛ cooldown")
+        except Exception:
+            pass
         return
 
     _last_intraday_signature = signature
@@ -270,21 +269,23 @@ def main() -> int:
     load_dotenv()
     _setup_logging()
 
-    # Log essential envs on startup (so we can see misconfig quickly)
+    # Log essential envs on startup
     _wallet_address = _env_str("WALLET_ADDRESS", "")
     logging.info("WALLET_ADDRESS=%s", _wallet_address or "(missing)")
     logging.info("CRONOS_RPC_URL=%s", rpc_url() or "(missing)")
 
-    send_telegram("✅ Cronos DeFi Sentinel started and is online.")
+    try:
+        send_telegram("✅ Cronos DeFi Sentinel started and is online.")
+    except Exception as exc:
+        notify_error("startup telegram", exc)
 
     # EOD
     eod_time = _env_str("EOD_TIME", "23:59")
     try:
         schedule.every().day.at(eod_time).do(_send_daily_report)
+        logging.info("daily report scheduled at %s", eod_time)
     except schedule.ScheduleValueError as exc:
         logging.warning("invalid EOD_TIME %s: %s", eod_time, exc)
-    else:
-        logging.info("daily report scheduled at %s", eod_time)
 
     # Weekly
     weekly_dow = _env_str("WEEKLY_DOW", "SUN")
@@ -297,10 +298,9 @@ def main() -> int:
         interval = max(1, int(health_min))
         try:
             schedule.every(interval).minutes.do(_send_health_ping)
+            logging.info("health ping scheduled every %s minute(s)", interval)
         except schedule.ScheduleValueError as exc:
             logging.warning("health ping schedule error: %s", exc)
-        else:
-            logging.info("health ping scheduled every %s minute(s)", interval)
     else:
         logging.info("health ping disabled")
 
@@ -349,20 +349,20 @@ def main() -> int:
                 snapshot = get_wallet_snapshot(_wallet_address) or {}
                 update_snapshot(snapshot, time.time())
                 set_holdings(set(snapshot.keys()))
-                # If empty, emit diagnostics once per refresh interval
                 if not snapshot:
+                    # Informational alert to surface root cause quickly
                     send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
                 last_hold = time.time()
 
         except Exception as exc:
             logging.exception("loop error: %s", exc)
+            # Throttle error alerts
             now = time.monotonic()
             global _last_error_ts
             if now - _last_error_ts >= 120:
-                send_telegram("⚠️ runtime error (throttled)", dedupe=False)
+                notify_error("runtime loop", exc)
                 _last_error_ts = now
 
-        # keep cadence stable
         sleep_for = max(0.5, _env_float("WALLET_POLL", 15.0) - (time.time() - t0))
         time.sleep(sleep_for)
     return 0
@@ -374,7 +374,7 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception("fatal: %s", exc)
         try:
-            send_telegram(f"💥 Fatal error: {exc}")
+            notify_error("fatal", exc)
         except Exception:
             pass
         sys.exit(1)
