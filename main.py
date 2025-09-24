@@ -1,328 +1,262 @@
-# main.py — drop-in for Zaikon13/wallet_monitor_Dex
-# Wires ONLY to exports confirmed in your repo:
-# core.wallet_monitor.make_wallet_monitor
-# core.holdings.get_wallet_snapshot
-# core.runtime_state.update_snapshot, note_tick
-# reports.day_report.build_day_report_text
-# reports.weekly.build_weekly_report_text
-# reports.scheduler.run_pending  (optional)
-# telegram.api.send_telegram, send_telegram_messages, telegram_long_poll_loop
-# schedule (python-schedule) if present
-#
-# Behavior:
-# - Starts TG long-poll thread (if available)
-# - Starts schedule worker thread (python-schedule + optional reports.scheduler.run_pending)
-# - Immediate first tick: wallet monitor poll + day report
-# - Intraday loop with clear logs
-# - EOD & Weekly jobs
-# - Health ping
-# - All Telegram sends are PLAIN TEXT
-
-import os
-import time
 import logging
+import os
+import signal
+import sys
 import threading
-from decimal import Decimal, getcontext
+import time
+from typing import Optional
 
-getcontext().prec = 28
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("main")
+import schedule
+from dotenv import load_dotenv
 
-# ==== Imports guarded to your actual modules ====
-try:
-    from core.wallet_monitor import make_wallet_monitor  # exists
-except Exception as e:
-    make_wallet_monitor = None
-    log.error("core.wallet_monitor.make_wallet_monitor unavailable: %s", e)
-
-try:
-    from core.holdings import get_wallet_snapshot  # exists
-except Exception as e:
-    get_wallet_snapshot = None
-    log.error("core.holdings.get_wallet_snapshot unavailable: %s", e)
-
-try:
-    from core.runtime_state import update_snapshot, note_tick  # exist
-except Exception as e:
-    def update_snapshot(_): pass
-    def note_tick(): pass
-    log.warning("core.runtime_state helpers unavailable: %s", e)
+from core.guards import set_holdings
+from core.holdings import get_wallet_snapshot
+from core.providers.cronos import fetch_wallet_txs
+from core.runtime_state import note_tick, update_snapshot
+from core.watch import make_from_env
+from core.wallet_monitor import make_wallet_monitor
+from reports.day_report import build_day_report_text
+from reports.weekly import build_weekly_report_text
+from reports.scheduler import run_pending
+from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop
+from telegram.dispatcher import dispatch
 
 try:
-    from reports.day_report import build_day_report_text  # exists
-except Exception as e:
-    build_day_report_text = None
-    log.error("reports.day_report.build_day_report_text unavailable: %s", e)
+    from core.signals.server import start_signals_server_if_enabled
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    def start_signals_server_if_enabled():
+        logging.warning("signals server disabled: Flask missing")
 
-try:
-    from reports.weekly import build_weekly_report_text  # exists
-except Exception:
-    build_weekly_report_text = None
 
-try:
-    from reports.scheduler import run_pending as reports_run_pending  # exists
-except Exception:
-    reports_run_pending = None
+_shutdown = False
+_last_error_ts = float("-inf")
+_last_intraday_signature: Optional[tuple] = None
+_wallet_address: Optional[str] = None
 
-try:
-    from telegram.api import (
-        send_telegram,
-        send_telegram_messages,
-        telegram_long_poll_loop,
-    )  # exist
-except Exception as e:
-    send_telegram = None
-    send_telegram_messages = None
-    telegram_long_poll_loop = None
-    log.error("telegram.api not available: %s", e)
 
-try:
-    import schedule  # python-schedule
-except Exception:
-    schedule = None
-    log.info("python-schedule not installed; timers disabled")
+def _env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value if value else default
 
-# ==== ENV helpers ====
-def _env_str(k: str, d: str = "") -> str:
-    v = os.getenv(k)
-    return v if v not in (None, "") else d
 
-def _env_int(k: str, d: int) -> int:
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
     try:
-        return int(os.getenv(k, str(d)) or d)
-    except Exception:
-        return d
+        return float(raw)
+    except (TypeError, ValueError):
+        logging.debug("invalid float env %s=%r", name, raw)
+        return default
 
-def _env_float(k: str, d: float) -> float:
+
+def _setup_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def _handle_shutdown(sig, frm):
+    global _shutdown
+    _shutdown = True
+
+
+def _snapshot_signature(snapshot: dict) -> tuple:
+    items = []
+    for symbol, payload in sorted(snapshot.items()):
+        qty = payload.get("qty") or payload.get("amount") or "0"
+        usd = payload.get("usd") or payload.get("value_usd") or "0"
+        items.append((symbol, str(qty), str(usd)))
+    return tuple(items)
+
+
+def _send_daily_report() -> None:
     try:
-        return float(os.getenv(k, str(d)) or d)
-    except Exception:
-        return d
-
-def _start_thread(target, name: str):
-    t = threading.Thread(target=target, name=name, daemon=True)
-    t.start()
-    return t
-
-# ==== Telegram helpers (plain text) ====
-def _send(msg: str):
-    if not send_telegram:
-        log.warning("Telegram unavailable; msg suppressed: %.120s", msg)
-        return False, "no-telegram"
-    try:
-        r = send_telegram(msg)
-        return r if isinstance(r, tuple) else (True, "sent")
-    except Exception as e:
-        log.exception("send_telegram failed")
-        return False, str(e)
-
-def _send_many(parts):
-    if not parts:
-        return True, "empty"
-    if send_telegram_messages:
-        try:
-            return send_telegram_messages(parts)
-        except Exception:
-            log.exception("send_telegram_messages failed; falling back")
-    ok = True
-    for p in parts:
-        r, _ = _send(p)
-        ok = ok and r
-    return ok, "fallback"
-
-def _chunk_and_send(title: str, body: str, max_len: int = 3500):
-    text = (title + "\n" + body) if body else title
-    if len(text) <= max_len:
-        return _send(text)
-    # paragraph chunking
-    parts, acc, size = [], [], 0
-    for ln in text.splitlines():
-        size += len(ln) + 1
-        acc.append(ln)
-        if size > max_len - 200:
-            parts.append("\n".join(acc)); acc=[]; size=0
-    if acc: parts.append("\n".join(acc))
-    return _send_many(parts)
-
-# ==== Snapshot / monitor ====
-def _snapshot():
-    """Return wallet snapshot dict and update runtime_state."""
-    if not get_wallet_snapshot:
-        return {}
-    addr = _env_str("WALLET_ADDRESS", "")
-    rpc  = _env_str("RPC", "")
-    try:
-        try:
-            snap = get_wallet_snapshot(addr, rpc)
-        except TypeError:
-            snap = get_wallet_snapshot(addr)
-    except Exception:
-        log.exception("get_wallet_snapshot failed")
-        snap = {}
-    try:
-        update_snapshot(snap)
-    except Exception:
-        pass
-    return snap
-
-def _make_monitor():
-    if not make_wallet_monitor:
-        return None
-    try:
-        # make_from_env exists per your list but monitor factory is what we call here
-        mon = make_wallet_monitor()
-        return mon
-    except Exception:
-        log.exception("make_wallet_monitor failed")
-        return None
-
-# ==== Reports ====
-def _day_text(snap):
-    if not build_day_report_text:
-        return "Daily report not available."
-    try:
-        try:
-            return build_day_report_text(snap)
-        except TypeError:
-            return build_day_report_text()
-    except Exception:
-        log.exception("build_day_report_text failed")
-        return "Failed to build daily report."
-
-def _weekly_text():
-    if not build_weekly_report_text:
-        return "Weekly report not available."
-    try:
-        return build_weekly_report_text()
-    except Exception:
-        log.exception("build_weekly_report_text failed")
-        return "Failed to build weekly report."
-
-# ==== Workers ====
-def _schedule_worker():
-    if not schedule and not reports_run_pending:
-        log.info("No schedule nor reports_run_pending; schedule worker exits.")
+        snapshot = get_wallet_snapshot(_wallet_address)
+        update_snapshot(snapshot, time.time())
+        report = build_day_report_text(
+            intraday=False,
+            wallet=_wallet_address,
+            snapshot=snapshot,
+        )
+    except Exception as exc:
+        logging.exception("daily report generation failed: %s", exc)
+        send_telegram("⚠️ Failed to generate daily report.", dedupe=False)
         return
-    while True:
-        try:
-            if schedule:
-                schedule.run_pending()
-            if reports_run_pending:
-                try:
-                    reports_run_pending()
-                except Exception:
-                    log.exception("reports.scheduler.run_pending error")
-        except Exception:
-            log.exception("schedule worker error")
-        time.sleep(1)
+    send_telegram_messages([report])
 
-def _tg_worker():
+
+def _send_weekly_report(days: int = 7) -> None:
+    try:
+        report = build_weekly_report_text(days=days, wallet=_wallet_address)
+    except Exception as exc:
+        logging.exception("weekly report generation failed: %s", exc)
+        send_telegram("⚠️ Failed to generate weekly report.", dedupe=False)
+        return
+    send_telegram_messages([report])
+
+
+def _send_health_ping() -> None:
+    send_telegram("✅ alive", dedupe=False)
+
+
+def _send_intraday_update() -> None:
+    global _last_intraday_signature
+    try:
+        snapshot = get_wallet_snapshot(_wallet_address) or {}
+        update_snapshot(snapshot, time.time())
+        signature = _snapshot_signature(snapshot)
+    except Exception as exc:
+        logging.exception("intraday snapshot failed: %s", exc)
+        send_telegram("⚠️ Failed to refresh snapshot.", dedupe=False)
+        return
+
+    if signature and signature == _last_intraday_signature:
+        send_telegram("⌛ cooldown")
+        return
+
+    _last_intraday_signature = signature
+    total_usd = 0.0
+    top_symbol = None
+    top_value = 0.0
+    for symbol, payload in snapshot.items():
+        try:
+            usd = float(payload.get("usd") or payload.get("value_usd") or 0.0)
+        except (TypeError, ValueError):
+            usd = 0.0
+        total_usd += usd
+        if usd > top_value:
+            top_symbol = symbol
+            top_value = usd
+
+    lines = ["🕒 Intraday Update"]
+    lines.append(f"Assets: {len(snapshot)} | Total ≈ ${total_usd:,.2f}")
+    if top_symbol:
+        lines.append(f"Top: {top_symbol.upper()} ≈ ${top_value:,.2f}")
+    send_telegram_messages(["\n".join(lines)])
+
+
+def _schedule_weekly_job(dow: str, at_time: str) -> None:
+    mapper = {
+        "MON": schedule.every().monday,
+        "TUE": schedule.every().tuesday,
+        "WED": schedule.every().wednesday,
+        "THU": schedule.every().thursday,
+        "FRI": schedule.every().friday,
+        "SAT": schedule.every().saturday,
+        "SUN": schedule.every().sunday,
+    }
+    job = mapper.get(dow.upper()) if dow else None
+    if not job:
+        logging.warning("invalid WEEKLY_DOW %s", dow)
+        return
+    try:
+        job.at(at_time).do(_send_weekly_report)
+    except schedule.ScheduleValueError as exc:
+        logging.warning("weekly schedule error: %s", exc)
+
+
+def _start_telegram_thread() -> None:
     if not callable(telegram_long_poll_loop):
-        log.info("telegram_long_poll_loop missing; skip TG thread")
         return
+    tg_thread = threading.Thread(target=telegram_long_poll_loop, args=(dispatch,), daemon=True)
+    tg_thread.start()
+
+
+def main() -> int:
+    global _wallet_address
+    load_dotenv()
+    _setup_logging()
+
+    send_telegram("✅ Cronos DeFi Sentinel started and is online.")
+
+    _wallet_address = _env_str("WALLET_ADDRESS", "")
+
+    eod_time = _env_str("EOD_TIME", "23:59")
     try:
-        telegram_long_poll_loop()
-    except Exception:
-        log.exception("telegram long-poll crashed")
-
-# One intraday cycle: poll monitor, build/send day report
-def _tick(mon):
-    try:
-        if mon is not None:
-            try:
-                mon.poll_once()
-            except Exception:
-                log.exception("wallet_monitor.poll_once failed")
-        snap = _snapshot()
-        day = _day_text(snap)
-        if not day:
-            day = "No transactions yet today."
-        _chunk_and_send("🕒 Intraday Update", day)
-        try:
-            note_tick()
-        except Exception:
-            pass
-    except Exception:
-        log.exception("intraday tick failed")
-        _send("⚠️ runtime error (intraday)")
-
-def _eod_job():
-    try:
-        snap = _snapshot()
-        text = _day_text(snap)
-        _chunk_and_send("📒 Daily Report", text or "(empty)")
-    except Exception:
-        log.exception("EOD failed")
-        _send("⚠️ Failed to generate daily report.")
-    return True
-
-def _weekly_job(target_dow: str):
-    def _run():
-        try:
-            import datetime as _dt
-            if _dt.datetime.now().strftime("%a").upper() == target_dow.upper():
-                _chunk_and_send("🗓 Weekly Report", _weekly_text())
-        except Exception:
-            log.exception("weekly job failed")
-        return True
-    return _run
-
-def _health_job():
-    _send("✅ alive")
-    return True
-
-# ==== Main ====
-def run():
-    log.info("🟢 Starting Wallet Monitor")
-
-    mon = _make_monitor()
-
-    # TG long-poll
-    _start_thread(_tg_worker, "tg-long-poll")
-
-    # Startup ping
-    _send("✅ Cronos DeFi Sentinel started and is online.")
-
-    # Scheduling
-    if schedule:
-        EOD_TIME    = _env_str("EOD_TIME", "23:59")
-        HEALTH_MIN  = _env_int("HEALTH_MIN", 30)
-        WEEKLY_DOW  = _env_str("WEEKLY_DOW", "SUN")
-        WEEKLY_TIME = _env_str("WEEKLY_TIME", "18:00")
-
-        try:
-            schedule.every().day.at(EOD_TIME).do(_eod_job)
-            log.info("daily report scheduled at %s", EOD_TIME)
-        except Exception:
-            log.exception("bind EOD failed")
-
-        try:
-            schedule.every(HEALTH_MIN).minutes.do(_health_job)
-            log.info("health ping scheduled every %s minute(s)", HEALTH_MIN)
-        except Exception:
-            log.exception("bind health failed")
-
-        try:
-            schedule.every().day.at(WEEKLY_TIME).do(_weekly_job(WEEKLY_DOW))
-            log.info("weekly report scheduled for %s at %s", WEEKLY_DOW, WEEKLY_TIME)
-        except Exception:
-            log.exception("bind weekly failed")
-
-        _start_thread(_schedule_worker, "schedule-worker")
+        schedule.every().day.at(eod_time).do(_send_daily_report)
+    except schedule.ScheduleValueError as exc:
+        logging.warning("invalid EOD_TIME %s: %s", eod_time, exc)
     else:
-        log.info("scheduling disabled (no schedule module)")
+        logging.info("daily report scheduled at %s", eod_time)
 
-    # First tick then loop
+    weekly_dow = _env_str("WEEKLY_DOW", "SUN")
+    weekly_time = _env_str("WEEKLY_TIME", "18:00")
+    _schedule_weekly_job(weekly_dow, weekly_time)
+
+    health_min = _env_float("HEALTH_MIN", 30.0)
+    if health_min > 0:
+        interval = max(1, int(health_min))
+        try:
+            schedule.every(interval).minutes.do(_send_health_ping)
+        except schedule.ScheduleValueError as exc:
+            logging.warning("health ping schedule error: %s", exc)
+        else:
+            logging.info("health ping scheduled every %s minute(s)", interval)
+    else:
+        logging.info("health ping disabled")
+
+    intraday_hours = _env_float("INTRADAY_HOURS", 1.0)
+    if intraday_hours > 0:
+        try:
+            schedule.every(max(1, int(intraday_hours))).hours.do(_send_intraday_update)
+        except schedule.ScheduleValueError as exc:
+            logging.warning("intraday schedule error: %s", exc)
+    else:
+        logging.info("intraday updates disabled")
+
+    watcher = make_from_env()
+    wallet_mon = make_wallet_monitor(provider=fetch_wallet_txs)
+
     try:
-        _tick(mon)
-    except Exception:
-        log.exception("first tick failed")
+        start_signals_server_if_enabled()
+    except Exception as exc:
+        logging.warning("signals server error: %s", exc)
 
-    sleep_s = max(60, int(_env_float("INTRADAY_HOURS", 1.0) * 3600))
-    while True:
-        _tick(mon)
-        log.info("sleeping %ss until next tick", sleep_s)
-        time.sleep(sleep_s)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
+    holdings_refresh = int(os.getenv("HOLDINGS_REFRESH_SEC", "60") or 60)
+    last_hold = 0.0
+
+    _start_telegram_thread()
+
+    while not _shutdown:
+        t0 = time.time()
+        try:
+            watcher.poll_once()
+            wallet_mon.poll_once()
+            note_tick()
+            run_pending()
+            if time.time() - last_hold >= holdings_refresh:
+                snapshot = get_wallet_snapshot(_wallet_address) or {}
+                update_snapshot(snapshot, time.time())
+                set_holdings(set(snapshot.keys()))
+                last_hold = time.time()
+        except Exception as exc:
+            logging.exception("loop error: %s", exc)
+            now = time.monotonic()
+            global _last_error_ts
+            if now - _last_error_ts >= 120:
+                send_telegram("⚠️ runtime error (throttled)", dedupe=False)
+                _last_error_ts = now
+        sleep_for = max(0.5, _env_float("WALLET_POLL", 15.0) - (time.time() - t0))
+        time.sleep(sleep_for)
+    return 0
+
 
 if __name__ == "__main__":
-    run()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        logging.exception("fatal: %s", exc)
+        try:
+            send_telegram(f"💥 Fatal error: {exc}")
+        except Exception:
+            pass
+        sys.exit(1)
