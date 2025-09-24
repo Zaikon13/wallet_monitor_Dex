@@ -1,11 +1,11 @@
 import os, sys, time, logging, signal, requests
 from dotenv import load_dotenv
 from reports.scheduler import start_eod_scheduler, run_pending
+from telegram.api import send_telegram
 try:
     from telegram.api import telegram_long_poll_loop  # new canonical name
 except ImportError:  # pragma: no cover - fallback when legacy bundle lacks the helper
     telegram_long_poll_loop = None
-from telegram.send import send_telegram
 from telegram.dispatcher import dispatch
 from core.watch import make_from_env
 from core.wallet_monitor import make_wallet_monitor
