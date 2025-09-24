@@ -43,4 +43,9 @@ class WalletMonitor:
             self._last = now
             self._record_alert(e)
         return len(fresh)
-
+def make_wallet_monitor(provider=None):
+    import os
+    wallet=os.getenv('WALLET_ADDRESS','')
+    if not provider: provider=lambda _addr: []
+    cd=max(3, int(os.getenv('WALLET_ALERTS_COOLDOWN','5') or 5))
+    return WalletMonitor(wallet, provider, cd)
