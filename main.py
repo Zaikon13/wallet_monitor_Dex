@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cronos DeFi Sentinel — main.py (unified, <1000 lines)
-- Compatible with new telegram/dispatcher.py & commands.py
-- Tolerant to etherscan_like snapshot shape (qty/amount, usd/value_usd/usd_value, price/price_usd)
-- Diagnostics on empty snapshot (RPC block, wallet, CRO probe)
-- Uses alerts if core.alerts is available (notify_error/notify_alert)
-- Keeps existing watcher + wallet monitor + scheduler flow
+Cronos DeFi Sentinel — main.py (stable)
+- Works with telegram/dispatcher.py (dispatch(text, chat_id)) & telegram/commands.py
+- Safe parsing of holdings snapshot (qty/amount, usd/value_usd/usd_value, price/price_usd)
+- No unterminated strings; ASCII quotes only
+- Includes diagnostics on empty snapshot and throttled alerting
 """
 
 from __future__ import annotations
@@ -33,26 +32,22 @@ from core.wallet_monitor import make_wallet_monitor
 from reports.day_report import build_day_report_text
 from reports.weekly import build_weekly_report_text
 from reports.scheduler import run_pending
-from telegram.api import (
-    send_telegram,
-    send_telegram_messages,
-    telegram_long_poll_loop,
-)
+from telegram.api import send_telegram, send_telegram_messages, telegram_long_poll_loop
 from telegram.dispatcher import dispatch
 
 # Optional alerts wiring
-try:  # pragma: no cover
+try:
     from core.alerts import notify_error, notify_alert  # type: ignore
-except Exception:  # fallback no-op wrappers
-    def notify_error(context: str, err: Exception):
+except Exception:
+    def notify_error(context: str, err: Exception) -> None:
         logging.error("%s: %s", context, err)
-    def notify_alert(text: str):
+    def notify_alert(text: str) -> None:
         logging.warning(text)
 
 # Optional diagnostics helpers
-try:  # pragma: no cover
+try:
     from core.providers.cronos import ping_block_number, get_native_balance, rpc_url  # type: ignore
-except Exception:  # graceful fallbacks
+except Exception:
     def ping_block_number():
         return None
     def get_native_balance(_addr: str):
@@ -61,10 +56,10 @@ except Exception:  # graceful fallbacks
         return os.getenv("CRONOS_RPC_URL", "")
 
 # Optional signals server
-try:  # pragma: no cover
+try:
     from core.signals.server import start_signals_server_if_enabled
-except ModuleNotFoundError:  # pragma: no cover
-    def start_signals_server_if_enabled():
+except ModuleNotFoundError:
+    def start_signals_server_if_enabled() -> None:
         logging.warning("signals server disabled: Flask missing")
 
 
@@ -109,7 +104,7 @@ def _setup_logging() -> None:
 # Shutdown
 # ---------------------------------------------------------------------------
 
-def _handle_shutdown(sig, frm):
+def _handle_shutdown(sig, frm) -> None:
     global _shutdown
     _shutdown = True
     try:
@@ -168,17 +163,17 @@ def _snapshot_signature(snapshot: dict) -> tuple:
 # ---------------------------------------------------------------------------
 
 def _diagnostics_empty_snapshot(addr: str) -> str:
-    lines = ["🧾 Holdings", "❌ Empty snapshot", ""]
-    lines.append(f"• WALLET_ADDRESS: {addr or '(missing)'}")
-    lines.append(f"• CRONOS_RPC_URL: {rpc_url() or '(missing)'}")
+    lines = ["Holdings", "Empty snapshot", ""]
+    lines.append("• WALLET_ADDRESS: " + (addr or "(missing)"))
+    lines.append("• CRONOS_RPC_URL: " + (rpc_url() or "(missing)"))
     try:
         bn = ping_block_number()
-        lines.append(f"• RPC block: {bn if bn is not None else '(no response)'}")
+        lines.append("• RPC block: " + (str(bn) if bn is not None else "(no response)"))
     except Exception:
         lines.append("• RPC block: (error)")
     try:
         cro = get_native_balance(addr) if addr else 0
-        lines.append(f"• CRO balance probe: {cro}")
+        lines.append("• CRO balance probe: " + str(cro))
     except Exception:
         lines.append("• CRO balance probe: (error)")
     lines.append("")
@@ -215,7 +210,7 @@ def _send_weekly_report(days: int = 7) -> None:
 
 def _send_health_ping() -> None:
     try:
-        send_telegram("✅ alive", dedupe=False)
+        send_telegram("alive", dedupe=False)
     except Exception:
         pass
 
@@ -235,13 +230,15 @@ def _send_intraday_update() -> None:
         return
 
     if not snapshot:
-        # Do not return an unterminated string; send a clear diagnostic message
-        send_telegram("❌ Empty snapshot (no balances).", dedupe=False)
+        try:
+            send_telegram(_diagnostics_empty_snapshot(_wallet_address or ""), dedupe=False)
+        except Exception:
+            pass
         return
 
     if signature and signature == _last_intraday_signature:
         try:
-            send_telegram("⌛ cooldown")
+            send_telegram("cooldown")
         except Exception:
             pass
         return
@@ -262,15 +259,21 @@ def _send_intraday_update() -> None:
     except Exception:
         total_str = str(total_usd)
 
-    lines = ["🕒 Intraday Update", f"Assets: {len(snapshot)} | Total ≈ ${total_str}"]
+    lines = [
+        "Intraday Update",
+        f"Assets: {len(snapshot)} | Total ≈ ${total_str}",
+    ]
     if top_symbol:
         try:
             top_str = f"{float(top_value):,.2f}"
         except Exception:
             top_str = str(top_value)
         lines.append(f"Top: {top_symbol.upper()} ≈ ${top_str}")
-    send_telegram_messages(["
+    try:
+        send_telegram_messages(["
 ".join(lines)])
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +324,7 @@ def main() -> int:
     logging.info("CRONOS_RPC_URL=%s", rpc_url() or "(missing)")
 
     try:
-        send_telegram("✅ Cronos DeFi Sentinel started and is online.")
+        send_telegram("Cronos DeFi Sentinel started and is online.")
     except Exception as exc:
         logging.debug("startup telegram failed: %s", exc, exc_info=True)
 
@@ -398,7 +401,10 @@ def main() -> int:
                 except Exception as e:
                     logging.debug("set_holdings failed: %s", e)
                 if not snapshot:
-                    send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
+                    try:
+                        send_telegram_messages([_diagnostics_empty_snapshot(_wallet_address or "")])
+                    except Exception:
+                        pass
                 last_hold = time.time()
 
         except Exception as exc:
@@ -414,7 +420,6 @@ def main() -> int:
 
         time.sleep(max(0.5, _env_float("WALLET_POLL", 15.0) - (time.time() - t0)))
     return 0
-
 
 if __name__ == "__main__":
     try:
