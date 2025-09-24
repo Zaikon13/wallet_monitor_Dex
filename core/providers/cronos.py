@@ -5,8 +5,20 @@ from core.providers.etherscan_like import account_txlist, account_tokentx
 
 def _D(x): return Decimal(str(x or 0))
 
-def _safe_json(data: Any) -> Dict[str, object]:
+def safe_json(data: Any) -> Dict[str, object]:
     return data if isinstance(data, dict) else {}
+
+
+def _coerce_tx_list(data: Any) -> List[Dict[str, object]]:
+    resp = safe_json(data) or {}
+    txs = resp.get("result") or resp.get("txs") or []
+    if not isinstance(txs, list):
+        return []
+    out: List[Dict[str, object]] = []
+    for item in txs:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
 
 def _int(value) -> int:
     try:
@@ -17,20 +29,11 @@ def _int(value) -> int:
         return 0
 
 def fetch_wallet_txs(address: str) -> List[Dict[str, object]]:
-    tx_resp = _safe_json(account_txlist(address)) or {}
-    txs = tx_resp.get("result") or tx_resp.get("txs") or []
-    if not isinstance(txs, list):
-        txs = []
-
-    tok_resp = _safe_json(account_tokentx(address)) or {}
-    toks = tok_resp.get("result") or tok_resp.get("txs") or []
-    if not isinstance(toks, list):
-        toks = []
+    txs = _coerce_tx_list(account_txlist(address))
+    toks = _coerce_tx_list(account_tokentx(address))
 
     by_hash: Dict[str, List[Dict[str, object]]] = {}
     for t in toks:
-        if not isinstance(t, dict):
-            continue
         by_hash.setdefault(t.get("hash"), []).append(t)
 
     out: List[Dict[str, object]] = []
@@ -39,7 +42,7 @@ def fetch_wallet_txs(address: str) -> List[Dict[str, object]]:
         if not isinstance(tx, dict):
             continue
         h = tx.get("hash")
-        xfers = [tr for tr in by_hash.get(h, []) if isinstance(tr, dict)]
+        xfers = by_hash.get(h, [])
         timestamp = _int(tx.get("timeStamp"))
         if xfers:
             legs: List[Dict[str, object]] = []
