@@ -1,76 +1,60 @@
-# core/holdings.py
-from __future__ import annotations
 import os
-from decimal import Decimal as D
-from typing import Dict, Any
-
-from core.providers.cronos import get_native_balance, erc20_balance_of
+from decimal import Decimal
+from core.providers.etherscan_like import account_balance, token_balance, account_tokentx
 from core.pricing import get_price_usd
 
-def _dec(x) -> D:
-    try: return D(str(x))
-    except Exception: return D("0")
-
-def _parse_map(env_key: str) -> dict[str, str]:
-    raw = (os.getenv(env_key) or "").strip()
-    if not raw: return {}
-    out: dict[str, str] = {}
-    for part in raw.split(","):
-        if "=" not in part: continue
-        k, v = part.split("=", 1)
-        k = (k or "").strip().upper()
-        v = (v or "").strip()
-        if k: out[k] = v
+def _map_from_env(key: str) -> dict:
+    s = os.getenv(key, "").strip()
+    if not s: return {}
+    out = {}
+    for part in s.split(","):
+        if not part or "=" not in part: continue
+        k,v = part.split("=",1)
+        out[k.strip().upper()] = v.strip()
     return out
 
-def _mk_row(qty: D, px: D | None) -> Dict[str, Any]:
-    px = _dec(px or 0)
-    usd = qty * px if px != 0 else D("0")
-    return {
-        "amount": qty,      # legacy shape
-        "usd_value": usd,
-        "qty": qty,         # new shape
-        "price_usd": px,
-        "usd": usd,
-    }
+def get_wallet_snapshot(address: str|None=None):
+    address = address or os.getenv("WALLET_ADDRESS","")
+    if not address: return {}
+    snap={}
 
-def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Any]]:
-    """
-    Snapshot via Cronos RPC only (no etherscan).
-    - Always includes CRO row (never empty dict).
-    - Tokens from TOKENS_ADDRS (+ TOKENS_DECIMALS).
-    """
-    addr = (address or os.getenv("WALLET_ADDRESS", "")).strip()
-    snap: Dict[str, Dict[str, Any]] = {}
-
-    # CRO always present (even if 0 / no price)
+    # 1) CRO native balance (wei→CRO)
     try:
-        cro_amt = _dec(get_native_balance(addr)) if addr else D("0")
+        bal = account_balance(address).get("result")
+        if bal is not None:
+            cro = Decimal(str(bal)) / (Decimal(10) ** 18)
+            px = get_price_usd("CRO")
+            usd = (cro * px).quantize(Decimal("0.0001")) if px is not None else None
+            snap["CRO"]={"qty": str(cro.normalize()), "price_usd": (str(px) if px is not None else None), "usd": (str(usd) if usd is not None else None)}
     except Exception:
-        cro_amt = D("0")
-    try:
-        cro_px = _dec(get_price_usd("CRO") or 0)
-    except Exception:
-        cro_px = D("0")
-    snap["CRO"] = _mk_row(cro_amt, cro_px)
+        pass
 
-    # Tokens from ENV
-    addrs = _parse_map("TOKENS_ADDRS")
-    decs  = _parse_map("TOKENS_DECIMALS")  # defaults to 18 if missing
-    for sym, contract in (addrs or {}).items():
-        if not contract: 
-            continue
+    # 2) Tokens via TOKENS_ADDRS (+ optional TOKENS_DECIMALS)
+    addr_map = _map_from_env("TOKENS_ADDRS")
+    dec_map = _map_from_env("TOKENS_DECIMALS")
+    for sym, contract in addr_map.items():
         try:
-            raw = erc20_balance_of(contract, addr) if addr else 0
-            decimals = int(decs.get(sym, "18"))
-            qty = D(raw) / (D(10) ** decimals)
-            px  = _dec(get_price_usd(sym) or 0)
-            snap[sym] = _mk_row(qty, px)
+            raw = token_balance(contract, address).get("result")
+            if raw is None: 
+                # include the symbol with zero qty
+                snap.setdefault(sym, {"qty":"0","price_usd": None, "usd": None})
+                continue
+            decimals = int(dec_map.get(sym, "18"))
+            qty = Decimal(str(raw)) / (Decimal(10) ** decimals)
+            px = get_price_usd(sym)
+            usd = (qty * px).quantize(Decimal("0.0001")) if px is not None else None
+            snap[sym] = {"qty": str(qty.normalize()), "price_usd": (str(px) if px is not None else None), "usd": (str(usd) if usd is not None else None)}
         except Exception:
-            # still expose the symbol to avoid "Empty snapshot"
-            snap.setdefault(sym, _mk_row(D("0"), D("0")))
+            snap.setdefault(sym, {"qty":"0","price_usd": None, "usd": None})
 
-    # Never return empty dict
-    if not snap:
-        snap = {"CRO": _mk_row(D("0"), D("0"))}
+    # 3) (Optional) Discover recent token symbols from tokentx (for visibility), w/o balances
+    try:
+        toks = (account_tokentx(address) or {}).get("result") or []
+        for t in toks[-50:]:
+            sym=(t.get("tokenSymbol") or "?").upper()
+            if sym and sym not in snap:
+                snap[sym] = {"qty":"?", "price_usd": None, "usd": None}
+    except Exception:
+        pass
+
     return snap
