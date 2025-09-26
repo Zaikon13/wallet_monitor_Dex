@@ -174,7 +174,6 @@ def _update(pos_qty,pos_cost,token_key,signed_amount,price_usd):
             avg_cost=(cost/qty) if qty>EPSILON else (price_usd or 0.0)
             pos_qty[token_key]=qty-sell_qty
             pos_cost[token_key]=max(0.0, cost - avg_cost*sell_qty)
-
     files=[]
     try:
         for fn in os.listdir(DATA_DIR):
