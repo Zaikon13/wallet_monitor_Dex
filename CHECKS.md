@@ -1,11 +1,8 @@
-````
 # path: CHECKS.md
 # Build & Runtime Checks (Codex/Railway)
 
 ## Purpose
 This document lists **expected build messages**, **safe-to-ignore warnings**, and **post-build runtime checks** for this repository when built/run in Codex or Railway containers. It aims to reduce noise during reviews and prevent false alarms.
-
----
 
 ## 1) Safe-to-Ignore Build Warnings (Codex/Railway)
 
@@ -150,7 +147,5 @@ _assert_env()
 * Prefer stability and clarity over “clever” changes that risk production behavior.
 
 ---
-
-```
 ::contentReference[oaicite:0]{index=0}
 ```
