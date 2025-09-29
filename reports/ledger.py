@@ -1,134 +1,227 @@
-# -*- coding: utf-8 -*-
-"""
-Ledger helpers:
-- append_ledger(entry)
-- update_cost_basis(positions_qty, positions_cost, key, delta_qty, price, eps)
-- replay_cost_basis_over_entries(positions_qty, positions_cost, entries, eps)
-File layout (per day):
-{
-  "date": "YYYY-MM-DD",
-  "entries": [ { ... } ],
-  "net_usd_flow": 0.0,
-  "realized_pnl": 0.0
-}
-"""
-import os
+from __future__ import annotations
+
 import json
-from datetime import datetime
-from typing import Dict, List, Any, Tuple
-from collections import defaultdict
+import os
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-DATA_DIR = "/app/data"
-os.makedirs(DATA_DIR, exist_ok=True)
+from core.tz import now_gr, ymd
 
-def _ymd(dt: datetime | None = None) -> str:
-    dt = dt or datetime.now()
+LEDGER_DIR = Path(os.getenv("LEDGER_DIR", "./.ledger")).expanduser()
+LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+COST_BASIS_FILE = LEDGER_DIR / "cost_basis.json"
+
+_DECIMAL_KEYS = ("qty", "price_usd", "usd", "fee_usd", "realized_usd")
+
+
+def _to_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+
+
+def _serialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for key, value in entry.items():
+        if key in _DECIMAL_KEYS and value is not None:
+            payload[key] = str(_to_decimal(value))
+        else:
+            payload[key] = value
+    return payload
+
+
+def _deserialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    for key, value in entry.items():
+        if key in _DECIMAL_KEYS:
+            data[key] = _to_decimal(value)
+        else:
+            data[key] = value
+    if "realized_usd" not in data:
+        data["realized_usd"] = Decimal("0")
+    return data
+
+
+def _day_from_entry(entry: Dict[str, Any]) -> Optional[str]:
+    ts = entry.get("time") or entry.get("timestamp")
+    if ts is None:
+        return None
+    try:
+        ts_int = int(float(ts))
+    except (TypeError, ValueError):
+        return None
+    dt = datetime.fromtimestamp(ts_int, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d")
 
-def _today_path() -> str:
-    return os.path.join(DATA_DIR, f"transactions_{_ymd()}.json")
 
-def _read_json(path: str, default):
+def data_file_for_day(day: str) -> Path:
+    return LEDGER_DIR / f"{day}.json"
+
+
+def data_file_for_today() -> Path:
+    return data_file_for_day(ymd())
+
+
+def _read_day_raw(day: str) -> List[Dict[str, Any]]:
+    path = data_file_for_day(day)
+    if not path.exists():
+        return []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return default
+        return []
 
-def _write_json(path: str, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
 
-def append_ledger(entry: Dict[str, Any]) -> None:
-    """
-    Append a normalized entry to today's file and update aggregates.
-    Expected entry keys (as produced by main.py handlers):
-    time, txhash, type, token, token_addr, amount, price_usd, usd_value, realized_pnl, from, to
-    """
-    path = _today_path()
-    data = _read_json(path, default={"date": _ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0})
-    if not isinstance(data, dict):
-        data = {"date": _ymd(), "entries": [], "net_usd_flow": 0.0, "realized_pnl": 0.0}
+def _write_day(day: str, entries: Iterable[Dict[str, Any]]) -> None:
+    payload = [_serialize_entry(entry) for entry in entries]
+    data_file_for_day(day).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-    e = dict(entry or {})
-    # normalize
-    e.setdefault("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    e.setdefault("txhash", None)
-    e.setdefault("type", "erc20")
-    e.setdefault("token", "?")
-    e.setdefault("token_addr", None)
-    e["amount"] = float(e.get("amount") or 0.0)
-    e["price_usd"] = float(e.get("price_usd") or 0.0)
-    e["usd_value"] = float(e.get("usd_value") or 0.0)
-    e["realized_pnl"] = float(e.get("realized_pnl") or 0.0)
 
-    data["entries"].append(e)
-    data["net_usd_flow"] = float(data.get("net_usd_flow", 0.0)) + e["usd_value"]
-    data["realized_pnl"] = float(data.get("realized_pnl", 0.0)) + e["realized_pnl"]
+def _is_valid_day(name: str) -> bool:
+    try:
+        datetime.strptime(name, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
 
-    _write_json(path, data)
 
-def update_cost_basis(positions_qty: Dict[str, float],
-                      positions_cost: Dict[str, float],
-                      key: str,
-                      delta_qty: float,
-                      price_usd: float,
-                      eps: float = 1e-12) -> float:
-    """
-    FIFO-like average cost update (single bucket avg).
-    Returns realized PnL for this trade (could be 0).
-    - Buy: qty += q ; cost += q*price
-    - Sell: realize (price - avg_cost) * sold_qty ; reduce qty/cost
-    """
-    if not key:
-        return 0.0
-    q = float(positions_qty.get(key, 0.0))
-    c = float(positions_cost.get(key, 0.0))
-    p = float(price_usd or 0.0)
-    realized = 0.0
+def list_days() -> List[str]:
+    return sorted(
+        [
+            path.stem
+            for path in LEDGER_DIR.glob("*.json")
+            if path.is_file() and _is_valid_day(path.stem)
+        ]
+    )
 
-    if delta_qty > eps:
-        # BUY
-        positions_qty[key] = q + delta_qty
-        positions_cost[key] = c + delta_qty * p
-    elif delta_qty < -eps:
-        # SELL
-        sell_qty = min(-delta_qty, max(0.0, q))
-        avg_cost = (c / q) if q > eps else p
-        realized = (p - avg_cost) * sell_qty
-        positions_qty[key] = max(0.0, q - sell_qty)
-        positions_cost[key] = max(0.0, c - avg_cost * sell_qty)
 
-    return float(realized)
+def read_ledger(day: str) -> List[Dict[str, Any]]:
+    raw_entries = _read_day_raw(day)
+    entries = [_deserialize_entry(entry) for entry in raw_entries]
+    entries.sort(key=lambda entry: entry.get("time") or 0)
+    return entries
 
-def replay_cost_basis_over_entries(positions_qty: Dict[str, float],
-                                   positions_cost: Dict[str, float],
-                                   entries: List[Dict[str, Any]],
-                                   eps: float = 1e-12) -> float:
-    """
-    Rebuild open positions & realized PnL by replaying a list of entries in order.
-    Mutates positions_* dicts, returns total realized PnL in the replay.
-    """
-    positions_qty.clear()
-    positions_cost.clear()
-    total_realized = 0.0
 
-    # sort by time if possible
-    def _parse_ts(e):
-        t = str(e.get("time") or "")
-        try:
-            return datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return datetime.min
+def iter_all_entries() -> Iterator[Dict[str, Any]]:
+    for day in list_days():
+        for entry in read_ledger(day):
+            yield entry
 
-    for e in sorted(entries or [], key=_parse_ts):
-        sym = (e.get("token") or "").strip()
-        addr = (e.get("token_addr") or "").strip().lower()
-        key = addr if (addr.startswith("0x")) else (sym.upper() or "?")
-        amt = float(e.get("amount") or 0.0)  # positive buy, negative sell (as produced by main.py)
-        prc = float(e.get("price_usd") or 0.0)
-        total_realized += update_cost_basis(positions_qty, positions_cost, key, amt, prc, eps=eps)
 
-    return float(total_realized)
+def append_ledger(day_or_entry: Any, entry: Optional[Dict[str, Any]] = None) -> None:
+    if entry is None:
+        if not isinstance(day_or_entry, dict):
+            raise ValueError("append_ledger(entry) requires a dict entry")
+        entry = dict(day_or_entry)
+        day = entry.pop("day", None) or _day_from_entry(entry) or ymd()
+    else:
+        day = str(day_or_entry)
+        entry = dict(entry)
+
+    normalized = _deserialize_entry(entry)
+    normalized.setdefault("wallet", entry.get("wallet"))
+    if normalized.get("realized_usd") is None:
+        normalized["realized_usd"] = Decimal("0")
+
+    day_entries = read_ledger(day)
+    day_entries.append(normalized)
+    day_entries.sort(key=lambda item: item.get("time") or 0)
+    _write_day(day, day_entries)
+
+
+def _clone_basis(basis: Dict[str, List[Dict[str, Decimal]]]) -> Dict[str, List[Dict[str, Decimal]]]:
+    cloned: Dict[str, List[Dict[str, Decimal]]] = {}
+    for asset, lots in basis.items():
+        cloned[asset] = [
+            {"qty": Decimal(lot["qty"]), "usd": Decimal(lot["usd"])} for lot in lots
+        ]
+    return cloned
+
+
+def _consume_lots(lots: List[Dict[str, Decimal]], qty: Decimal) -> Decimal:
+    remaining = qty
+    cost = Decimal("0")
+    while remaining > 0 and lots:
+        lot = lots[0]
+        lot_qty = lot["qty"]
+        lot_usd = lot["usd"]
+        if lot_qty <= 0:
+            lots.pop(0)
+            continue
+        take = lot_qty if lot_qty <= remaining else remaining
+        proportion = take / lot_qty if lot_qty else Decimal("0")
+        cost += lot_usd * proportion
+        lot["qty"] = lot_qty - take
+        lot["usd"] = lot_usd - (lot_usd * proportion)
+        remaining -= take
+        if lot["qty"] <= Decimal("0"):
+            lots.pop(0)
+    return cost
+
+
+def replay_cost_basis_over_entries(
+    entries: Iterable[Dict[str, Any]],
+    basis: Optional[Dict[str, List[Dict[str, Decimal]]]] = None,
+) -> Tuple[Dict[str, List[Dict[str, Decimal]]], Dict[str, Decimal], List[Dict[str, Any]]]:
+    basis_state = _clone_basis(basis or {})
+    realized_totals: Dict[str, Decimal] = {}
+    annotated_entries: List[Dict[str, Any]] = []
+
+    for raw in entries or []:
+        entry = _deserialize_entry(dict(raw))
+        asset = str(entry.get("asset") or "?").upper()
+        side = str(entry.get("side") or "").upper()
+        qty = _to_decimal(entry.get("qty"))
+        usd = _to_decimal(entry.get("usd"))
+        fee = _to_decimal(entry.get("fee_usd"))
+
+        lots = basis_state.setdefault(asset, [])
+        realized = Decimal("0")
+
+        if side == "IN" and qty > 0:
+            lots.append({"qty": qty, "usd": usd + fee})
+        elif side == "OUT" and qty > 0:
+            proceeds = usd - fee
+            cost = _consume_lots(lots, qty)
+            realized = proceeds - cost
+        entry["realized_usd"] = realized
+        realized_totals[asset] = realized_totals.get(asset, Decimal("0")) + realized
+        annotated_entries.append(entry)
+
+    return basis_state, realized_totals, annotated_entries
+
+
+def update_cost_basis() -> None:
+    basis: Dict[str, List[Dict[str, Decimal]]] = {}
+    for day in list_days():
+        entries = read_ledger(day)
+        basis, _, annotated = replay_cost_basis_over_entries(entries, basis)
+        _write_day(day, annotated)
+
+    payload = {
+        asset: [{"qty": str(lot["qty"]), "usd": str(lot["usd"]) } for lot in lots]
+        for asset, lots in basis.items()
+    }
+    COST_BASIS_FILE.write_text(
+        json.dumps({"updated_at": now_gr().isoformat(), "basis": payload}, indent=2),
+        encoding="utf-8",
+    )
+
+
+__all__ = [
+    "append_ledger",
+    "data_file_for_today",
+    "iter_all_entries",
+    "list_days",
+    "read_ledger",
+    "replay_cost_basis_over_entries",
+    "update_cost_basis",
+]
