@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional
@@ -22,12 +21,10 @@ def aggregate_per_asset(
     entries: Iterable[Dict[str, Any]] | None,
     wallet: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Aggregate buy/sell ledger entries per asset.
-
-    The function keeps Decimal values so downstream formatters/tests can
-    perform precise arithmetic without string parsing.
     """
-
+    Aggregate ledger entries per asset (IN/OUT quantities & USD), keeping Decimals.
+    Supports optional wallet filter (case-insensitive).
+    """
     normalized_wallet = _normalize_wallet(wallet)
     acc: Dict[str, Dict[str, Decimal]] = defaultdict(
         lambda: {
@@ -39,21 +36,13 @@ def aggregate_per_asset(
             "tx_count": Decimal("0"),
         }
     )
-
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-
-        if normalized_wallet and _normalize_wallet(entry.get("wallet")) not in {
-            "",
-            normalized_wallet,
-        }:
+        if normalized_wallet and _normalize_wallet(entry.get("wallet")) not in {"", normalized_wallet}:
             continue
 
-        asset = str(entry.get("asset") or "?").upper()
-        if not asset:
-            asset = "?"
-
+        asset = (str(entry.get("asset") or "?").upper()) or "?"
         side = str(entry.get("side") or "").upper()
         qty = _to_decimal(entry.get("qty"))
         usd = _to_decimal(entry.get("usd"))
@@ -68,10 +57,8 @@ def aggregate_per_asset(
             bucket["out_qty"] += qty
             bucket["out_usd"] += usd
             bucket["tx_count"] += Decimal(1)
-        elif side == "SWAP":
-            bucket["tx_count"] += Decimal(1)
         else:
-            # ignore unsupported side but still count to highlight activity
+            # Count activity even if side is SWAP/UNKNOWN, so tx_count reflects traffic
             bucket["tx_count"] += Decimal(1)
 
         bucket["realized_usd"] += realized
@@ -98,7 +85,7 @@ def aggregate_per_asset(
             }
         )
 
-    rows.sort(key=lambda row: (row["net_usd"], row["asset"]), reverse=True)
+    rows.sort(key=lambda r: (r["net_usd"], r["asset"]), reverse=True)
     return rows
 
 
@@ -113,6 +100,6 @@ def totals(rows: Iterable[Dict[str, Any]]) -> Dict[str, Decimal]:
         "realized_usd": Decimal("0"),
     }
     for row in rows or []:
-        for key in total:
-            total[key] += _to_decimal(row.get(key))
+        for k in total:
+            total[k] += _to_decimal(row.get(k))
     return total
