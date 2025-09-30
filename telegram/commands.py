@@ -4,7 +4,7 @@ import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from core.runtime_state import get_snapshot, get_state
 from core.tz import ymd
@@ -13,6 +13,8 @@ from reports.day_report import build_day_report_text
 from reports.ledger import iter_all_entries, read_ledger
 from reports.weekly import build_weekly_report_text
 
+
+# ---------- helpers ----------
 
 def _fmt_decimal(value: Decimal) -> str:
     value = Decimal(value)
@@ -43,11 +45,13 @@ def _format_age(ts: Optional[float]) -> str:
     return f"{int(delta // 86400)}d ago"
 
 
+# ---------- commands ----------
+
 def handle_diag() -> str:
     state = get_state()
     wallet = os.getenv("WALLET_ADDRESS", "")
+    lines: List[str] = ["Diagnostics:"]
 
-    lines = ["Diagnostics:"]
     rpc_ok_ts = state.get("last_rpc_ok_ts")
     rpc_error = state.get("last_rpc_error")
     if rpc_ok_ts:
@@ -80,11 +84,13 @@ def handle_status() -> str:
     state = get_state()
     snapshot = state.get("snapshot") or {}
     total = Decimal(state.get("snapshot_total_usd") or 0)
-    lines = ["Status:"]
+
+    lines: List[str] = ["Status:"]
     lines.append(f"Assets tracked: {len(snapshot)}")
     lines.append(f"Estimated total: ${_fmt_decimal(total)}")
     lines.append(f"Snapshot age: {_format_age(state.get('snapshot_ts'))}")
     lines.append(f"Last wallet poll: {_format_age(state.get('last_wallet_poll_ts'))}")
+
     return "\n".join(lines)
 
 
@@ -101,13 +107,13 @@ def handle_holdings(limit: int = 20) -> str:
 
     items.sort(key=lambda item: item[2], reverse=True)
 
-    lines = ["Holdings (top {limit}):".format(limit=limit)]
+    lines: List[str] = ["Holdings (top {limit}):".format(limit=limit)]
     for symbol, qty, usd in items[:limit]:
         lines.append(f" - {symbol:<6} {qty:>12,.4f} ≈ ${usd:,.2f}")
 
     if len(items) > limit:
         remaining = sum(usd for _, _, usd in items[limit:])
-        lines.append(f" ... {len(items) - limit} more positions totaling ≈ ${remaining:,.2f}")
+        lines.append(f"{len(items) - limit} more positions totaling ≈ ${remaining:,.2f}")
 
     total_usd = sum(usd for _, _, usd in items)
     lines.append("")
@@ -122,6 +128,8 @@ def handle_totals() -> str:
         return "Ledger is empty."
 
     totals_row = totals(rows)
+
+    # base για ποσοστά κατανομής
     base_values = [
         max(
             abs(row.get("net_usd", Decimal("0"))),
@@ -138,7 +146,7 @@ def handle_totals() -> str:
     top = rows[:10]
     others = rows[10:]
 
-    lines = ["Totals & Allocation:"]
+    lines: List[str] = ["Totals & Allocation:"]
     for row in top:
         share_base = max(
             abs(row.get("net_usd", Decimal("0"))),
@@ -203,7 +211,7 @@ def handle_weekly(days: int = 7) -> str:
     return build_weekly_report_text(days=days, wallet=wallet)
 
 
-def _entries_for_asset(symbol: str) -> List[Dict[str, object]]:
+def _entries_for_asset(symbol: str) -> List[Dict[str, Any]]:
     symbol = symbol.upper()
     return [
         entry
@@ -218,15 +226,18 @@ def handle_pnl(symbol: Optional[str] = None) -> str:
         symbol = symbol.upper()
         if not entries:
             return f"No ledger entries for {symbol}."
+
         buys = [e for e in entries if str(e.get("side")).upper() == "IN"]
         sells = [e for e in entries if str(e.get("side")).upper() == "OUT"]
         realized = sum(Decimal(e.get("realized_usd", 0)) for e in entries)
         qty_net = sum(
-            Decimal(e.get("qty", 0)) * (1 if str(e.get("side")).upper() == "IN" else -1)
+            Decimal(e.get("qty", 0))
+            * (1 if str(e.get("side")).upper() == "IN" else -1)
             for e in entries
         )
         spent = sum(Decimal(e.get("usd", 0)) for e in buys)
         received = sum(Decimal(e.get("usd", 0)) for e in sells)
+
         lines = [f"PnL for {symbol}:"]
         lines.append(f" - Buys: {len(buys)} totaling ${_fmt_decimal(spent)}")
         lines.append(f" - Sells: {len(sells)} totaling ${_fmt_decimal(received)}")
@@ -234,17 +245,20 @@ def handle_pnl(symbol: Optional[str] = None) -> str:
         lines.append(f" - Realized PnL: ${_fmt_decimal(realized)}")
         return "\n".join(lines)
 
+    # No symbol: δείξε Top movers
     rows = aggregate_per_asset(iter_all_entries())
     if not rows:
         return "Ledger is empty."
     rows.sort(key=lambda row: abs(row.get("realized_usd", Decimal("0"))), reverse=True)
     top = rows[:5]
+
     lines = ["Top movers by realized PnL:"]
     for row in top:
         realized = row.get("realized_usd", Decimal("0"))
         direction = "+" if realized >= 0 else ""
         lines.append(
-            f" - {row.get('asset', '?')}: {direction}${_fmt_decimal(realized)} (net ${_fmt_decimal(row.get('net_usd', Decimal('0')))} )"
+            f" - {row.get('asset', '?')}: {direction}${_fmt_decimal(realized)} "
+            f"(net ${_fmt_decimal(row.get('net_usd', Decimal('0')))} )"
         )
     return "\n".join(lines)
 
@@ -252,6 +266,7 @@ def handle_pnl(symbol: Optional[str] = None) -> str:
 def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
     day = day or ymd()
     entries = read_ledger(day)
+
     if symbol:
         symbol = symbol.upper()
         entries = [
@@ -259,12 +274,13 @@ def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
             for entry in entries
             if str(entry.get("asset") or "").upper() == symbol
         ]
+
     if not entries:
         target = f" for {symbol}" if symbol else ""
         return f"No transactions on {day}{target}."
 
     limit = 20
-    lines = [f"Transactions on {day}{(' for ' + symbol) if symbol else ''}:"]
+    lines: List[str] = [f"Transactions on {day}{(' for ' + symbol) if symbol else ''}:"]
     for entry in entries[:limit]:
         ts = entry.get("time")
         if ts:
@@ -275,6 +291,7 @@ def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
                 ts_text = str(ts)
         else:
             ts_text = "--"
+
         lines.append(
             " - {ts} {side} {asset} {qty} @ ${usd}".format(
                 ts=ts_text,
@@ -284,6 +301,8 @@ def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
                 usd=_fmt_decimal(entry.get("usd", Decimal("0"))),
             )
         )
+
     if len(entries) > limit:
-        lines.append(" ... more ...")
+        lines.append(f"{len(entries) - limit} more ...")
+
     return "\n".join(lines)
