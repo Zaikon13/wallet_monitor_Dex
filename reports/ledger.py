@@ -220,16 +220,14 @@ def _consume_lots(lots: List[Dict[str, Decimal]], qty: Decimal, eps: Decimal) ->
     return cost
 
 
-def replay_cost_basis_over_entries(
+# -----------------------------
+# Modern path (entries[, basis][, eps]) → returns tuple
+# -----------------------------
+def _replay_fifo_modern(
     entries: Iterable[Dict[str, Any]],
     basis: Optional[Dict[str, List[Dict[str, Decimal]]]] = None,
     eps: Any = Decimal("1e-9"),
 ) -> Tuple[Dict[str, List[Dict[str, Decimal]]], Dict[str, Decimal], List[Dict[str, Any]]]:
-    """
-    Recompute FIFO cost basis over ordered entries.
-    Accepts optional `eps` (epsilon) for tiny-amount handling to align with main.py calls.
-    Returns (basis_state, realized_totals, annotated_entries)
-    """
     _eps = _to_decimal(eps)
     basis_state = _clone_basis(basis or {})
     realized_totals: Dict[str, Decimal] = {}
@@ -260,6 +258,99 @@ def replay_cost_basis_over_entries(
     return basis_state, realized_totals, annotated_entries
 
 
+# -----------------------------
+# Legacy compat path (qty, cost, entries[, eps]) → returns Decimal
+# -----------------------------
+def _replay_avgcost_compat(
+    position_qty: Any,
+    position_cost: Any,
+    entries: Iterable[Dict[str, Any]],
+    eps: Any = Decimal("1e-9"),
+) -> Decimal:
+    """
+    Average-cost replay used by legacy main.py:
+
+      total_realized = replay_cost_basis_over_entries(qty, cost, entries, eps=...)
+
+    It starts from an in-memory position (qty, cost) and processes entries:
+      IN:  qty += q ; cost += (usd + fee)
+      OUT: realized += ( (usd - fee) - q * avg_cost ), where avg_cost = cost/qty
+           qty -= q ; cost -= q * avg_cost
+    Returns Decimal total_realized for this batch.
+    """
+    q = _to_decimal(position_qty)
+    c = _to_decimal(position_cost)
+    _eps = _to_decimal(eps)
+    total_realized = Decimal("0")
+
+    for raw in entries or []:
+        entry = _deserialize_entry(dict(raw))
+        side = str(entry.get("side") or "").upper()
+        qty = _to_decimal(entry.get("qty"))
+        usd = _to_decimal(entry.get("usd"))
+        fee = _to_decimal(entry.get("fee_usd"))
+
+        if qty <= _eps:
+            continue
+
+        if side == "IN":
+            q = q + qty
+            c = c + (usd + fee)
+        elif side == "OUT":
+            if q <= _eps:
+                # No position to sell against; treat as fully realized against zero cost
+                proceeds = usd - fee
+                total_realized += proceeds
+                q = Decimal("0")
+                c = Decimal("0")
+            else:
+                avg_cost = c / q if q > _eps else Decimal("0")
+                qty_sold = qty if qty <= q else q
+                proceeds = qty_sold * (usd / qty) if qty > _eps else (usd - fee)
+                # prefer total proceeds path consistent with modern FIFO:
+                proceeds = usd - fee  # usd is total for the leg
+                cost_reduced = qty_sold * avg_cost
+                realized = proceeds - cost_reduced
+                total_realized += realized
+
+                q = q - qty_sold
+                if q <= _eps:
+                    q = Decimal("0")
+                    c = Decimal("0")
+                else:
+                    c = c - cost_reduced
+
+    return total_realized
+
+
+# -----------------------------
+# Public API (dual-mode)
+# -----------------------------
+def replay_cost_basis_over_entries(*args, **kwargs):
+    """
+    Dual-mode API:
+
+    Modern:
+      replay_cost_basis_over_entries(entries, basis=None, eps=1e-9)
+      -> (basis_state, realized_totals, annotated_entries)
+
+    Legacy compat (used by main.py):
+      replay_cost_basis_over_entries(position_qty, position_cost, entries, eps=1e-9)
+      -> Decimal total_realized
+    """
+    # Heuristic: legacy form has at least 3 positional args and the 3rd is a list/iter of entries
+    if len(args) >= 3 and isinstance(args[2], (list, tuple)):
+        position_qty, position_cost, entries = args[0], args[1], args[2]
+        eps = kwargs.get("eps", Decimal("1e-9"))
+        return _replay_avgcost_compat(position_qty, position_cost, entries, eps=eps)
+
+    # Modern keyword/positional form
+    entries = args[0] if args else kwargs.get("entries")
+    basis = kwargs.get("basis", None)
+    eps = kwargs.get("eps", Decimal("1e-9"))
+    return _replay_fifo_modern(entries, basis=basis, eps=eps)
+
+
 def _rebuild_cost_basis_files() -> None:
     """
     Scan all days, recompute FIFO basis and persist results.
@@ -268,7 +359,7 @@ def _rebuild_cost_basis_files() -> None:
     basis: Dict[str, List[Dict[str, Decimal]]] = {}
     for day in list_days():
         entries = read_ledger(day)
-        basis, _, annotated = replay_cost_basis_over_entries(entries, basis)
+        basis, _, annotated = _replay_fifo_modern(entries, basis=basis)
         _write_day(day, annotated)
 
     payload = {
@@ -281,8 +372,26 @@ def _rebuild_cost_basis_files() -> None:
     )
 
 
+def update_cost_basis(*args, **kwargs):
+    """
+    Dual-mode function kept for backward compatibility with main.py:
+
+    1) Per-trade position update (what main.py calls):
+       update_cost_basis(position_qty, position_cost, symbol, delta_qty, price, eps=1e-9)
+       -> returns (new_qty, new_cost, realized_usd)
+
+    2) Bulk recompute of on-disk ledger files (legacy/scripts):
+       update_cost_basis()
+       -> returns None
+    """
+    if len(args) >= 5 or any(k in kwargs for k in ("symbol", "delta_qty", "price", "eps")):
+        return _update_position_avg_cost(*args, **kwargs)
+    _rebuild_cost_basis_files()
+    return None
+
+
 # -----------------------------
-# Per-position cost basis — avg cost model (main.py expects this)
+# Per-position cost basis — avg cost model (used by main.py)
 # -----------------------------
 def _update_position_avg_cost(
     position_qty: Any,
@@ -333,27 +442,6 @@ def _update_position_avg_cost(
         return q_new, c_new, realized
 
     return q, c, realized
-
-
-# -----------------------------
-# Public API
-# -----------------------------
-def update_cost_basis(*args, **kwargs):
-    """
-    Dual-mode function kept for backward compatibility with main.py:
-
-    1) Per-trade position update (what main.py calls):
-       update_cost_basis(position_qty, position_cost, symbol, delta_qty, price, eps=1e-9)
-       -> returns (new_qty, new_cost, realized_usd)
-
-    2) Bulk recompute of on-disk ledger files (legacy/scripts):
-       update_cost_basis()
-       -> returns None
-    """
-    if len(args) >= 5 or any(k in kwargs for k in ("symbol", "delta_qty", "price", "eps")):
-        return _update_position_avg_cost(*args, **kwargs)
-    _rebuild_cost_basis_files()
-    return None
 
 
 __all__ = [
