@@ -51,10 +51,7 @@ def _to_jsonable(obj: Any) -> Any:
 
 
 def _serialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert any Decimal (even nested) to str so json.dumps won't fail.
-    Only *known* numeric fields are parsed back to Decimal on read.
-    """
+    """Convert any Decimal (even nested) to str so json.dumps won't fail."""
     return _to_jsonable(entry)  # type: ignore[return-value]
 
 
@@ -197,27 +194,27 @@ def _clone_basis(basis: Dict[str, List[Dict[str, Decimal]]]) -> Dict[str, List[D
     return cloned
 
 
-def _consume_lots(lots: List[Dict[str, Decimal]], qty: Decimal) -> Decimal:
+def _consume_lots(lots: List[Dict[str, Decimal]], qty: Decimal, eps: Decimal) -> Decimal:
     remaining = qty
     cost = Decimal("0")
-    while remaining > 0 and lots:
+    while remaining > eps and lots:
         lot = lots[0]
         lot_qty = lot["qty"]
         lot_usd = lot["usd"]
 
-        if lot_qty <= 0:
+        if lot_qty <= eps:
             lots.pop(0)
             continue
 
         take = lot_qty if lot_qty <= remaining else remaining
-        proportion = take / lot_qty if lot_qty else Decimal("0")
+        proportion = take / lot_qty if lot_qty > eps else Decimal("0")
         cost += lot_usd * proportion
 
         lot["qty"] = lot_qty - take
         lot["usd"] = lot_usd - (lot_usd * proportion)
         remaining -= take
 
-        if lot["qty"] <= Decimal("0"):
+        if lot["qty"] <= eps:
             lots.pop(0)
 
     return cost
@@ -226,11 +223,14 @@ def _consume_lots(lots: List[Dict[str, Decimal]], qty: Decimal) -> Decimal:
 def replay_cost_basis_over_entries(
     entries: Iterable[Dict[str, Any]],
     basis: Optional[Dict[str, List[Dict[str, Decimal]]]] = None,
+    eps: Any = Decimal("1e-9"),
 ) -> Tuple[Dict[str, List[Dict[str, Decimal]]], Dict[str, Decimal], List[Dict[str, Any]]]:
     """
     Recompute FIFO cost basis over ordered entries.
+    Accepts optional `eps` (epsilon) for tiny-amount handling to align with main.py calls.
     Returns (basis_state, realized_totals, annotated_entries)
     """
+    _eps = _to_decimal(eps)
     basis_state = _clone_basis(basis or {})
     realized_totals: Dict[str, Decimal] = {}
     annotated_entries: List[Dict[str, Any]] = []
@@ -246,11 +246,11 @@ def replay_cost_basis_over_entries(
         lots = basis_state.setdefault(asset, [])
         realized = Decimal("0")
 
-        if side == "IN" and qty > 0:
+        if side == "IN" and qty > _eps:
             lots.append({"qty": qty, "usd": usd + fee})
-        elif side == "OUT" and qty > 0:
+        elif side == "OUT" and qty > _eps:
             proceeds = usd - fee
-            cost = _consume_lots(lots, qty)
+            cost = _consume_lots(lots, qty, _eps)
             realized = proceeds - cost
             entry["realized_usd"] = realized
             realized_totals[asset] = realized_totals.get(asset, Decimal("0")) + realized
