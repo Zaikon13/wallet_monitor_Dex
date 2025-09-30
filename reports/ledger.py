@@ -3,19 +3,25 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, getcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from core.tz import now_gr, ymd
 
+getcontext().prec = 28  # safe default for money math
+
 LEDGER_DIR = Path(os.getenv("LEDGER_DIR", "./.ledger")).expanduser()
 LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+
 COST_BASIS_FILE = LEDGER_DIR / "cost_basis.json"
 
 _DECIMAL_KEYS = ("qty", "price_usd", "usd", "fee_usd", "realized_usd")
 
 
+# -----------------------------
+# Decimal (de)serialization
+# -----------------------------
 def _to_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
         return value
@@ -47,6 +53,9 @@ def _deserialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+# -----------------------------
+# Day helpers & file IO
+# -----------------------------
 def _day_from_entry(entry: Dict[str, Any]) -> Optional[str]:
     ts = entry.get("time") or entry.get("timestamp")
     if ts is None:
@@ -117,6 +126,12 @@ def iter_all_entries() -> Iterator[Dict[str, Any]]:
 
 
 def append_ledger(day_or_entry: Any, entry: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Append one entry to a day's ledger file (creating file if needed).
+    Usage:
+      append_ledger({"time": 1696118400, "asset": "CRO", "side": "IN", "qty": "10", "usd": "5.0"})
+      append_ledger("2025-09-30", {"time": 1696118400, ...})
+    """
     if entry is None:
         if not isinstance(day_or_entry, dict):
             raise ValueError("append_ledger(entry) requires a dict entry")
@@ -137,11 +152,15 @@ def append_ledger(day_or_entry: Any, entry: Optional[Dict[str, Any]] = None) -> 
     _write_day(day, day_entries)
 
 
+# -----------------------------
+# Cost-basis (FIFO) — bulk rebuild path
+# -----------------------------
 def _clone_basis(basis: Dict[str, List[Dict[str, Decimal]]]) -> Dict[str, List[Dict[str, Decimal]]]:
     cloned: Dict[str, List[Dict[str, Decimal]]] = {}
     for asset, lots in basis.items():
         cloned[asset] = [
-            {"qty": Decimal(lot["qty"]), "usd": Decimal(lot["usd"])} for lot in lots
+            {"qty": Decimal(lot["qty"]), "usd": Decimal(lot["usd"])}
+            for lot in lots
         ]
     return cloned
 
@@ -153,17 +172,22 @@ def _consume_lots(lots: List[Dict[str, Decimal]], qty: Decimal) -> Decimal:
         lot = lots[0]
         lot_qty = lot["qty"]
         lot_usd = lot["usd"]
+
         if lot_qty <= 0:
             lots.pop(0)
             continue
+
         take = lot_qty if lot_qty <= remaining else remaining
         proportion = take / lot_qty if lot_qty else Decimal("0")
         cost += lot_usd * proportion
+
         lot["qty"] = lot_qty - take
         lot["usd"] = lot_usd - (lot_usd * proportion)
         remaining -= take
+
         if lot["qty"] <= Decimal("0"):
             lots.pop(0)
+
     return cost
 
 
@@ -171,6 +195,10 @@ def replay_cost_basis_over_entries(
     entries: Iterable[Dict[str, Any]],
     basis: Optional[Dict[str, List[Dict[str, Decimal]]]] = None,
 ) -> Tuple[Dict[str, List[Dict[str, Decimal]]], Dict[str, Decimal], List[Dict[str, Any]]]:
+    """
+    Recompute FIFO cost basis over ordered entries.
+    Returns (basis_state, realized_totals, annotated_entries)
+    """
     basis_state = _clone_basis(basis or {})
     realized_totals: Dict[str, Decimal] = {}
     annotated_entries: List[Dict[str, Any]] = []
@@ -192,14 +220,19 @@ def replay_cost_basis_over_entries(
             proceeds = usd - fee
             cost = _consume_lots(lots, qty)
             realized = proceeds - cost
-        entry["realized_usd"] = realized
-        realized_totals[asset] = realized_totals.get(asset, Decimal("0")) + realized
+            entry["realized_usd"] = realized
+            realized_totals[asset] = realized_totals.get(asset, Decimal("0")) + realized
+
         annotated_entries.append(entry)
 
     return basis_state, realized_totals, annotated_entries
 
 
-def update_cost_basis() -> None:
+def _rebuild_cost_basis_files() -> None:
+    """
+    Scan all days, recompute FIFO basis and persist results.
+    (This is what our previous update_cost_basis() did.)
+    """
     basis: Dict[str, List[Dict[str, Decimal]]] = {}
     for day in list_days():
         entries = read_ledger(day)
@@ -207,13 +240,93 @@ def update_cost_basis() -> None:
         _write_day(day, annotated)
 
     payload = {
-        asset: [{"qty": str(lot["qty"]), "usd": str(lot["usd"]) } for lot in lots]
+        asset: [{"qty": str(lot["qty"]), "usd": str(lot["usd"])} for lot in lots]
         for asset, lots in basis.items()
     }
     COST_BASIS_FILE.write_text(
         json.dumps({"updated_at": now_gr().isoformat(), "basis": payload}, indent=2),
         encoding="utf-8",
     )
+
+
+# -----------------------------
+# Per-position cost basis — avg cost model (main.py expects this)
+# -----------------------------
+def _update_position_avg_cost(
+    position_qty: Any,
+    position_cost: Any,
+    symbol: str,
+    delta_qty: Any,
+    price: Any,
+    eps: Any = Decimal("1e-9"),
+) -> Tuple[Decimal, Decimal, Decimal]:
+    """
+    Update an in-memory position using **average cost** accounting.
+
+    Returns (new_qty, new_cost, realized_usd).
+
+    - Buy  (delta_qty > 0): qty += delta; cost += delta * price; realized = 0
+    - Sell (delta_qty < 0): realized = (price - avg_cost) * sell_qty
+        avg_cost = cost / qty  (if qty > eps)
+        new_cost = cost - min(sell_qty, qty) * avg_cost
+        qty reduced; if residual < eps → zero out qty & cost
+    """
+    q = _to_decimal(position_qty)
+    c = _to_decimal(position_cost)
+    d = _to_decimal(delta_qty)
+    p = _to_decimal(price)
+    e = _to_decimal(eps)
+
+    realized = Decimal("0")
+
+    if d > 0:
+        # Buy
+        q_new = q + d
+        c_new = c + (d * p)
+        return q_new, c_new, realized
+
+    if d < 0:
+        sell_qty = -d
+        if q <= e:
+            # nothing to sell against; no position — treat as realized=0, keep cost/qty
+            return Decimal("0"), Decimal("0"), realized
+        avg_cost = c / q if q > e else Decimal("0")
+        qty_sold = sell_qty if sell_qty <= q else q
+        proceeds = qty_sold * p
+        cost_reduced = qty_sold * avg_cost
+        realized = proceeds - cost_reduced
+
+        q_new = q - qty_sold
+        if q_new <= e:
+            return Decimal("0"), Decimal("0"), realized
+        c_new = c - cost_reduced
+        return q_new, c_new, realized
+
+    # d == 0 → no change
+    return q, c, realized
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+def update_cost_basis(*args, **kwargs):
+    """
+    Dual-mode function kept for backward compatibility with main.py:
+
+    1) Per-trade position update (what main.py calls):
+       update_cost_basis(position_qty, position_cost, symbol, delta_qty, price, eps=1e-9)
+       -> returns (new_qty, new_cost, realized_usd)
+
+    2) Bulk recompute of on-disk ledger files (legacy/scripts):
+       update_cost_basis()
+       -> returns None
+    """
+    if len(args) >= 5 or any(k in kwargs for k in ("symbol", "delta_qty", "price", "eps")):
+        # Per-position update path
+        return _update_position_avg_cost(*args, **kwargs)
+    # Bulk rebuild path (no args)
+    _rebuild_cost_basis_files()
+    return None
 
 
 __all__ = [
@@ -223,5 +336,5 @@ __all__ = [
     "list_days",
     "read_ledger",
     "replay_cost_basis_over_entries",
-    "update_cost_basis",
+    "update_cost_basis",  # dual mode (per-position or bulk)
 ]
