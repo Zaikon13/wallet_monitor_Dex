@@ -16,6 +16,7 @@ LEDGER_DIR.mkdir(parents=True, exist_ok=True)
 
 COST_BASIS_FILE = LEDGER_DIR / "cost_basis.json"
 
+# Known numeric keys we *parse back* as Decimal on read.
 _DECIMAL_KEYS = ("qty", "price_usd", "usd", "fee_usd", "realized_usd")
 
 
@@ -32,10 +33,14 @@ def _to_decimal(value: Any) -> Decimal:
 
 
 def _serialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert any Decimal value to a string so json.dumps won't fail.
+    Only *known* numeric fields are parsed back to Decimal on read.
+    """
     payload: Dict[str, Any] = {}
     for key, value in entry.items():
-        if key in _DECIMAL_KEYS and value is not None:
-            payload[key] = str(_to_decimal(value))
+        if isinstance(value, Decimal):
+            payload[key] = str(value)
         else:
             payload[key] = value
     return payload
@@ -57,15 +62,30 @@ def _deserialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
 # Day helpers & file IO
 # -----------------------------
 def _day_from_entry(entry: Dict[str, Any]) -> Optional[str]:
+    """
+    Try to infer day from entry["time"] which may be:
+      - epoch seconds (int/float/str)
+      - ISO-like string "YYYY-MM-DD HH:MM:SS"
+    Falls back to None if parsing fails.
+    """
     ts = entry.get("time") or entry.get("timestamp")
     if ts is None:
         return None
+    # numeric epoch?
     try:
         ts_int = int(float(ts))
-    except (TypeError, ValueError):
-        return None
-    dt = datetime.fromtimestamp(ts_int, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d")
+        dt = datetime.fromtimestamp(ts_int, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    # ISO-like date?
+    try:
+        # Only date present
+        if isinstance(ts, str) and len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+            return ts[:10]
+    except Exception:
+        pass
+    return None
 
 
 def data_file_for_day(day: str) -> Path:
@@ -144,7 +164,8 @@ def append_ledger(day_or_entry: Any, entry: Optional[Dict[str, Any]] = None) -> 
     normalized = _deserialize_entry(entry)
     normalized.setdefault("wallet", entry.get("wallet"))
     if normalized.get("realized_usd") is None:
-        normalized["realized_usd"] = Decimal("0")
+        from decimal import Decimal as _D
+        normalized["realized_usd"] = _D("0")
 
     day_entries = read_ledger(day)
     day_entries.append(normalized)
@@ -280,7 +301,6 @@ def _update_position_avg_cost(
     realized = Decimal("0")
 
     if d > 0:
-        # Buy
         q_new = q + d
         c_new = c + (d * p)
         return q_new, c_new, realized
@@ -288,7 +308,6 @@ def _update_position_avg_cost(
     if d < 0:
         sell_qty = -d
         if q <= e:
-            # nothing to sell against; no position — treat as realized=0, keep cost/qty
             return Decimal("0"), Decimal("0"), realized
         avg_cost = c / q if q > e else Decimal("0")
         qty_sold = sell_qty if sell_qty <= q else q
@@ -302,7 +321,6 @@ def _update_position_avg_cost(
         c_new = c - cost_reduced
         return q_new, c_new, realized
 
-    # d == 0 → no change
     return q, c, realized
 
 
@@ -322,9 +340,7 @@ def update_cost_basis(*args, **kwargs):
        -> returns None
     """
     if len(args) >= 5 or any(k in kwargs for k in ("symbol", "delta_qty", "price", "eps")):
-        # Per-position update path
         return _update_position_avg_cost(*args, **kwargs)
-    # Bulk rebuild path (no args)
     _rebuild_cost_basis_files()
     return None
 
@@ -336,5 +352,5 @@ __all__ = [
     "list_days",
     "read_ledger",
     "replay_cost_basis_over_entries",
-    "update_cost_basis",  # dual mode (per-position or bulk)
+    "update_cost_basis",
 ]
