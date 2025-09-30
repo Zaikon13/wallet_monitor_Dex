@@ -13,11 +13,13 @@ from zoneinfo import ZoneInfo
 from core.holdings import get_wallet_snapshot, format_snapshot_lines
 from telegram.api import send_telegram
 
+
 def _tz():
     try:
         return ZoneInfo(os.getenv("TZ", "Europe/Athens"))
     except Exception:
         return ZoneInfo("UTC")
+
 
 def main() -> int:
     tz = _tz()
@@ -47,11 +49,13 @@ def main() -> int:
 
     # Προαιρετικά: στείλ’ το και στο Telegram αν υπάρχουν credentials
     if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
-        ok, code, resp = send_telegram(text)
-        if not ok:
-            print(f"(Telegram send failed {code}): {resp}", file=sys.stderr)
+        try:
+            send_telegram(text)
+        except Exception as exc:
+            print(f"ERROR sending Telegram message: {exc}", file=sys.stderr)
 
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
