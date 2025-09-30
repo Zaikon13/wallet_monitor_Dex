@@ -32,18 +32,30 @@ def _to_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def _to_jsonable(obj: Any) -> Any:
+    """
+    Recursively convert values to JSON-safe:
+    - Decimal -> str
+    - dict/list/tuple -> walk recursively
+    - others unchanged
+    """
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_jsonable(v) for v in obj)
+    return obj
+
+
 def _serialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Convert any Decimal value to a string so json.dumps won't fail.
+    Convert any Decimal (even nested) to str so json.dumps won't fail.
     Only *known* numeric fields are parsed back to Decimal on read.
     """
-    payload: Dict[str, Any] = {}
-    for key, value in entry.items():
-        if isinstance(value, Decimal):
-            payload[key] = str(value)
-        else:
-            payload[key] = value
-    return payload
+    return _to_jsonable(entry)  # type: ignore[return-value]
 
 
 def _deserialize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,7 +92,6 @@ def _day_from_entry(entry: Dict[str, Any]) -> Optional[str]:
         pass
     # ISO-like date?
     try:
-        # Only date present
         if isinstance(ts, str) and len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
             return ts[:10]
     except Exception:
