@@ -1,183 +1,118 @@
-# -*- coding: utf-8 -*-
-"""
-Aggregate helpers for totals, PnL and day reports.
-
-Public API
-----------
-- load_remaining_cost_basis() -> dict[str, Decimal]
-- compute_unrealized_from_snapshot(snapshot) -> dict[symbol, Decimal]
-- day_totals(day: str) -> dict[str, Decimal]
-- month_to_date_totals(yyyy_mm: str) -> dict[str, Decimal]
-- build_daily_summary(day: str) -> str
-"""
 from __future__ import annotations
 
-import json
-import os
 from collections import defaultdict
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
-from core.tz import ymd, now_gr, month_prefix
-from reports.ledger import (
-    LEDGER_DIR,  # type: ignore[attr-defined]
-    list_days,
-    read_ledger,
-)
 
-# ---------------------------
-# Decimal helpers
-# ---------------------------
-def _D(x: Any) -> Decimal:
-    if isinstance(x, Decimal):
-        return x
+def _to_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
     try:
-        return Decimal(str(x))
+        return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
 
 
-# ---------------------------
-# Cost basis (remaining) loader
-# ---------------------------
-def _cost_basis_file() -> Path:
-    return Path(os.getenv("LEDGER_DIR", "./.ledger")).expanduser() / "cost_basis.json"
+def _normalize_wallet(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
 
 
-def load_remaining_cost_basis() -> Dict[str, Decimal]:
+def aggregate_per_asset(
+    entries: Iterable[Dict[str, Any]] | None,
+    wallet: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Aggregate buy/sell ledger entries per asset.
+
+    The function keeps Decimal values so downstream formatters/tests can
+    perform precise arithmetic without string parsing.
     """
-    Read remaining FIFO cost basis per asset from cost_basis.json, summing lots.
-    Returns mapping: symbol -> remaining_cost_usd (Decimal)
-    """
-    path = _cost_basis_file()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    basis = data.get("basis") or {}
-    out: Dict[str, Decimal] = {}
-    for sym, lots in basis.items():
-        rem = Decimal("0")
-        for lot in lots or []:
-            rem += _D(lot.get("usd"))
-        out[sym.upper()] = rem
-    return out
 
+    normalized_wallet = _normalize_wallet(wallet)
+    acc: Dict[str, Dict[str, Decimal]] = defaultdict(
+        lambda: {
+            "in_qty": Decimal("0"),
+            "out_qty": Decimal("0"),
+            "in_usd": Decimal("0"),
+            "out_usd": Decimal("0"),
+            "realized_usd": Decimal("0"),
+            "tx_count": Decimal("0"),
+        }
+    )
 
-def compute_unrealized_from_snapshot(snapshot: Dict[str, Dict[str, str | None]]) -> Dict[str, Decimal]:
-    """
-    Given a holdings snapshot:
-      {SYM: {"qty": "…", "usd": "…", "price_usd": "..."}}
-    compute unrealized PnL per asset as: current_value_usd - remaining_cost_basis_usd
-    """
-    remaining = load_remaining_cost_basis()
-    out: Dict[str, Decimal] = {}
-    for sym, row in (snapshot or {}).items():
-        cur = _D(row.get("usd"))
-        rem = remaining.get(sym.upper(), Decimal("0"))
-        out[sym.upper()] = cur - rem
-    return out
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
 
+        if normalized_wallet and _normalize_wallet(entry.get("wallet")) not in {
+            "",
+            normalized_wallet,
+        }:
+            continue
 
-# ---------------------------
-# Totals aggregation
-# ---------------------------
-def _iter_month_days(yyyy_mm: str) -> Iterable[str]:
-    # yyyy_mm like "2025-09"
-    for d in list_days():
-        if d.startswith(yyyy_mm + "-"):
-            yield d
+        asset = str(entry.get("asset") or "?").upper()
+        if not asset:
+            asset = "?"
 
+        side = str(entry.get("side") or "").upper()
+        qty = _to_decimal(entry.get("qty"))
+        usd = _to_decimal(entry.get("usd"))
+        realized = _to_decimal(entry.get("realized_usd"))
 
-def _sum_fields(entries: Iterable[Dict[str, Any]]) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
-    """
-    Returns (in_usd, out_usd, fee_usd, realized)
-    """
-    _in = Decimal("0")
-    _out = Decimal("0")
-    _fee = Decimal("0")
-    _real = Decimal("0")
-    for e in entries:
-        side = str(e.get("side") or "").upper()
-        usd = _D(e.get("usd"))
-        fee = _D(e.get("fee_usd"))
-        rv = _D(e.get("realized_usd"))
+        bucket = acc[asset]
         if side == "IN":
-            _in += usd
-            _fee += fee
+            bucket["in_qty"] += qty
+            bucket["in_usd"] += usd
+            bucket["tx_count"] += Decimal(1)
         elif side == "OUT":
-            _out += usd
-            _fee += fee
-            _real += rv
-    return _in, _out, _fee, _real
+            bucket["out_qty"] += qty
+            bucket["out_usd"] += usd
+            bucket["tx_count"] += Decimal(1)
+        elif side == "SWAP":
+            bucket["tx_count"] += Decimal(1)
+        else:
+            # ignore unsupported side but still count to highlight activity
+            bucket["tx_count"] += Decimal(1)
+
+        bucket["realized_usd"] += realized
+
+    rows: List[Dict[str, Any]] = []
+    for asset, values in acc.items():
+        in_qty = values["in_qty"]
+        out_qty = values["out_qty"]
+        in_usd = values["in_usd"]
+        out_usd = values["out_usd"]
+        realized_usd = values["realized_usd"]
+        tx_count = int(values["tx_count"])
+        rows.append(
+            {
+                "asset": asset,
+                "in_qty": in_qty,
+                "out_qty": out_qty,
+                "net_qty": in_qty - out_qty,
+                "in_usd": in_usd,
+                "out_usd": out_usd,
+                "net_usd": in_usd - out_usd,
+                "realized_usd": realized_usd,
+                "tx_count": tx_count,
+            }
+        )
+
+    rows.sort(key=lambda row: (row["net_usd"], row["asset"]), reverse=True)
+    return rows
 
 
-def day_totals(day: str | None = None) -> Dict[str, Decimal]:
-    d = day or ymd()
-    entries = read_ledger(d)
-    _in, _out, _fee, _real = _sum_fields(entries)
-    net = _in - _out - _fee
-    return {
-        "in": _in,
-        "out": _out,
-        "fee": _fee,
-        "net": net,
-        "realized": _real,
+def totals(rows: Iterable[Dict[str, Any]]) -> Dict[str, Decimal]:
+    total = {
+        "in_qty": Decimal("0"),
+        "out_qty": Decimal("0"),
+        "net_qty": Decimal("0"),
+        "in_usd": Decimal("0"),
+        "out_usd": Decimal("0"),
+        "net_usd": Decimal("0"),
+        "realized_usd": Decimal("0"),
     }
-
-
-def month_to_date_totals(yyyy_mm: str | None = None) -> Dict[str, Decimal]:
-    mm = yyyy_mm or month_prefix()
-    _in = _out = _fee = _real = Decimal("0")
-    for d in _iter_month_days(mm):
-        entries = read_ledger(d)
-        a, b, c, r = _sum_fields(entries)
-        _in += a
-        _out += b
-        _fee += c
-        _real += r
-    net = _in - _out - _fee
-    return {
-        "in": _in,
-        "out": _out,
-        "fee": _fee,
-        "net": net,
-        "realized": _real,
-    }
-
-
-# ---------------------------
-# Daily summary
-# ---------------------------
-def _fmt_dec(val: Decimal) -> str:
-    if val == 0:
-        return "0"
-    if abs(val) >= 1:
-        return f"{val:,.2f}"
-    return f"{val:.6f}"
-
-
-def build_daily_summary(day: str | None = None) -> str:
-    d = day or ymd()
-    t = day_totals(d)
-    mm = month_to_date_totals()
-    lines = [
-        f"📅 Daily — {d}",
-        f"IN:  ${_fmt_dec(t['in'])}",
-        f"OUT: ${_fmt_dec(t['out'])}",
-        f"FEE: ${_fmt_dec(t['fee'])}",
-        f"NET: ${_fmt_dec(t['net'])}",
-        f"Realized: ${_fmt_dec(t['realized'])}",
-        "",
-        f"📆 MTD — {month_prefix()}",
-        f"IN:  ${_fmt_dec(mm['in'])}",
-        f"OUT: ${_fmt_dec(mm['out'])}",
-        f"FEE: ${_fmt_dec(mm['fee'])}",
-        f"NET: ${_fmt_dec(mm['net'])}",
-        f"Realized: ${_fmt_dec(mm['realized'])}",
-    ]
-    return "\n".join(lines)
+    for row in rows or []:
+        for key in total:
+            total[key] += _to_decimal(row.get(key))
+    return total
