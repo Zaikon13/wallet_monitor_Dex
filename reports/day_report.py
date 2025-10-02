@@ -36,20 +36,19 @@ def build_day_report_text(
     day: Optional[str] = None,
 ) -> str:
     day = day or ymd()
+
     entries = read_ledger(day)
     rows = aggregate_per_asset(entries, wallet=wallet)
     totals_row = totals(rows)
 
-    title = "🕒 Intraday Update" if intraday else f"📒 Daily Report ({day})"
+    title = " Intraday Update" if intraday else f" Daily Report ({day})"
     lines = [title]
 
+    # Optional holdings snapshot header
     assets_count, est_total = _snapshot_summary(snapshot)
     if assets_count:
-        lines.append(
-            f"Holdings snapshot: {assets_count} assets · est. ${_fmt_decimal(est_total)}"
-        )
-
-    lines.append("")
+        lines.append(f"Holdings snapshot: {assets_count} assets · est. ${_fmt_decimal(est_total)}")
+        lines.append("")
 
     if not entries:
         lines.append("No transactions recorded.")
