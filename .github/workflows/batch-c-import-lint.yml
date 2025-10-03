@@ -1,0 +1,58 @@
+name: Batch C — Import & Lint (providers + rpc)
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - 'core/providers/**'
+      - 'core/rpc.py'
+      - '.github/workflows/batch-c-import-lint.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'core/providers/**'
+      - 'core/rpc.py'
+      - '.github/workflows/batch-c-import-lint.yml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install minimal tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Syntax-only lint (avoid style noise)
+        run: |
+          flake8 \
+            --select=E9,F63,F7,F82 \
+            --show-source \
+            core/providers/__init__.py \
+            core/providers/cronos.py \
+            core/providers/etherscan_like.py \
+            core/rpc.py
+
+      - name: Byte-compile targets
+        run: |
+          python - <<'PY'
+          import py_compile, sys
+          files = [
+            'core/providers/__init__.py',
+            'core/providers/cronos.py',
+            'core/providers/etherscan_like.py',
+            'core/rpc.py',
+          ]
+          for f in files:
+            py_compile.compile(f, doraise=True)
+          print('Byte-compile OK for', len(files), 'files')
+          PY
