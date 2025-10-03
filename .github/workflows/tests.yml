@@ -1,78 +1,43 @@
-from __future__ import annotations
-import os
-import logging
-from typing import Dict, List, Tuple
+name: Tests (matrix)
 
-ENV_ALIASES: Dict[str, str] = {
-    "BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
-    "CHAT_ID": "TELEGRAM_CHAT_ID",
-    "WALLET": "WALLET_ADDRESS",
-    "RPC": "CRONOS_RPC_URL",
-    "ETHERSCAN": "ETHERSCAN_API",
-}
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'  # daily at 03:17 UTC
 
-# Keys that should normally be present for a healthy runtime
-REQUIRED_KEYS: List[str] = [
-    "TZ",
-    "CRONOS_RPC_URL",
-    "WALLET_ADDRESS",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "EOD_HOUR",
-    "EOD_MINUTE",
-]
+permissions:
+  contents: read
 
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
 
-def apply_env_aliases() -> None:
-    for short, full in ENV_ALIASES.items():
-        val = os.getenv(short)
-        if val and not os.getenv(full):
-            os.environ[full] = val
-
-
-def get_env(key: str, default: str | None = None) -> str | None:
-    return os.getenv(key, default)
-
-
-def require_env(key: str) -> str:
-    v = os.getenv(key)
-    if not v:
-        raise RuntimeError(f"Missing env: {key}")
-    return v
-
-
-def _strip_if_needed(key: str, val: str) -> Tuple[str, bool]:
-    new = val.strip()
-    return new, (new != val)
-
-
-def validate_env(strict: bool = False) -> Tuple[bool, list[str]]:
-    """Validate critical env vars.
-    - Warn if values have leading/trailing spaces (typical `.env` formatting issue)
-    - Check REQUIRED_KEYS presence
-    Returns (ok, warnings). If strict, raises on missing keys.
-    """
-    warnings: list[str] = []
-
-    # Strip inadvertent spaces and log warnings
-    for k, v in list(os.environ.items()):
-        if not isinstance(v, str):
-            continue
-        new, changed = _strip_if_needed(k, v)
-        if changed:
-            os.environ[k] = new
-            msg = f"Stripped spaces around env value: {k}"
-            logging.warning(msg)
-            warnings.append(msg)
-
-    # Required keys
-    missing = [k for k in REQUIRED_KEYS if not os.getenv(k)]
-    if missing:
-        msg = f"Missing required env keys: {', '.join(missing)}"
-        logging.warning(msg)
-        warnings.append(msg)
-        if strict:
-            raise RuntimeError(msg)
-
-    ok = not missing
-    return ok, warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+      - name: Safe env
+        run: |
+          echo TZ=Europe/Athens >> $GITHUB_ENV
+          echo CRONOS_RPC_URL= >> $GITHUB_ENV
+          echo WALLET_ADDRESS= >> $GITHUB_ENV
+          echo TELEGRAM_BOT_TOKEN= >> $GITHUB_ENV
+          echo TELEGRAM_CHAT_ID= >> $GITHUB_ENV
+          echo EOD_HOUR=23 >> $GITHUB_ENV
+          echo EOD_MINUTE=55 >> $GITHUB_ENV
+      - name: PyTest
+        env:
+          PYTHONPATH: .
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: pytest -q
