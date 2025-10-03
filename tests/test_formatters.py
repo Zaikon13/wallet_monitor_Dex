@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from telegram.formatters import escape_md, format_holdings
+# Use the MarkdownV2 escaper from the current codebase
+from telegram.formatters import escape_md_v2 as escape_md, format_holdings
 
 
 def test_escape_md_basic():
