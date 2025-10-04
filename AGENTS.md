@@ -1,151 +1,122 @@
-# AGENTS.md (για copy-paste στο repo)
-
-# Cronos DeFi Sentinel — Codex / Agents Brief
-
-> Repository: `Zaikon13/wallet_monitor_Dex`  
-> Deployment: Railway (TZ: Europe/Athens)
+# AGENTS.md  
+**Project:** `wallet_monitor_Dex`  
+**Owner:** `Zaikon13`  
+**Mode:** Codex — Full-File Operations Only  
 
 ---
 
-## 0) Στόχος
-- Κρατάμε canonical `main.py` (~1000–1400 lines).  
-- Όλα τα helpers βρίσκονται σε modules (`utils/`, `telegram/`, `reports/`).  
-- Ο Codex κάνει μόνο per-file edits, ποτέ ενιαίο mirror.  
-- Προτεραιότητα: σταθερότητα, deploy χωρίς errors.
+## 🧠 Project Agents Overview
+
+This document describes the roles and responsibilities of all AI and automation agents active in the **wallet_monitor_Dex** project.  
+It is meant as an operational map for collaboration, CI orchestration, and Codex-based development.
 
 ---
 
-## 1) Κανόνες (CRITICAL)
-1. **Per-file only**: κάθε edit = πλήρες αρχείο, όχι diff.  
-2. **Canonical**: baseline `main.py` στο branch `main` (13/09/2025).  
-3. 🚫 Όχι `@diff` patches.  
-4. 🚫 Όχι bash/CLI εντολές (ο χρήστης δουλεύει μόνο από GitHub Web UI).  
-5. 🚫 Όχι rename σε env vars ή public functions.  
-6. ✅ Αν κάτι είναι speculative → βάλε `# TODO:` σχόλιο.  
-7. ✅ Όταν παραδίδονται πολλά αρχεία → **Manifest με λίστα αρχείων**.  
-8. ✅ Σύντομες εξηγήσεις στα ελληνικά.  
+## 🤖 Core Agents
+
+### 1. **ChatGPT (Codex Mode)**
+**Role:** Primary development and integration assistant.  
+**Scope:**  
+- Generates and updates **full, deploy-ready files** (never diffs).  
+- Maintains project memory and canonical state across sessions.  
+- Produces MANIFEST summaries for every deliverable.  
+- Operates strictly according to user rules (Repo-First, Stability, Transparency).  
+- Supports: Python modules (`core/`, `utils/`, `telegram/`, `reports/`, `scripts/`), CI workflows, and documentation.
+
+**Rules:**  
+1. Never alter the project’s logical flow without confirmation.  
+2. Always read the canonical repo (Zaikon13/wallet_monitor_Dex) before editing.  
+3. Deliver one file per cycle unless multi-file MANIFEST is explicitly requested.  
+4. Use `# TODO:` only for optional or speculative code.  
+5. Avoid CLI/Bash suggestions — GitHub Web UI only.  
 
 ---
 
-## 2) Repo Αρχιτεκτονική
-- `main.py` — entrypoint, loops (wallet, dex, alerts, guard, telegram, scheduler).  
-- `utils/http.py` — `safe_get`, `safe_json`.  
-- `telegram/api.py` — `send_telegram(text)`.  
-- `reports/ledger.py` — ledger helpers.  
-- `reports/aggregates.py` — aggregations.  
-- `reports/day_report.py` — EOD/intraday report text.  
-- `telegram/__init__.py`, `reports/__init__.py` — κενά αρχεία.  
+### 2. **Cordex**
+**Role:** Repository automation and diagnostics agent.  
+**Scope:**  
+- Monitors CI/CD pipelines (`.github/workflows/*`).  
+- Runs smoke tests, lint checks, and consistency audits on merges.  
+- Maintains **cordex-diag**, **cordex-ping**, and **cordex-issue-smoke** scripts.  
+- Confirms alignment between repo files and Codex deliverables.  
 
-**Imports στο main.py:**
-```python
-from utils.http import safe_get, safe_json
-from telegram.api import send_telegram
-from reports.day_report import build_day_report_text as _compose_day_report
-from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
-from reports.aggregates import aggregate_per_asset
-````
-
-## 3) Environment (Railway)
-
-**Χωρίς secrets**. Canonical names:
-
-* `TELEGRAM_BOT_TOKEN`
-* `TELEGRAM_CHAT_ID=5307877340`
-* `WALLET_ADDRESS=0xEa53D79ce2A915033e6b4C5ebE82bb6b292E35Cc`
-* `ETHERSCAN_API`
-* `CRONOS_RPC_URL=https://cronos-evm-rpc.publicnode.com`
-* Thresholds/Intervals: `ALERTS_INTERVAL_MIN`, `DEX_POLL`, `DISCOVER_*`, `EOD_HOUR`, `EOD_MINUTE`, `TZ=Europe/Athens`
+**Output:**  
+- ✅ CI Green confirmation on GitHub Actions.  
+- ❌ Diagnostics report via PR comment if mismatch detected.
 
 ---
 
-## 4) Requirements
+### 3. **Railway**
+**Role:** Deployment agent.  
+**Scope:**  
+- Builds and deploys the app from the `main` branch.  
+- Loads canonical environment variables defined in `core/config.py` and `.env`.  
+- Sends startup notifications through `telegram/api.py`.
 
-```text
-requests==2.32.3
-web3==6.20.1
-setuptools==69.5.1
-tzdata==2024.1
-python-dotenv==1.0.1
-# schedule==1.2.1  # μόνο αν ξαναχρησιμοποιηθεί
-```
+**Key Parameters (excerpt):**
+
 
 ---
 
-## 5) Telegram API
-
-* Function: **`send_telegram(text)`** μόνο.
-* Base URL: `https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}`
-* `parse_mode="Markdown"`. Αν error → αφαιρείται ή γίνεται escape.
-* Long messages split σε chunks ~3800 chars.
-
----
-
-## 6) Checklist πριν commit
-
-* [ ] Κάθε f-string κλείνει σωστά.
-* [ ] Imports όπως §2.
-* [ ] Υπάρχουν `reports/__init__.py` & `telegram/__init__.py`.
-* [ ] Στο boot: `send_telegram("🟢 Starting Cronos DeFi Sentinel.")`.
-* [ ] Στο exit: `send_telegram("🛑 Shutting down.")`.
-* [ ] Όλες οι commands (`/status`, `/holdings`, `/report` κ.λπ.) καλούν `send_telegram`.
+### 4. **GitHub Actions**
+**Role:** Continuous Integration & Backup.  
+**Workflows:**  
+- `runtime-smoke.yml` — ensures main.py runs cleanly.  
+- `wallet-snapshot.yml` — daily repo snapshot + artifact.  
+- `backup.yml` — full git bundle backup.  
+- `tests.yml` — runs unit and integration tests.  
 
 ---
 
-## 7) Manifest Template
-
-Όταν παραδίδονται πολλά αρχεία, χρησιμοποίησε το εξής format:
-
-
-## Manifest (4 αρχεία)
-
-1. utils/http.py
-2. telegram/api.py
-3. reports/ledger.py
-4. reports/day_report.py
+### 5. **Telegram Bot (@Look1982Bot)**
+**Role:** Notification and command interface.  
+**Scope:**  
+- Sends alerts to chat ID `5307877340`.  
+- Handles `/show`, `/holdings`, `/totals`, `/daily`, `/pnl` commands.  
+- Relays startup and error messages (e.g., “✅ Cronos DeFi Sentinel started”).  
 
 ---
 
-### utils/http.py
-```python
-# full content …
-```
+## 🧩 Coordination Protocol
 
-### telegram/api.py
-```python
-# full content …
-```
-
-### reports/ledger.py
-```python
-# full content …
-```
-
-### reports/day_report.py
-```python
-# full content …
-```
+| Layer | Responsible Agent | Trigger | Output |
+|-------|-------------------|----------|---------|
+| Code Generation | ChatGPT (Codex) | `/codex` | Full file(s) + MANIFEST |
+| Repo Diagnostics | Cordex | CI run | Comment / Report |
+| Deployment | Railway | Merge to `main` | Live service |
+| Alerts | Telegram Bot | Wallet / DEX events | Push notification |
 
 ---
 
-## 8) Running pip (Railway)
+## 🪶 Authoritative Baselines
 
-Για να επιβεβαιώσεις ότι το image έχει τις σωστές βιβλιοθήκες, στο build log θα τρέξει αυτόματα:
-
-```bash
-pip install -r requirements.txt
-```
-
-Αν θες να το κάνεις χειροκίνητα σε dev περιβάλλον:
-
-```bash
-pip install requests==2.32.3 web3==6.20.1 setuptools==69.5.1 tzdata==2024.1 python-dotenv==1.0.1
-```
+| Category | Baseline |
+|-----------|-----------|
+| Canonical main.py | 13 Sep 2025 — 3-part version (1371 lines) |
+| Environment defaults | Memory snapshot 2025-09-19 |
+| Repo policy | Collaboration rules v43 (2025-09-30) |
 
 ---
 
-*This AGENTS.md είναι η πηγή αλήθειας για το Codex στο project.*
+## 🧾 Change Management
+
+- All deliverables include MANIFEST (files + status + pending).  
+- Each Pull Request must include:
+  1. Description of intent.  
+  2. File count and affected modules.  
+  3. Confirmation of CI success (green).  
 
 ---
 
-Θέλεις να το ανεβάσουμε στο repo σου ως **`AGENTS.md`** στο root, ώστε να το βλέπει και ο Codex;
-```
+## 🧰 Contact & Access
+
+| System | Access |
+|---------|--------|
+| GitHub | [`Zaikon13/wallet_monitor_Dex`](https://github.com/Zaikon13/wallet_monitor_Dex) |
+| Railway | Production service linked to `main` branch |
+| Telegram | User ID `5307877340` — alerts active |
+| Codex | Active (GPT-5) — Full-file mode |
+
+---
+
+_Last updated: 2025-10-04_  
