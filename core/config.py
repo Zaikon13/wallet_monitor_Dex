@@ -1,84 +1,96 @@
-from __future__ import annotations
+# -*- coding: utf-8 -*-
+"""
+core/config.py
+
+Centralized configuration loader for Cronos DeFi Sentinel.
+Replaces scattered os.getenv calls with typed getters and AppConfig dataclass.
+
+Usage:
+    from core.config import AppConfig
+    config = AppConfig()
+"""
+
 import os
-import logging
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
-# Short → canonical env names
-ENV_ALIASES: Dict[str, str] = {
-    "BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
-    "CHAT_ID": "TELEGRAM_CHAT_ID",
-    "WALLET": "WALLET_ADDRESS",
-    "RPC": "CRONOS_RPC_URL",
-    "ETHERSCAN": "ETHERSCAN_API",
-}
 
-# Keys that should normally be present for a healthy runtime
-REQUIRED_KEYS: List[str] = [
-    "TZ",
-    "CRONOS_RPC_URL",
-    "WALLET_ADDRESS",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "EOD_HOUR",
-    "EOD_MINUTE",
-]
+def get_str(key: str, default: Optional[str] = None) -> str:
+    return os.getenv(key, default or "")
 
-def apply_env_aliases() -> None:
-    for short, full in ENV_ALIASES.items():
-        val = os.getenv(short)
-        if val and not os.getenv(full):
-            os.environ[full] = val
 
-def get_env(key: str, default: str | None = None) -> str | None:
-    return os.getenv(key, default)
+def get_int(key: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(key, default))
+    except Exception:
+        return default
 
-def require_env(key: str) -> str:
-    v = os.getenv(key)
-    if not v:
-        raise RuntimeError(f"Missing env: {key}")
-    return v
 
-def _strip_if_needed(key: str, val: str) -> Tuple[str, bool]:
-    new = val.strip()
-    return new, (new != val)
+def get_float(key: str, default: float = 0.0) -> float:
+    try:
+        return float(os.getenv(key, default))
+    except Exception:
+        return default
 
-def validate_env(strict: bool = False) -> Tuple[bool, list[str]]:
+
+def get_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    # Telegram
+    telegram_bot_token: str = get_str("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = get_str("TELEGRAM_CHAT_ID")
+
+    # Wallet / APIs
+    wallet_address: str = get_str("WALLET_ADDRESS").lower()
+    etherscan_api: str = get_str("ETHERSCAN_API")
+
+    # Polling / intervals
+    alerts_interval_minutes: int = get_int("ALERTS_INTERVAL_MINUTES", 15)
+    dex_poll: int = get_int("DEX_POLL", 60)
+    wallet_poll: int = get_int("WALLET_POLL", 15)
+
+    # Discovery
+    discover_enabled: bool = get_bool("DISCOVER_ENABLED", True)
+    discover_limit: int = get_int("DISCOVER_LIMIT", 10)
+    discover_query: str = get_str("DISCOVER_QUERY", "cronos")
+    discover_max_pair_age_hours: int = get_int("DISCOVER_MAX_PAIR_AGE_HOURS", 24)
+    discover_min_liq_usd: float = get_float("DISCOVER_MIN_LIQ_USD", 30000)
+    discover_min_vol24_usd: float = get_float("DISCOVER_MIN_VOL24_USD", 5000)
+
+    # End of Day
+    eod_hour: int = get_int("EOD_HOUR", 23)
+    eod_minute: int = get_int("EOD_MINUTE", 59)
+
+    # Thresholds / alerts
+    price_move_threshold: float = get_float("PRICE_MOVE_THRESHOLD", 5.0)
+    pump_alert_24h_pct: float = get_float("PUMP_ALERT_24H_PCT", 20.0)
+    dump_alert_24h_pct: float = get_float("DUMP_ALERT_24H_PCT", -15.0)
+    risky_pump_default: float = get_float("RISKY_PUMP_DEFAULT", 20.0)
+    risky_dump_default: float = get_float("RISKY_DUMP_DEFAULT", -15.0)
+
+    # Guard window (anti-false positive)
+    guard_window_min: int = get_int("GUARD_WINDOW_MIN", 60)
+    guard_pump_pct: float = get_float("GUARD_PUMP_PCT", 20.0)
+    guard_drop_pct: float = get_float("GUARD_DROP_PCT", -12.0)
+    guard_trail_drop_pct: float = get_float("GUARD_TRAIL_DROP_PCT", -8.0)
+
+    # Timezone
+    tz: str = get_str("TZ", "Europe/Athens")
+
+    # RPC
+    cronos_rpc_url: str = get_str(
+        "CRONOS_RPC_URL", "https://cronos-evm-rpc.publicnode.com"
+    )
+
+
+def load_config() -> AppConfig:
     """
-    Validate critical env vars.
-    - Trim leading/trailing spaces (common .env formatting issue) and warn
-    - Check REQUIRED_KEYS presence
-    Returns (ok, warnings). If strict, raises on missing keys.
+    Factory for AppConfig (useful for tests or reloads).
     """
-    warnings: list[str] = []
-
-    # Trim accidental spaces and log warnings
-    for k, v in list(os.environ.items()):
-        if not isinstance(v, str):
-            continue
-        new, changed = _strip_if_needed(k, v)
-        if changed:
-            os.environ[k] = new
-            msg = f"Stripped spaces around env value: {k}"
-            logging.warning(msg)
-            warnings.append(msg)
-
-    # Required keys
-    missing = [k for k in REQUIRED_KEYS if not os.getenv(k)]
-    if missing:
-        msg = f"Missing required env keys: {', '.join(missing)}"
-        logging.warning(msg)
-        warnings.append(msg)
-        if strict:
-            raise RuntimeError(msg)
-
-    ok = not missing
-    return ok, warnings
-
-__all__ = [
-    "ENV_ALIASES",
-    "REQUIRED_KEYS",
-    "apply_env_aliases",
-    "get_env",
-    "require_env",
-    "validate_env",
-]
+    return AppConfig()
