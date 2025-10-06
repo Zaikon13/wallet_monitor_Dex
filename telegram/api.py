@@ -1,8 +1,10 @@
-# -*- coding: utf-8 -*-
-"""Telegram API helpers."""
 from __future__ import annotations
 
+"""Telegram API helpers."""
+
+import logging
 import os
+from typing import Iterable
 
 import requests
 
@@ -12,6 +14,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+log = logging.getLogger(__name__)
 
 
 def _tg_send_raw(text: str, use_markdown: bool = True) -> bool:
@@ -26,22 +30,35 @@ def _tg_send_raw(text: str, use_markdown: bool = True) -> bool:
         }
         if use_markdown:
             data["parse_mode"] = "MarkdownV2"
-        r = requests.post(f"{_API_BASE}/sendMessage", data=data, timeout=30)
-        return r.status_code == 200
+        response = requests.post(f"{_API_BASE}/sendMessage", data=data, timeout=30)
+        return response.status_code == 200
     except Exception:
+        log.debug("Telegram send failed", exc_info=True)
         return False
+
+
+def _escape_parts(parts: Iterable[str], escape: bool) -> Iterable[tuple[str, bool]]:
+    for raw_part in parts:
+        if not escape:
+            yield raw_part, False
+            continue
+        try:
+            yield escape_md_v2(raw_part), True
+        except Exception:
+            log.debug("Markdown escape failed; falling back to plain text", exc_info=True)
+            yield raw_part, False
 
 
 def send_telegram(text: str, escape: bool = True) -> None:
     """High-level sender with safe chunking and MarkdownV2 escaping."""
     if not text:
         return
+
     parts = list(chunk(text, 3800))
-    for raw_part in parts:
-        payload = escape_md_v2(raw_part) if escape else raw_part
-        ok = _tg_send_raw(payload, use_markdown=escape)
-        if not ok:
-            _tg_send_raw(raw_part, use_markdown=False)
+    for escaped_part, used_markdown in _escape_parts(parts, escape):
+        ok = _tg_send_raw(escaped_part, use_markdown=used_markdown)
+        if not ok and used_markdown:
+            _tg_send_raw(escaped_part, use_markdown=False)
 
 
 # Compatibility alias for legacy imports used across the codebase
