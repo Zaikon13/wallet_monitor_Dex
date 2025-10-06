@@ -12,6 +12,7 @@ from core.providers.etherscan_like import (
     token_balance,
 )
 from core.pricing import get_price_usd
+from core.rpc import get_native_balance
 
 
 def _map_from_env(key: str) -> Dict[str, str]:
@@ -115,11 +116,34 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
 
 def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     """Return a sanitized snapshot dict suitable for formatting."""
+    wallet_address = (os.getenv("WALLET_ADDRESS") or "").strip()
+    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
+    if wallet_address:
+        try:
+            balance_cro = Decimal(str(get_native_balance(wallet_address)))
+            px = get_price_usd("CRO")
+            usd = (balance_cro * px).quantize(Decimal("0.0001")) if px is not None else None
+            cro_entry = {
+                "qty": str(balance_cro.normalize()),
+                "price_usd": (str(px) if px is not None else None),
+                "usd": (str(usd) if usd is not None else None),
+            }
+        except Exception:
+            cro_entry = {"qty": "0", "price_usd": None, "usd": None}
+
     try:
         raw = get_wallet_snapshot()
     except Exception:
         raw = {}
+
     sanitized = _sanitize_snapshot(raw)
+    existing_cro = sanitized.get("CRO", {})
+    merged_cro = dict(existing_cro)
+    merged_cro.update({k: v for k, v in cro_entry.items() if v is not None})
+    merged_cro["qty"] = cro_entry.get("qty", merged_cro.get("qty", "0"))
+    merged_cro.setdefault("symbol", "CRO")
+    sanitized["CRO"] = merged_cro
+
     if "TCRO" in sanitized and "tCRO" not in sanitized:
         sanitized["tCRO"] = sanitized.pop("TCRO")
     return sanitized
