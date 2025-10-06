@@ -118,5 +118,9 @@ def main():
     REPORT.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 
-if __name__=="__main__":
+def cli() -> None:
     raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    pass
