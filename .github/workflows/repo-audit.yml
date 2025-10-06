@@ -1,0 +1,157 @@
+name: Repo Audit
+on:
+  workflow_dispatch: {}   # Run manually from Actions tab
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Run static audit (inline)
+        run: |
+          python - <<'PY'
+          import ast, pathlib, re
+          from collections import defaultdict
+          ROOT = pathlib.Path('.').resolve()
+          IGN = {".git",".github","__pycache__","venv",".venv","node_modules","dist","build",".mypy_cache",".pytest_cache"}
+          STD = {"sys","os","json","time","datetime","typing","pathlib","logging","math","re","subprocess","itertools","functools","collections","decimal","asyncio","enum","dataclasses","traceback","types","queue","signal","random","contextlib"}
+          HINT = {"requests","httpx","schedule","threading","subprocess","socket"}
+
+          def py_files():
+              for p in ROOT.rglob("*.py"):
+                  if any(part in IGN for part in p.parts): continue
+                  yield p
+
+          def modname(p): return ".".join(p.relative_to(ROOT).with_suffix("").parts)
+
+          idx, parsed, symbols, syn = {}, {}, {}, []
+          for p in py_files():
+              m = modname(p); idx[m]=p
+              try:
+                  s = p.read_text(encoding="utf-8")
+                  t = ast.parse(s, filename=str(p))
+                  parsed[m] = (t, s)
+                  defs, all_list = set(), None
+                  for n in getattr(t,"body",[]):
+                      if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): defs.add(n.name)
+                      elif isinstance(n,ast.Assign):
+                          for tgt in n.targets:
+                              if isinstance(tgt,ast.Name): defs.add(tgt.id)
+                  symbols[m]=defs
+              except SyntaxError as e:
+                  syn.append((str(p), f"{e.msg} (line {e.lineno}, col {e.offset})"))
+
+          miss_mod, miss_sym = [], []
+          graph = defaultdict(set)
+          sidefx = defaultdict(list)
+
+          def is_std(name): return name.split(".")[0] in STD
+          def resolve(cur, node):
+              pkg = (node.module or ""); lvl = node.level or 0
+              if not lvl: return pkg
+              base = cur.split(".")[:-lvl]
+              return ".".join(base + (pkg.split(".") if pkg else []))
+
+          for mod,(tree,src) in parsed.items():
+              for n in getattr(tree,"body",[]):
+                  if isinstance(n,ast.Expr) and isinstance(n.value,ast.Call):
+                      f=n.value.func; nm=None
+                      if isinstance(f,ast.Attribute) and isinstance(f.value,ast.Name): nm=f.value.id
+                      elif isinstance(f,ast.Name): nm=f.id
+                      sidefx[str(idx[mod])].append(f"Top-level call using '{nm}'" if nm in HINT else "Top-level function call")
+                  if isinstance(n,ast.Assign) and isinstance(getattr(n,"value",None),ast.Call):
+                      sidefx[str(idx[mod])].append("Top-level call in assignment")
+              for n in ast.walk(tree):
+                  if isinstance(n,ast.Import):
+                      for a in n.names:
+                          if is_std(a.name): continue
+                          parts=a.name.split("."); found=False
+                          while parts:
+                              cand=".".join(parts)
+                              if cand in idx: graph[mod].add(cand); found=True; break
+                              parts.pop()
+                          if not found and a.name.split(".")[0] in {k.split(".")[0] for k in idx}:
+                              miss_mod.append((mod,a.name))
+                  elif isinstance(n,ast.ImportFrom):
+                      tgt = resolve(mod,n)
+                      if tgt:
+                          check=tgt; parts=check.split("."); exists=False
+                          while True:
+                              if check in idx: graph[mod].add(check); exists=True; break
+                              if not parts: break
+                              parts.pop(); check=".".join(parts) or ""
+                          if not exists and tgt.split(".")[0] in {k.split(".")[0] for k in idx}:
+                              miss_mod.append((mod,tgt))
+                          if tgt in symbols:
+                              defs=symbols[tgt]
+                              for a in n.names:
+                                  if a.name!="*" and a.name not in defs:
+                                      miss_sym.append((mod,tgt,a.name))
+
+          # cycles
+          seen,stack,out=set(),[],[]
+          def dfs(u):
+              if u in stack:
+                  i=stack.index(u); out.append(stack[i:]+[u]); return
+              if u in seen: return
+              seen.add(u); stack.append(u)
+              for v in graph.get(u,()): dfs(v)
+              stack.pop()
+          for n in list(graph.keys()): dfs(n)
+          cyc=[]; ded=set()
+          for c in out:
+              t=tuple(c)
+              if t not in ded: ded.add(t); cyc.append(c)
+
+          # scripts/ & telegram/ hygiene
+          extra=[]
+          for mod,(tree,src) in parsed.items():
+              if mod.startswith("scripts."):
+                  if "if __name__ == '__main__':" not in src and 'if __name__ == "__main__":' not in src:
+                      extra.append(("[SCRIPTS_MAIN_GUARD]", mod, "missing __main__ guard"))
+                  if "argparse" not in src:
+                      extra.append(("[SCRIPTS_ARGPARSE]", mod, "argparse not used"))
+              if mod.startswith("telegram."):
+                  uses = re.search(r"(send_message|send_telegram_message|bot\.send|send_telegram\()", src, re.I)
+                  if uses and ("4096" not in src and "chunk" not in src.lower()):
+                      extra.append(("[TELEGRAM_CHUNKING]", mod, "no 4096 chunking safeguard"))
+                  if uses and ("escape" not in src.lower()):
+                      extra.append(("[TELEGRAM_ESCAPE]", mod, "no escaping helper referenced"))
+
+          lines=[]
+          push=lines.append
+          push("# Repo Audit Report\n")
+          if syn:
+              push("## Syntax errors"); [push(f"- {p}: {m}") for p,m in syn]; push("")
+          if miss_mod:
+              push("## Missing internal modules"); [push(f"- {w}: `{n}`") for w,n in sorted(set(miss_mod))]; push("")
+          if miss_sym:
+              push("## Missing symbols"); [push(f"- {w}: `{s}` from `{t}`") for w,t,s in sorted(set(miss_sym))]; push("")
+          if sidefx:
+              push("## Potential side-effects at import"); 
+              for p,items in sidefx.items():
+                  for it in items: push(f"- {p}: {it}")
+              push("")
+          if cyc:
+              push("## Circular imports"); [push(f"- {' -> '.join(c)}") for c in cyc]; push("")
+          if extra:
+              push("## Scripts & Telegram hygiene"); 
+              for tag,mod,msg in extra: push(f"- {tag} {mod}: {msg}")
+              push("")
+          if not any([syn,miss_mod,miss_sym,sidefx,cyc,extra]):
+              push("✅ No issues detected.")
+          pathlib.Path("repo_audit_report.md").write_text("\n".join(lines), encoding="utf-8")
+          print("\n".join(lines))
+          PY
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-audit-report
+          path: repo_audit_report.md
+          if-no-files-found: error
