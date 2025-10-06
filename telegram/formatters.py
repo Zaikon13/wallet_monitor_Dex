@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import math
 import re
 from decimal import Decimal
-from typing import Dict
+from typing import Dict, Iterable
 
 
-# --- MarkdownV2 escaping (retained for backwards compatibility) ---
+# --- Markdown escaping helpers ---
 def escape_md(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"([_*`\[\]()~>#+\-=|{}.!])", r"\\\\\1", str(text))
+
+
+def escape_md_v2(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\\\1", str(text))
+
+
+def chunk(text: str, size: int = 3800) -> Iterable[str]:
+    if not text:
+        return []
+    total = max(1, math.ceil(len(text) / size))
+    for idx in range(total):
+        yield text[idx * size : (idx + 1) * size]
 
 
 # --- Helpers ---

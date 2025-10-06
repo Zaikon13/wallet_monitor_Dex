@@ -250,5 +250,9 @@ def main(argv: List[str]) -> int:
     return 0 if RESULT["ok"] else 1
 
 
-if __name__ == "__main__":
+def cli() -> None:
     raise SystemExit(main(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    pass

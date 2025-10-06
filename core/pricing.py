@@ -27,6 +27,16 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from utils.http import get_json
 
+
+# ---------- General helpers ----------
+def _map_from_env(prefix: str) -> dict:
+    """Return a dict of environment variables filtered by ``prefix_``."""
+    import os
+
+    needle = f"{prefix}_"
+    return {k[len(needle) :]: v for k, v in os.environ.items() if k.startswith(needle)}
+
+
 # ---------- Cache settings ----------
 _PRICE_TTL_SEC = 60            # how long a price is considered fresh
 _PRICE_MAX_ITEMS = 512         # hard bound on symbol->price cache

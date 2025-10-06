@@ -1,32 +1,17 @@
 # -*- coding: utf-8 -*-
-"""
-Telegram API helpers.
-
-Public API:
-- send_telegram(text: str) -> None
-- send_telegram_message = send_telegram  (compat alias for legacy imports)
-"""
+"""Telegram API helpers."""
 from __future__ import annotations
 
-import math
 import os
-from typing import Iterable
 
 import requests
+
+from telegram.formatters import chunk, escape_md_v2
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-
-def _chunks(s: str, size: int = 3800) -> Iterable[str]:
-    """Yield Telegram-safe chunks (4096 hard limit, keep headroom for Markdown)."""
-    if not s:
-        return []
-    total = max(1, math.ceil(len(s) / size))
-    for i in range(total):
-        yield s[i * size : (i + 1) * size]
 
 
 def _tg_send_raw(text: str, use_markdown: bool = True) -> bool:
@@ -40,24 +25,21 @@ def _tg_send_raw(text: str, use_markdown: bool = True) -> bool:
             "disable_web_page_preview": True,
         }
         if use_markdown:
-            data["parse_mode"] = "Markdown"
+            data["parse_mode"] = "MarkdownV2"
         r = requests.post(f"{_API_BASE}/sendMessage", data=data, timeout=30)
         return r.status_code == 200
     except Exception:
         return False
 
 
-def send_telegram(text: str) -> None:
-    """
-    High-level sender with safe chunking and Markdown fallback.
-    Returns None (fire-and-forget).
-    """
+def send_telegram(text: str, escape: bool = True) -> None:
+    """High-level sender with safe chunking and MarkdownV2 escaping."""
     if not text:
         return
-    for part in _chunks(text, 3800):
+    payload_text = escape_md_v2(text) if escape else text
+    for part in chunk(payload_text, 3800):
         ok = _tg_send_raw(part, use_markdown=True)
         if not ok:
-            # Fallback: send without parse_mode (avoid Markdown parsing errors)
             _tg_send_raw(part, use_markdown=False)
 
 

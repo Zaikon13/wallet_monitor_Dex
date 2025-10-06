@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-scripts/cordex_ping.py
-Ultra-safe smoke test: δεν αποτυγχάνει ποτέ, απλώς τυπώνει τι δουλεύει.
-"""
-
+"""Ultra-safe smoke test for repo module imports."""
 from __future__ import annotations
-import sys
+
+import argparse
 import importlib
+import importlib.util
+import os
+import sys
+from typing import Iterable
 
 TARGETS = (
-    # βασικά modules/πακέτα του repo
     "core",
     "core.config",
     "core.tz",
@@ -25,46 +25,84 @@ TARGETS = (
     "telegram.formatters",
     "utils",
     "utils.http",
-    # προαιρετικά: το main.py ως module από αρχείο
-    # Αν το τρέξεις απευθείας, δεν θα εκτελέσει main loop.
 )
 
-def _print_ok(name: str):
+
+def _print_ok(name: str) -> None:
     print(f"[OK]    {name}")
 
-def _print_fail(name: str, err: Exception):
+
+def _print_fail(name: str, err: Exception) -> None:
     print(f"[FAIL]  {name} -> {type(err).__name__}: {err}")
 
-def _try_import(name: str):
+
+def _try_import(name: str) -> None:
     try:
         importlib.import_module(name)
         _print_ok(name)
-    except Exception as e:
-        _print_fail(name, e)
+    except Exception as exc:  # pragma: no cover - diagnostic output only
+        _print_fail(name, exc)
 
-def main() -> int:
+
+def _iter_targets(extra: Iterable[str]) -> Iterable[str]:
+    seen = set()
+    for item in TARGETS:
+        if item not in seen:
+            seen.add(item)
+            yield item
+    for item in extra:
+        if item and item not in seen:
+            seen.add(item)
+            yield item
+
+
+def _import_main_file(root: str) -> None:
+    main_path = os.path.join(root, "main.py")
+    if not os.path.isfile(main_path):
+        print("[WARN] main.py not found at repo root")
+        return
+    spec = importlib.util.spec_from_file_location("cordex_main_smoke", main_path)
+    if not spec or not spec.loader:
+        print("[WARN] Could not create spec for main.py")
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    _print_ok("main.py (file import)")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Cordex ping import smoke test")
+    parser.add_argument(
+        "--target",
+        action="append",
+        dest="targets",
+        default=[],
+        help="Additional dotted module path to import (can repeat).",
+    )
+    parser.add_argument(
+        "--skip-main",
+        action="store_true",
+        help="Skip importing main.py as a module-from-file.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     print("Python:", sys.version.replace("\n", " "))
-    # δοκίμασε imports ένα-ένα χωρίς να ρίχνεις exit code
-    for t in TARGETS:
-        _try_import(t)
 
-    # Προαιρετικά: προσπάθησε να φορτώσεις το main.py μόνο ως module-from-file, χωρίς να τρέξεις τίποτα
-    try:
-        import os
-        import importlib.util
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        main_path = os.path.join(root, "main.py")
-        if os.path.isfile(main_path):
-            spec = importlib.util.spec_from_file_location("cordex_main_smoke", main_path)
-            if spec and spec.loader:
-                m = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(m)  # δεν τρέχει main loop αν είναι σωστά γραμμένο
-                _print_ok("main.py (file import)")
-            else:
-                print("[WARN] Could not create spec for main.py")
-        else:
-            print("[WARN] main.py not found at repo root")
-    except Exception as e:
-        _print_fail("main.py (file import)", e)
+    for target in _iter_targets(args.targets):
+        _try_import(target)
 
-    # Ποτέ failure exit — ώστε το Actions βήμα να μη γίνει
+    if not args.skip_main:
+        try:
+            root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            _import_main_file(root)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            _print_fail("main.py (file import)", exc)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

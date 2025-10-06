@@ -72,5 +72,9 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def cli() -> None:
     raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    pass

@@ -30,5 +30,9 @@ def main() -> None:
         print(f"⚠️ Failed to send Telegram message: {e}", file=sys.stderr)
 
 
-if __name__ == "__main__":
+def cli() -> None:
     main()
+
+
+if __name__ == "__main__":
+    pass
