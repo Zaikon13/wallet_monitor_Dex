@@ -1,0 +1,49 @@
+name: Dedent Fix (open PR)
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  dedent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Dedent inline
+        run: |
+          python - <<'PY'
+          import pathlib, textwrap
+          ROOT = pathlib.Path('.').resolve()
+          IGN = {".git",".github","__pycache__","venv",".venv","node_modules","dist","build",".mypy_cache",".pytest_cache"}
+          def files():
+              for p in ROOT.rglob("*.py"):
+                  if any(part in IGN for part in p.parts): continue
+                  yield p
+          def needs_dedent(s, sample=20):
+              lines=[ln for ln in s.splitlines() if ln.strip()][:sample]
+              return bool(lines) and all(ln[0] in " \t" for ln in lines)
+          changed=0
+          for p in files():
+              s=p.read_text(encoding="utf-8")
+              if needs_dedent(s):
+                  d=textwrap.dedent(s)
+                  if d!=s:
+                      p.write_text(d, encoding="utf-8"); changed+=1
+          print(f"Dedented {changed} file(s).")
+          PY
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: dedent/fix-indentation
+          title: "fix: remove accidental leading indentation across repo"
+          commit-message: "fix: dedent python files with accidental global indentation"
+          body: |
+            Automated dedent across Python files.
+            - Removes accidental leading indentation detected on first non-empty lines.
+            - No functional changes intended beyond syntax unblocking.
+          labels: chore, automated
