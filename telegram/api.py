@@ -36,11 +36,12 @@ def send_telegram(text: str, escape: bool = True) -> None:
     """High-level sender with safe chunking and MarkdownV2 escaping."""
     if not text:
         return
-    payload_text = escape_md_v2(text) if escape else text
-    for part in chunk(payload_text, 3800):
-        ok = _tg_send_raw(part, use_markdown=True)
+    parts = list(chunk(text, 3800))
+    for raw_part in parts:
+        payload = escape_md_v2(raw_part) if escape else raw_part
+        ok = _tg_send_raw(payload, use_markdown=escape)
         if not ok:
-            _tg_send_raw(part, use_markdown=False)
+            _tg_send_raw(raw_part, use_markdown=False)
 
 
 # Compatibility alias for legacy imports used across the codebase

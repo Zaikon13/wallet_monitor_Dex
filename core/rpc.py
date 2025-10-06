@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 import os
+from typing import Any, Dict, List, Mapping
+
 import requests
-from typing import Dict, List, Any
 
 WEB3 = None
 ERC20_ABI_MIN = [
@@ -10,38 +12,74 @@ ERC20_ABI_MIN = [
     {"constant": True, "inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
 ]
 
-# Environment
-RPC_URL = os.getenv("CRONOS_RPC_URL", "") or os.getenv("RPC_URL", "")
-WALLET_ADDR = (os.getenv("WALLET_ADDRESS") or "").lower()
-ETHERSCAN_API = os.getenv("ETHERSCAN_API", "")
+DEFAULT_CONFIG: Dict[str, str] = {
+    "rpc_url": "",
+    "wallet_address": "",
+    "etherscan_api": "",
+}
 
+_RPC_CONFIG: Dict[str, str] = dict(DEFAULT_CONFIG)
 _sym_cache: Dict[str, str] = {}
 _dec_cache: Dict[str, int] = {}
 
+
+def get_rpc_config(env: Mapping[str, str] = os.environ) -> Dict[str, str]:
+    """Read RPC-related environment variables and return a sanitized config."""
+    rpc_url = (env.get("CRONOS_RPC_URL") or env.get("RPC_URL") or "").strip()
+    wallet_address = (env.get("WALLET_ADDRESS") or "").lower().strip()
+    etherscan_api = (env.get("ETHERSCAN_API") or "").strip()
+    return {
+        "rpc_url": rpc_url,
+        "wallet_address": wallet_address,
+        "etherscan_api": etherscan_api,
+    }
+
+
+def configure_rpc(config: Dict[str, Any] | None = None) -> Dict[str, str]:
+    """Apply a new RPC configuration. Returns the active config."""
+    global _RPC_CONFIG, WEB3
+    if config is None:
+        config = get_rpc_config()
+    applied = dict(DEFAULT_CONFIG)
+    for key in applied:
+        value = config.get(key) if config else None
+        if value is None:
+            continue
+        text = str(value).strip()
+        if key == "wallet_address":
+            applied[key] = text.lower()
+        else:
+            applied[key] = text
+    if applied["rpc_url"] != _RPC_CONFIG.get("rpc_url"):
+        WEB3 = None  # reset connection to apply new endpoint
+    _RPC_CONFIG = applied
+    return dict(_RPC_CONFIG)
+
+
 def rpc_init() -> bool:
-    """
-    Initialize Web3 provider once; return True if connected.
-    """
+    """Initialize Web3 provider once; return True if connected."""
     global WEB3
     if WEB3 is not None:
         try:
             return bool(WEB3.is_connected())
         except Exception:
             pass
-    if not RPC_URL:
+
+    rpc_url = _RPC_CONFIG.get("rpc_url", "")
+    if not rpc_url:
         return False
     try:
         from web3 import Web3
-        WEB3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
+
+        WEB3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
         return bool(WEB3.is_connected())
     except Exception:
         WEB3 = None
         return False
 
+
 def get_native_balance(addr: str) -> float:
-    """
-    Returns the CRO balance of the given address.
-    """
+    """Return the CRO balance of the given address."""
     if not rpc_init():
         return 0.0
     try:
@@ -50,10 +88,9 @@ def get_native_balance(addr: str) -> float:
     except Exception:
         return 0.0
 
+
 def erc20_balance(contract: str, owner: str) -> float:
-    """
-    Returns the token balance of owner for the given ERC20 contract (scaled to token units).
-    """
+    """Return the ERC-20 token balance of the owner for the given contract."""
     if not rpc_init():
         return 0.0
     try:
@@ -68,10 +105,9 @@ def erc20_balance(contract: str, owner: str) -> float:
     except Exception:
         return 0.0
 
+
 def erc20_symbol(contract: str) -> str:
-    """
-    Returns the symbol for the given ERC20 contract.
-    """
+    """Return the symbol for the given ERC-20 contract."""
     if contract in _sym_cache:
         return _sym_cache[contract]
     if not rpc_init():
@@ -88,10 +124,9 @@ def erc20_symbol(contract: str) -> str:
         _sym_cache[contract] = contract[:8].upper()
         return _sym_cache[contract]
 
+
 def get_symbol_decimals(contract: str) -> tuple[str, int]:
-    """
-    Returns (symbol, decimals) for the given ERC20 contract address.
-    """
+    """Return (symbol, decimals) for the given ERC-20 contract address."""
     if contract in _sym_cache and contract in _dec_cache:
         return (_sym_cache[contract], _dec_cache[contract])
     if not rpc_init():
@@ -111,14 +146,11 @@ def get_symbol_decimals(contract: str) -> tuple[str, int]:
         _dec_cache[contract] = 18
     return (_sym_cache[contract], _dec_cache[contract])
 
+
 def discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: int) -> set[str]:
-    """
-    Scans recent blockchain logs for ERC20 Transfer events involving the owner address.
-    Returns a set of token contract addresses.
-    """
+    """Scan recent blockchain logs for ERC-20 Transfer events involving the owner address."""
     if not rpc_init():
         return set()
-    latest = None
     try:
         latest = WEB3.eth.block_number
     except Exception:
@@ -137,7 +169,7 @@ def discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: int) -
             logs = WEB3.eth.get_logs({
                 "fromBlock": current_block,
                 "toBlock": end_block,
-                "topics": [transfer_topic, topic_addr]
+                "topics": [transfer_topic, topic_addr],
             })
             for log in logs:
                 addr = (log.get("address") or "").lower()
@@ -149,7 +181,7 @@ def discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: int) -
             logs = WEB3.eth.get_logs({
                 "fromBlock": current_block,
                 "toBlock": end_block,
-                "topics": [transfer_topic, None, topic_addr]
+                "topics": [transfer_topic, None, topic_addr],
             })
             for log in logs:
                 addr = (log.get("address") or "").lower()
@@ -160,28 +192,30 @@ def discover_token_contracts_by_logs(owner: str, blocks_back: int, chunk: int) -
         current_block = end_block + 1
     return found
 
+
 def discover_wallet_tokens(window_blocks: int = 120000, chunk: int = 5000) -> List[Dict[str, Any]]:
-    """
-    Discover token contracts associated with the wallet and return list of those with balance > 0.
-    Each item: {"token_addr": ..., "symbol": ..., "decimals": ..., "balance": ...}
-    """
-    tokens = []
-    if not WALLET_ADDR:
+    """Discover wallet tokens with positive balance via RPC and optional Etherscan fallback."""
+    tokens: List[Dict[str, Any]] = []
+    wallet = _RPC_CONFIG.get("wallet_address", "")
+    if not wallet:
         return tokens
-    contracts = discover_token_contracts_by_logs(WALLET_ADDR, window_blocks, chunk)
-    if not contracts and ETHERSCAN_API:
+
+    contracts = discover_token_contracts_by_logs(wallet, window_blocks, chunk)
+    etherscan_api = _RPC_CONFIG.get("etherscan_api", "")
+
+    if not contracts and etherscan_api:
         try:
             params = {
                 "chainid": 25,
                 "module": "account",
                 "action": "tokentx",
-                "address": WALLET_ADDR,
+                "address": wallet,
                 "startblock": 0,
                 "endblock": 99999999,
                 "page": 1,
                 "offset": 1000,
                 "sort": "desc",
-                "apikey": ETHERSCAN_API
+                "apikey": etherscan_api,
             }
             resp = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=15)
             if resp.status_code == 200:
@@ -193,18 +227,20 @@ def discover_wallet_tokens(window_blocks: int = 120000, chunk: int = 5000) -> Li
                             contracts.add(ca)
         except Exception:
             pass
+
     if not contracts:
         return tokens
+
     for addr in sorted(contracts):
         if not addr.startswith("0x"):
             continue
         sym, dec = get_symbol_decimals(addr)
-        bal = erc20_balance(addr, WALLET_ADDR)
+        bal = erc20_balance(addr, wallet)
         if bal > 1e-12:
             tokens.append({
                 "token_addr": addr,
                 "symbol": sym,
                 "decimals": dec,
-                "balance": bal
+                "balance": bal,
             })
     return tokens

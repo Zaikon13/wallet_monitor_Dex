@@ -14,11 +14,11 @@ from core.holdings import get_wallet_snapshot, format_snapshot_lines
 from telegram.api import send_telegram
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     snapshot = get_wallet_snapshot()
     if not snapshot:
         print("No holdings.")
-        return
+        return 0
 
     text = "💰 Wallet Snapshot\n" + format_snapshot_lines(snapshot)
     print(text)
@@ -28,11 +28,12 @@ def main() -> None:
         send_telegram(text)
     except Exception as e:
         print(f"⚠️ Failed to send Telegram message: {e}", file=sys.stderr)
-
-
-def cli() -> None:
-    main()
+    return 0
 
 
 if __name__ == "__main__":
-    pass
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Snapshot wallet holdings")
+    _ = ap.parse_args()
+    raise SystemExit(main())

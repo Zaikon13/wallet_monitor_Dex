@@ -95,7 +95,7 @@ def cycles(graph):
         if t not in ded: ded.add(t); uniq.append(c)
     return uniq
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     idx, parsed, symbols, synerr = parse_all()
     graph, miss_mod, miss_sym, sidefx = analyze(idx, parsed, symbols)
     cyc = cycles(graph)
@@ -117,10 +117,12 @@ def main():
         lines.append("✅ No issues detected.")
     REPORT.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
-
-def cli() -> None:
-    raise SystemExit(main())
+    return 0
 
 
 if __name__ == "__main__":
-    pass
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Repo health report")
+    _ = ap.parse_args()
+    raise SystemExit(main())

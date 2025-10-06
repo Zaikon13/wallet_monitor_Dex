@@ -32,14 +32,14 @@ from telegram.api import send_telegram
 from reports.day_report import build_day_report_text as _compose_day_report
 from reports.ledger import append_ledger, update_cost_basis as ledger_update_cost_basis, replay_cost_basis_over_entries
 from reports.aggregates import aggregate_per_asset
+from reports import scheduler as report_scheduler
+from core import guards
+import core.rpc as core_rpc
 
 # ---------- Bootstrap / TZ ----------
-load_dotenv()
 def _alias_env(src, dst):
     if os.getenv(dst) is None and os.getenv(src) is not None:
         os.environ[dst] = os.getenv(src)
-_alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
-_alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
 
 def _init_tz(tz_str: str | None):
     tz = tz_str or "Europe/Athens"
@@ -53,7 +53,7 @@ def _init_tz(tz_str: str | None):
     return ZoneInfo(tz)
 
 TZ = os.getenv("TZ", "Europe/Athens")
-LOCAL_TZ = _init_tz(TZ)
+LOCAL_TZ: ZoneInfo = ZoneInfo("UTC")
 def now_dt(): return datetime.now(LOCAL_TZ)
 def ymd(dt=None): return (dt or now_dt()).strftime("%Y-%m-%d")
 def month_prefix(dt=None): return (dt or now_dt()).strftime("%Y-%m")
@@ -97,10 +97,10 @@ ALERTS_INTERVAL_MIN = int(os.getenv("ALERTS_INTERVAL_MIN","15"))
 DUMP_ALERT_24H_PCT  = float(os.getenv("DUMP_ALERT_24H_PCT","-15"))
 PUMP_ALERT_24H_PCT  = float(os.getenv("PUMP_ALERT_24H_PCT","20"))
 
-GUARD_WINDOW_MIN     = int(os.getenv("GUARD_WINDOW_MIN","60"))
-GUARD_PUMP_PCT       = float(os.getenv("GUARD_PUMP_PCT","20"))
-GUARD_DROP_PCT       = float(os.getenv("GUARD_DROP_PCT","-12"))
-GUARD_TRAIL_DROP_PCT = float(os.getenv("GUARD_TRAIL_DROP_PCT","-8"))
+GUARD_WINDOW_MIN     = 60
+GUARD_PUMP_PCT       = 20.0
+GUARD_DROP_PCT       = -12.0
+GUARD_TRAIL_DROP_PCT = -8.0
 
 RECEIPT_SYMBOLS = set([s.strip().upper() for s in os.getenv("RECEIPT_SYMBOLS","TCRO").split(",") if s.strip()])
 
@@ -114,8 +114,126 @@ CRONOS_TX        = "https://cronoscan.com/tx/{txhash}"
 DATA_DIR         = "/app/data"
 ATH_PATH         = os.path.join(DATA_DIR, "ath.json")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", stream=sys.stdout)
 log = logging.getLogger("wallet-monitor")
+
+# ---------- App lifecycle ----------
+_APP_INITIALIZED = False
+_SERVICES_STARTED = False
+_SCHEDULER_THREAD: threading.Thread | None = None
+GUARDS: dict[str, object] = {}
+
+
+def _apply_guard_settings(config: dict[str, object]) -> None:
+    global GUARDS, GUARD_WINDOW_MIN, GUARD_PUMP_PCT, GUARD_DROP_PCT, GUARD_TRAIL_DROP_PCT
+    GUARDS = dict(config or {})
+    if "window_minutes" in GUARDS:
+        try:
+            GUARD_WINDOW_MIN = int(float(GUARDS["window_minutes"]))
+        except Exception:
+            GUARD_WINDOW_MIN = 60
+    if "pump_pct" in GUARDS:
+        try:
+            GUARD_PUMP_PCT = float(GUARDS["pump_pct"])
+        except Exception:
+            GUARD_PUMP_PCT = 20.0
+    if "drop_pct" in GUARDS:
+        try:
+            GUARD_DROP_PCT = float(GUARDS["drop_pct"])
+        except Exception:
+            GUARD_DROP_PCT = -12.0
+    if "trail_drop_pct" in GUARDS:
+        try:
+            GUARD_TRAIL_DROP_PCT = float(GUARDS["trail_drop_pct"])
+        except Exception:
+            GUARD_TRAIL_DROP_PCT = -8.0
+
+
+def init_app() -> None:
+    """Initialize runtime configuration and logging lazily."""
+    global _APP_INITIALIZED, TZ, LOCAL_TZ, log
+    if _APP_INITIALIZED:
+        return None
+
+    load_dotenv()
+    _alias_env("ALERTS_INTERVAL_MINUTES", "ALERTS_INTERVAL_MIN")
+    _alias_env("DISCOVER_REQUIRE_WCRO_QUOTE", "DISCOVER_REQUIRE_WCRO")
+
+    tz_value = os.getenv("TZ", "Europe/Athens")
+    os.environ["TZ"] = tz_value
+    try:
+        if hasattr(time, "tzset"):
+            time.tzset()
+    except Exception:
+        pass
+
+    TZ = tz_value
+    try:
+        LOCAL_TZ = ZoneInfo(tz_value)  # type: ignore[assignment]
+    except Exception:
+        LOCAL_TZ = ZoneInfo("UTC")  # type: ignore[assignment]
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", stream=sys.stdout)
+    log = logging.getLogger("wallet-monitor")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    guard_config = guards.make_guards_from_env()
+    try:
+        guards.configure_guards(guard_config)
+    except AttributeError:
+        # Backwards compatibility if configure_guards is missing
+        pass
+    _apply_guard_settings(guard_config)
+
+    try:
+        core_rpc.configure_rpc(core_rpc.get_rpc_config())
+    except Exception:
+        log.debug("RPC configuration not initialized", exc_info=True)
+
+    _APP_INITIALIZED = True
+    return None
+
+
+def start_services() -> None:
+    """Start runtime threads and optional schedulers without blocking."""
+    global _SERVICES_STARTED, _SCHEDULER_THREAD
+    if _SERVICES_STARTED:
+        return None
+    if not _APP_INITIALIZED:
+        init_app()
+
+    load_ath()
+    try:
+        send_telegram("🟢 Starting Cronos DeFi Sentinel.")
+    except Exception:
+        log.debug("Failed to send startup telegram", exc_info=True)
+
+    threading.Thread(target=discovery_loop, name="discovery", daemon=True).start()
+    threading.Thread(target=wallet_monitor_loop, name="wallet", daemon=True).start()
+    threading.Thread(target=monitor_tracked_pairs_loop, name="dex", daemon=True).start()
+    threading.Thread(target=alerts_monitor_loop, name="alerts", daemon=True).start()
+    threading.Thread(target=guard_monitor_loop, name="guard", daemon=True).start()
+    threading.Thread(target=telegram_long_poll_loop, name="telegram", daemon=True).start()
+    threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True).start()
+
+    if os.getenv("START_SCHEDULER") == "1":
+        eod_time = os.getenv("EOD_TIME") or f"{EOD_HOUR:02d}:{EOD_MINUTE:02d}"
+        try:
+            report_scheduler.schedule_daily_report(eod_time)
+            if not _SCHEDULER_THREAD or not _SCHEDULER_THREAD.is_alive():
+                _SCHEDULER_THREAD = threading.Thread(
+                    target=report_scheduler.start_eod_scheduler,
+                    name="eod-scheduler",
+                    daemon=True,
+                )
+                _SCHEDULER_THREAD.start()
+            log.info("Daily report scheduled at %s", eod_time)
+        except Exception:
+            log.exception("Failed to start EOD scheduler")
+
+    _SERVICES_STARTED = True
+    return None
+
 
 # ---------- Runtime ----------
 shutdown_event = threading.Event()
@@ -140,8 +258,6 @@ PRICE_CACHE, PRICE_CACHE_TTL = {}, 60
 ATH, _alert_last_sent = {}, {}
 COOLDOWN_SEC = 60*30
 _guard = {}  # key -> {"entry","peak","start_ts"}
-
-os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---------- Utils ----------
 def _format_amount(a):
@@ -1317,22 +1433,17 @@ def _handle_command(text: str):
 # ---------- Schedulers (Intraday/EOD) ----------
 def _scheduler_loop():
     global _last_intraday_sent
-    send_telegram("⏱ Scheduler online (intraday/EOD).")
+    send_telegram("⏱ Scheduler online (intraday).")
     while not shutdown_event.is_set():
         try:
-            now=now_dt()
-            # Intraday
-            if _last_intraday_sent<=0 or (time.time()-_last_intraday_sent)>=INTRADAY_HOURS*3600:
-                send_telegram(_format_daily_sum_message()); _last_intraday_sent=time.time()
-            # EOD
-            if now.hour==EOD_HOUR and now.minute==EOD_MINUTE:
-                send_telegram(build_day_report_text())
-                # wait a minute to avoid duplicates
-                time.sleep(65)
+            if _last_intraday_sent <= 0 or (time.time() - _last_intraday_sent) >= INTRADAY_HOURS * 3600:
+                send_telegram(_format_daily_sum_message())
+                _last_intraday_sent = time.time()
         except Exception as e:
             log.debug("scheduler error: %s", e)
         for _ in range(20):
-            if shutdown_event.is_set(): break
+            if shutdown_event.is_set():
+                break
             time.sleep(3)
 
 # ---------- Main ----------
@@ -1341,31 +1452,29 @@ def _graceful_exit(signum, frame):
     except: pass
     shutdown_event.set()
 
-def main():
-    load_ath()
-    send_telegram("🟢 Starting Cronos DeFi Sentinel.")
-
-    # seed discovery
-    threading.Thread(target=discovery_loop, name="discovery", daemon=True).start()
-    # monitors
-    threading.Thread(target=wallet_monitor_loop, name="wallet", daemon=True).start()
-    threading.Thread(target=monitor_tracked_pairs_loop, name="dex", daemon=True).start()
-    threading.Thread(target=alerts_monitor_loop, name="alerts", daemon=True).start()
-    threading.Thread(target=guard_monitor_loop, name="guard", daemon=True).start()
-    threading.Thread(target=telegram_long_poll_loop, name="telegram", daemon=True).start()
-    threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True).start()
-
-    # keep alive
+def run_forever() -> None:
     while not shutdown_event.is_set():
         time.sleep(1)
 
-if __name__=="__main__":
+
+def main() -> None:
+    init_app()
+    start_services()
+    run_forever()
+
+
+if __name__ == "__main__":
     signal.signal(signal.SIGINT, _graceful_exit)
     signal.signal(signal.SIGTERM, _graceful_exit)
     try:
-        main()
-    except Exception as e:
-        log.exception("fatal: %s", e)
-        try: send_telegram(f"💥 Fatal error: {e}")
-        except: pass
+        init_app()
+        start_services()
+        logging.getLogger(__name__).info("✅ Cronos DeFi Sentinel started and is online.")
+        run_forever()
+    except Exception as exc:
+        log.exception("fatal: %s", exc)
+        try:
+            send_telegram(f"💥 Fatal error: {exc}")
+        except Exception:
+            log.debug("Failed to send fatal telegram", exc_info=True)
         sys.exit(1)

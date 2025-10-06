@@ -12,9 +12,14 @@ from core.tz import now_gr, ymd
 getcontext().prec = 28  # safe default for money math
 
 LEDGER_DIR = Path(os.getenv("LEDGER_DIR", "./.ledger")).expanduser()
-LEDGER_DIR.mkdir(parents=True, exist_ok=True)
 
 COST_BASIS_FILE = LEDGER_DIR / "cost_basis.json"
+
+
+def ensure_ledger_dir() -> None:
+    """Create the ledger directory if it does not exist."""
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # Known numeric keys we *parse back* as Decimal on read.
 _DECIMAL_KEYS = ("qty", "price_usd", "usd", "fee_usd", "realized_usd")
@@ -97,6 +102,7 @@ def _day_from_entry(entry: Dict[str, Any]) -> Optional[str]:
 
 
 def data_file_for_day(day: str) -> Path:
+    ensure_ledger_dir()
     return LEDGER_DIR / f"{day}.json"
 
 
@@ -115,6 +121,7 @@ def _read_day_raw(day: str) -> List[Dict[str, Any]]:
 
 
 def _write_day(day: str, entries: Iterable[Dict[str, Any]]) -> None:
+    ensure_ledger_dir()
     payload = [_serialize_entry(entry) for entry in entries]
     data_file_for_day(day).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -131,6 +138,7 @@ def _is_valid_day(name: str) -> bool:
 
 
 def list_days() -> List[str]:
+    ensure_ledger_dir()
     return sorted(
         [
             path.stem
@@ -141,6 +149,7 @@ def list_days() -> List[str]:
 
 
 def read_ledger(day: str) -> List[Dict[str, Any]]:
+    ensure_ledger_dir()
     raw_entries = _read_day_raw(day)
     entries = [_deserialize_entry(entry) for entry in raw_entries]
     entries.sort(key=lambda entry: entry.get("time") or 0)
@@ -148,6 +157,7 @@ def read_ledger(day: str) -> List[Dict[str, Any]]:
 
 
 def iter_all_entries() -> Iterator[Dict[str, Any]]:
+    ensure_ledger_dir()
     for day in list_days():
         for entry in read_ledger(day):
             yield entry
@@ -170,6 +180,7 @@ def append_ledger(day_or_entry: Any, entry: Optional[Dict[str, Any]] = None) -> 
         entry = dict(entry)
 
     normalized = _deserialize_entry(entry)
+    ensure_ledger_dir()
     normalized.setdefault("wallet", entry.get("wallet"))
     if normalized.get("realized_usd") is None:
         from decimal import Decimal as _D
@@ -356,6 +367,7 @@ def _rebuild_cost_basis_files() -> None:
     Scan all days, recompute FIFO basis and persist results.
     (This is what our previous update_cost_basis() did.)
     """
+    ensure_ledger_dir()
     basis: Dict[str, List[Dict[str, Decimal]]] = {}
     for day in list_days():
         entries = read_ledger(day)
@@ -384,6 +396,7 @@ def update_cost_basis(*args, **kwargs):
        update_cost_basis()
        -> returns None
     """
+    ensure_ledger_dir()
     if len(args) >= 5 or any(k in kwargs for k in ("symbol", "delta_qty", "price", "eps")):
         return _update_position_avg_cost(*args, **kwargs)
     _rebuild_cost_basis_files()
