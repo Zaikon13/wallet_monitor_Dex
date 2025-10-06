@@ -8,7 +8,9 @@ import time
 import schedule
 
 from reports.day_report import build_day_report_text
-from telegram.api import send_telegram_message
+from telegram.api import send_telegram
+
+log = logging.getLogger(__name__)
 
 
 def run_pending() -> None:
@@ -25,27 +27,33 @@ def start_eod_scheduler() -> None:
 
 def run_scheduler() -> None:
     """Background thread that polls the scheduler every second."""
+
     def _run() -> None:
         while True:
             try:
                 run_pending()
                 time.sleep(1)
-            except Exception:
-                logging.exception("Scheduler encountered an error")
-                send_telegram_message("⚠️ Scheduler error")
+            except Exception:  # pragma: no cover - defensive logging
+                log.exception("Scheduler encountered an error")
+                try:
+                    send_telegram("⚠️ Scheduler error", escape=True)
+                except Exception:
+                    log.debug("Unable to notify scheduler error", exc_info=True)
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
 
 
-def schedule_daily_report(eod_time: str = "23:59") -> None:
-    schedule.every().day.at(eod_time).do(send_daily_report)
-
-
 def send_daily_report() -> None:
+    """Compose and send the daily report through Telegram."""
     try:
         text = build_day_report_text()
-        send_telegram_message(f"📒 Daily Report\n{text}")
     except Exception:
-        logging.exception("Failed to build or send daily report")
-        send_telegram_message("⚠️ Failed to generate daily report.")
+        log.exception("Failed to compose daily report")
+        text = "Daily report unavailable (n/a)."
+    send_telegram(text)
+
+
+def schedule_daily_report(eod_time: str = "23:59") -> None:
+    """Register the end-of-day report job."""
+    schedule.every().day.at(eod_time).do(send_daily_report)

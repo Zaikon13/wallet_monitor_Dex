@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+"""Telegram command handlers that return plain text responses."""
+
 import os
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
 
-from core.runtime_state import get_snapshot, get_state
+from core.holdings import holdings_snapshot, holdings_text
+from core.runtime_state import get_state
 from core.tz import ymd
-from reports.aggregates import aggregate_per_asset, totals
+from reports.aggregates import aggregate_per_asset, totals as totals_aggregated
 from reports.day_report import build_day_report_text
 from reports.ledger import iter_all_entries, read_ledger
 from reports.weekly import build_weekly_report_text
@@ -16,20 +19,36 @@ from reports.weekly import build_weekly_report_text
 
 # ---------- helpers ----------
 
-def _fmt_decimal(value: Decimal) -> str:
-    value = Decimal(value)
-    if value == 0:
-        return "0"
-    if abs(value) >= 1:
-        return f"{value:,.2f}"
-    return f"{value:.6f}"
 
-
-def _fmt_pct(value: Decimal) -> str:
+def _to_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
     try:
-        return f"{Decimal(value):.2f}%"
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+
+
+def _fmt_money(value: Decimal) -> str:
+    try:
+        if value == 0:
+            return "$0.00"
+        if abs(value) >= 1:
+            return f"${value:,.2f}"
+        return f"${value:.6f}"
     except Exception:
-        return "0%"
+        return "$0.00"
+
+
+def _fmt_qty(value: Decimal) -> str:
+    try:
+        if value == 0:
+            return "0"
+        if abs(value) >= 1:
+            return f"{value:,.4f}"
+        return f"{value:.6f}"
+    except Exception:
+        return "0"
 
 
 def _format_age(ts: Optional[float]) -> str:
@@ -45,23 +64,108 @@ def _format_age(ts: Optional[float]) -> str:
     return f"{int(delta // 86400)}d ago"
 
 
-# ---------- commands ----------
+def _entries_for_asset(symbol: str) -> List[Dict[str, Any]]:
+    symbol = symbol.upper()
+    return [
+        entry
+        for entry in iter_all_entries() or []
+        if str(entry.get("asset") or "").upper() == symbol
+    ]
 
-def handle_diag() -> str:
+
+def _asset_usd(snapshot: Dict[str, Dict[str, Any]], symbol: str) -> Decimal:
+    info = snapshot.get(symbol) or {}
+    return _to_decimal(info.get("usd") or info.get("value_usd"))
+
+
+def _ordered_assets(snapshot: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Decimal]]:
+    symbols = list(snapshot.keys())
+    ordered: List[Tuple[str, Decimal]] = []
+    for special in ("CRO", "tCRO"):
+        if special in symbols:
+            ordered.append((special, _asset_usd(snapshot, special)))
+            symbols.remove(special)
+    symbols.sort(key=lambda sym: (_asset_usd(snapshot, sym), sym), reverse=True)
+    for sym in symbols:
+        ordered.append((sym, _asset_usd(snapshot, sym)))
+    return ordered
+
+
+# ---------- high-level command strings ----------
+
+
+def holdings(limit: int = 20) -> str:
+    try:
+        snapshot = holdings_snapshot()
+    except Exception:
+        snapshot = {}
+    if not snapshot:
+        return "No holdings data."
+
+    ordered = _ordered_assets(snapshot)
+    limited_symbols = [symbol for symbol, _ in ordered[:limit]]
+    filtered_snapshot = {symbol: snapshot.get(symbol, {}) for symbol in limited_symbols}
+    return holdings_text(filtered_snapshot)
+
+
+def totals() -> str:
+    try:
+        rows = aggregate_per_asset(iter_all_entries())
+        summary = totals_aggregated(rows)
+    except Exception:
+        return "Totals unavailable."
+    return (
+        "Totals — IN {in_usd} / OUT {out_usd} / NET {net_usd} / Realized {realized}".format(
+            in_usd=_fmt_money(_to_decimal(summary.get("in_usd"))),
+            out_usd=_fmt_money(_to_decimal(summary.get("out_usd"))),
+            net_usd=_fmt_money(_to_decimal(summary.get("net_usd"))),
+            realized=_fmt_money(_to_decimal(summary.get("realized_usd"))),
+        )
+    )
+
+
+def daily() -> str:
+    try:
+        return build_day_report_text()
+    except Exception:
+        return "Daily report unavailable."
+
+
+def show(limit: int = 5) -> str:
+    try:
+        snapshot = holdings_snapshot()
+    except Exception:
+        snapshot = {}
+    if not snapshot:
+        return "No holdings data."
+
+    ordered = _ordered_assets(snapshot)
+    top_n = ordered[:limit]
+    lines = [f"Top {len(top_n)} holdings:"]
+    for symbol, usd in top_n:
+        info = snapshot.get(symbol) or {}
+        qty = _fmt_qty(_to_decimal(info.get("qty") or info.get("amount")))
+        lines.append(f" - {symbol:<6} {qty} ≈ {_fmt_money(usd)}")
+    return "\n".join(lines)
+
+
+def status() -> str:
+    return "Cronos DeFi Sentinel online"
+
+
+def diag() -> str:
     state = get_state()
-    wallet = os.getenv("WALLET_ADDRESS", "")
     lines: List[str] = ["Diagnostics:"]
-
     rpc_ok_ts = state.get("last_rpc_ok_ts")
     rpc_error = state.get("last_rpc_error")
     if rpc_ok_ts:
-        rpc_line = f"RPC reachable: yes ({_format_age(rpc_ok_ts)})"
+        lines.append(f"RPC reachable: yes ({_format_age(rpc_ok_ts)})")
     elif rpc_error:
-        rpc_line = f"RPC reachable: no (last error: {rpc_error})"
+        lines.append(f"RPC reachable: no (last error: {rpc_error})")
     else:
-        rpc_line = "RPC reachable: unknown"
-    lines.append(rpc_line)
+        lines.append("RPC reachable: unknown")
 
+    wallet = os.getenv("WALLET_ADDRESS", "")
     lines.append(f"Wallet configured: {'yes' if wallet else 'no'}")
     lines.append(f"Last tick: {_format_age(state.get('last_tick_ts'))}")
     lines.append(f"Last wallet poll: {_format_age(state.get('last_wallet_poll_ts'))}")
@@ -80,147 +184,15 @@ def handle_diag() -> str:
     return "\n".join(lines)
 
 
-def handle_status() -> str:
-    state = get_state()
-    snapshot = state.get("snapshot") or {}
-    total = Decimal(state.get("snapshot_total_usd") or 0)
-
-    lines: List[str] = ["Status:"]
-    lines.append(f"Assets tracked: {len(snapshot)}")
-    lines.append(f"Estimated total: ${_fmt_decimal(total)}")
-    lines.append(f"Snapshot age: {_format_age(state.get('snapshot_ts'))}")
-    lines.append(f"Last wallet poll: {_format_age(state.get('last_wallet_poll_ts'))}")
-
-    return "\n".join(lines)
-
-
-def handle_holdings(limit: int = 20) -> str:
-    snapshot = get_snapshot()
-    if not snapshot:
-        return "No holdings snapshot available."
-
-    items: List[tuple[str, Decimal, Decimal]] = []
-    for symbol, data in snapshot.items():
-        qty = Decimal(str(data.get("qty") or data.get("amount") or "0"))
-        usd = Decimal(str(data.get("usd") or data.get("value_usd") or "0"))
-        items.append((symbol.upper(), qty, usd))
-
-    items.sort(key=lambda item: item[2], reverse=True)
-
-    lines: List[str] = ["Holdings (top {limit}):".format(limit=limit)]
-    for symbol, qty, usd in items[:limit]:
-        lines.append(f" - {symbol:<6} {qty:>12,.4f} ≈ ${usd:,.2f}")
-
-    if len(items) > limit:
-        remaining = sum(usd for _, _, usd in items[limit:])
-        lines.append(f"{len(items) - limit} more positions totaling ≈ ${remaining:,.2f}")
-
-    total_usd = sum(usd for _, _, usd in items)
-    lines.append("")
-    lines.append(f"Total ≈ ${total_usd:,.2f}")
-    return "\n".join(lines)
-
-
-def handle_totals() -> str:
-    entries = list(iter_all_entries())
-    rows = aggregate_per_asset(entries)
-    if not rows:
-        return "Ledger is empty."
-
-    totals_row = totals(rows)
-
-    # base για ποσοστά κατανομής
-    base_values = [
-        max(
-            abs(row.get("net_usd", Decimal("0"))),
-            row.get("in_usd", Decimal("0")),
-            row.get("out_usd", Decimal("0")),
-        )
-        for row in rows
-    ]
-    base_total = sum(base_values)
-    if base_total <= 0:
-        base_total = sum(abs(row.get("realized_usd", Decimal("0"))) for row in rows)
-
-    rows.sort(key=lambda row: row.get("net_usd", Decimal("0")), reverse=True)
-    top = rows[:10]
-    others = rows[10:]
-
-    lines: List[str] = ["Totals & Allocation:"]
-    for row in top:
-        share_base = max(
-            abs(row.get("net_usd", Decimal("0"))),
-            row.get("in_usd", Decimal("0")),
-            row.get("out_usd", Decimal("0")),
-        )
-        pct = (share_base / base_total * 100) if base_total else Decimal("0")
-        lines.append(
-            " - {asset}: NET ${net_usd} | Realized ${realized} | Share {share}".format(
-                asset=row.get("asset", "?"),
-                net_usd=_fmt_decimal(row.get("net_usd", Decimal("0"))),
-                realized=_fmt_decimal(row.get("realized_usd", Decimal("0"))),
-                share=_fmt_pct(pct),
-            )
-        )
-
-    if others:
-        others_net = sum(row.get("net_usd", Decimal("0")) for row in others)
-        others_realized = sum(row.get("realized_usd", Decimal("0")) for row in others)
-        share_base = sum(
-            max(
-                abs(row.get("net_usd", Decimal("0"))),
-                row.get("in_usd", Decimal("0")),
-                row.get("out_usd", Decimal("0")),
-            )
-            for row in others
-        )
-        pct = (share_base / base_total * 100) if base_total else Decimal("0")
-        lines.append(
-            " - Others: NET ${net_usd} | Realized ${realized} | Share {share}".format(
-                net_usd=_fmt_decimal(others_net),
-                realized=_fmt_decimal(others_realized),
-                share=_fmt_pct(pct),
-            )
-        )
-
-    lines.append("")
-    lines.append(
-        "Totals — IN ${in_usd} / OUT ${out_usd} / NET ${net_usd} / Realized ${realized}".format(
-            in_usd=_fmt_decimal(totals_row["in_usd"]),
-            out_usd=_fmt_decimal(totals_row["out_usd"]),
-            net_usd=_fmt_decimal(totals_row["net_usd"]),
-            realized=_fmt_decimal(totals_row["realized_usd"]),
-        )
-    )
-    return "\n".join(lines)
-
-
-def handle_daily() -> str:
-    snapshot = get_snapshot()
+def weekly(days: int = 7) -> str:
     wallet = os.getenv("WALLET_ADDRESS", "")
-    return build_day_report_text(
-        intraday=False,
-        wallet=wallet,
-        snapshot=snapshot,
-        day=ymd(),
-    )
+    try:
+        return build_weekly_report_text(days=days, wallet=wallet)
+    except Exception:
+        return "Weekly report unavailable."
 
 
-def handle_weekly(days: int = 7) -> str:
-    wallet = os.getenv("WALLET_ADDRESS", "")
-    return build_weekly_report_text(days=days, wallet=wallet)
-
-
-def _entries_for_asset(symbol: str) -> List[Dict[str, Any]]:
-    symbol = symbol.upper()
-    return [
-        entry
-        for entry in iter_all_entries()
-        if str(entry.get("asset") or "").upper() == symbol
-    ]
-
-
-def handle_pnl(symbol: Optional[str] = None) -> str:
+def pnl(symbol: Optional[str] = None) -> str:
     if symbol:
         entries = _entries_for_asset(symbol)
         symbol = symbol.upper()
@@ -229,43 +201,45 @@ def handle_pnl(symbol: Optional[str] = None) -> str:
 
         buys = [e for e in entries if str(e.get("side")).upper() == "IN"]
         sells = [e for e in entries if str(e.get("side")).upper() == "OUT"]
-        realized = sum(Decimal(e.get("realized_usd", 0)) for e in entries)
+        realized = sum(_to_decimal(e.get("realized_usd")) for e in entries)
         qty_net = sum(
-            Decimal(e.get("qty", 0))
+            _to_decimal(e.get("qty"))
             * (1 if str(e.get("side")).upper() == "IN" else -1)
             for e in entries
         )
-        spent = sum(Decimal(e.get("usd", 0)) for e in buys)
-        received = sum(Decimal(e.get("usd", 0)) for e in sells)
+        spent = sum(_to_decimal(e.get("usd")) for e in buys)
+        received = sum(_to_decimal(e.get("usd")) for e in sells)
 
         lines = [f"PnL for {symbol}:"]
-        lines.append(f" - Buys: {len(buys)} totaling ${_fmt_decimal(spent)}")
-        lines.append(f" - Sells: {len(sells)} totaling ${_fmt_decimal(received)}")
-        lines.append(f" - Net qty: {_fmt_decimal(qty_net)}")
-        lines.append(f" - Realized PnL: ${_fmt_decimal(realized)}")
+        lines.append(f" - Buys: {len(buys)} totaling {_fmt_money(spent)}")
+        lines.append(f" - Sells: {len(sells)} totaling {_fmt_money(received)}")
+        lines.append(f" - Net qty: {_fmt_qty(qty_net)}")
+        lines.append(f" - Realized PnL: {_fmt_money(realized)}")
         return "\n".join(lines)
 
-    # No symbol: δείξε Top movers
     rows = aggregate_per_asset(iter_all_entries())
     if not rows:
         return "Ledger is empty."
-    rows.sort(key=lambda row: abs(row.get("realized_usd", Decimal("0"))), reverse=True)
+    rows.sort(key=lambda row: abs(_to_decimal(row.get("realized_usd"))), reverse=True)
     top = rows[:5]
 
     lines = ["Top movers by realized PnL:"]
     for row in top:
-        realized = row.get("realized_usd", Decimal("0"))
+        realized = _to_decimal(row.get("realized_usd"))
         direction = "+" if realized >= 0 else ""
         lines.append(
-            f" - {row.get('asset', '?')}: {direction}${_fmt_decimal(realized)} "
-            f"(net ${_fmt_decimal(row.get('net_usd', Decimal('0')))} )"
+            f" - {row.get('asset', '?')}: {direction}{_fmt_money(realized)} "
+            f"(net {_fmt_money(_to_decimal(row.get('net_usd')))} )"
         )
     return "\n".join(lines)
 
 
-def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
-    day = day or ymd()
-    entries = read_ledger(day)
+def tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
+    target_day = day or ymd()
+    try:
+        entries = read_ledger(target_day) or []
+    except Exception:
+        entries = []
 
     if symbol:
         symbol = symbol.upper()
@@ -277,10 +251,10 @@ def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
 
     if not entries:
         target = f" for {symbol}" if symbol else ""
-        return f"No transactions on {day}{target}."
+        return f"No transactions on {target_day}{target}."
 
     limit = 20
-    lines: List[str] = [f"Transactions on {day}{(' for ' + symbol) if symbol else ''}:"]
+    lines: List[str] = [f"Transactions on {target_day}{(' for ' + symbol) if symbol else ''}:"]
     for entry in entries[:limit]:
         ts = entry.get("time")
         if ts:
@@ -297,8 +271,8 @@ def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
                 ts=ts_text,
                 side=str(entry.get("side") or "?").upper(),
                 asset=str(entry.get("asset") or "?").upper(),
-                qty=_fmt_decimal(entry.get("qty", Decimal("0"))),
-                usd=_fmt_decimal(entry.get("usd", Decimal("0"))),
+                qty=_fmt_qty(_to_decimal(entry.get("qty"))),
+                usd=_fmt_money(_to_decimal(entry.get("usd"))),
             )
         )
 
@@ -306,3 +280,42 @@ def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
         lines.append(f"{len(entries) - limit} more ...")
 
     return "\n".join(lines)
+
+
+# ---------- compatibility wrappers ----------
+
+
+def handle_holdings(limit: int = 20) -> str:
+    return holdings(limit=limit)
+
+
+def handle_totals() -> str:
+    return totals()
+
+
+def handle_daily() -> str:
+    return daily()
+
+
+def handle_show(limit: int = 5) -> str:
+    return show(limit=limit)
+
+
+def handle_status() -> str:
+    return status()
+
+
+def handle_diag() -> str:
+    return diag()
+
+
+def handle_weekly(days: int = 7) -> str:
+    return weekly(days=days)
+
+
+def handle_pnl(symbol: Optional[str] = None) -> str:
+    return pnl(symbol=symbol)
+
+
+def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
+    return tx(symbol=symbol, day=day)

@@ -217,7 +217,7 @@ def start_services() -> None:
     threading.Thread(target=_scheduler_loop, name="scheduler", daemon=True).start()
 
     if os.getenv("START_SCHEDULER") == "1":
-        eod_time = os.getenv("EOD_TIME") or f"{EOD_HOUR:02d}:{EOD_MINUTE:02d}"
+        eod_time = os.getenv("EOD_TIME", "23:59")
         try:
             report_scheduler.schedule_daily_report(eod_time)
             if not _SCHEDULER_THREAD or not _SCHEDULER_THREAD.is_alive():
