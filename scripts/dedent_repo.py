@@ -52,14 +52,22 @@ def process(path: pathlib.Path, write: bool = False):
         print(f"[WOULD_FIX] {path}")
     return True
 
-def main():
-    write = "--write" in sys.argv
+def main(argv: list[str] | None = None) -> int:
+    args = argv or sys.argv[1:]
+    write = "--write" in (args or [])
     changed = 0
     for p in iter_py_files():
         if process(p, write=write):
             changed += 1
-    print(f"\nSummary: {'fixed' if write else 'would fix'} {changed} file(s).")
+    status = "fixed" if write else "would fix"
+    print(f"\nSummary: {status} {changed} file(s).")
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Dedent repo")
+    ap.add_argument("--write", action="store_true", help="Apply changes")
+    parsed = ap.parse_args()
+    cli_args = ["--write"] if parsed.write else []
+    raise SystemExit(main(cli_args))

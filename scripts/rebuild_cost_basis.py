@@ -30,7 +30,7 @@ def _fmt_dec(v: Decimal) -> str:
     return f"{v:.6f}"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     # 1) Bulk rebuild (writes annotated entries per day + cost_basis.json)
     try:
         update_cost_basis()  # public bulk path; no args
@@ -72,9 +72,10 @@ def main() -> int:
     return 0
 
 
-def cli() -> None:
-    raise SystemExit(main())
-
 
 if __name__ == "__main__":
-    pass
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Rebuild FIFO cost basis")
+    _ = ap.parse_args()
+    raise SystemExit(main())

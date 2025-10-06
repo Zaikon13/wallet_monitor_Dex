@@ -3,32 +3,40 @@ from __future__ import annotations
 import math
 import re
 from decimal import Decimal
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List
+
+__all__ = [
+    "escape_md",
+    "escape_md_v2",
+    "chunk",
+    "format_holdings",
+    "format_per_asset_totals",
+]
 
 
 # --- Markdown escaping helpers ---
 def escape_md(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r"([_*`\[\]()~>#+\-=|{}.!])", r"\\\\\1", str(text))
+    return re.sub(r"([_*`\\[\\]()~>#+\-=|{}.!])", r"\\\\\\1", str(text))
 
 
 def escape_md_v2(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\\\1", str(text))
+    return re.sub(r"([_*\\[\\]()~`>#+\-=|{}.!])", r"\\\\\\1", str(text))
 
 
 def chunk(text: str, size: int = 3800) -> Iterable[str]:
     if not text:
         return []
-    total = max(1, math.ceil(len(text) / size))
-    for idx in range(total):
-        yield text[idx * size : (idx + 1) * size]
+    safe_size = max(1, int(size))
+    total = max(1, math.ceil(len(text) / safe_size))
+    return [text[idx * safe_size : (idx + 1) * safe_size] for idx in range(total)]
 
 
 # --- Helpers ---
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     try:
         return Decimal(str(value))
     except Exception:
@@ -39,7 +47,7 @@ def format_holdings(snapshot: Dict[str, Dict[str, object]]) -> str:
     if not snapshot:
         return "Holdings snapshot is empty."
 
-    lines = ["Holdings snapshot:"]
+    lines: List[str] = ["Holdings snapshot:"]
     total_usd = Decimal("0")
     for symbol, data in sorted(snapshot.items()):
         qty = _dec(data.get("amount", data.get("qty", 0)))
@@ -55,7 +63,7 @@ def format_holdings(snapshot: Dict[str, Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def format_per_asset_totals(period: str, rows: list[dict]) -> str:
+def format_per_asset_totals(period: str, rows: List[dict]) -> str:
     title = f"Totals per Asset — {str(period).title()}"
     lines = [title]
     for row in rows or []:

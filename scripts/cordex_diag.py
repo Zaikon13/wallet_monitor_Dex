@@ -229,7 +229,7 @@ def check_runtime_env() -> None:
     _set("runtime.env", True, info=runtime)
 
 
-def main(argv: List[str]) -> int:
+def main(argv: List[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     check_runtime_env()
@@ -250,9 +250,10 @@ def main(argv: List[str]) -> int:
     return 0 if RESULT["ok"] else 1
 
 
-def cli() -> None:
-    raise SystemExit(main(sys.argv[1:]))
-
 
 if __name__ == "__main__":
-    pass
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Cordex diagnostics")
+    _ = ap.parse_args()
+    raise SystemExit(main())
