@@ -145,51 +145,55 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
 
 
 def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
-    """Return a sanitized snapshot dict suitable for formatting."""
+    """Return a sanitized snapshot dict suitable for formatting.
+    Guarantees a CRO entry seeded from RPC, then merges with discovered data.
+    """
     address = (os.getenv("WALLET_ADDRESS") or "").strip()
-    cro_balance: Optional[Decimal] = None
+
+    # 1) Seed CRO via RPC (never raise)
+    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
     if address:
         try:
-            cro_balance = Decimal(str(get_native_balance(address)))
+            balance_cro = Decimal(str(get_native_balance(address)))
         except Exception:
-            cro_balance = None
+            balance_cro = Decimal("0")
+        try:
+            px = get_price_usd("CRO")
+        except Exception:
+            px = None
+        try:
+            usd = (balance_cro * px).quantize(Decimal("0.0001")) if px is not None else None
+        except Exception:
+            usd = None
+        cro_entry = {
+            "qty": str(balance_cro.normalize()),
+            "price_usd": (str(px) if px is not None else None),
+            "usd": (str(usd) if usd is not None else None),
+        }
 
+    # 2) Build raw snapshot (may include CRO/tokens); never raise
     try:
         raw = get_wallet_snapshot(address=address or None)
     except Exception:
         raw = {}
 
+    # 3) Sanitize & merge CRO (RPC first, then enrich with any discovered fields)
     sanitized = _sanitize_snapshot(raw)
+    existing_cro = sanitized.get("CRO", {})
+    merged_cro = dict(existing_cro)
+    # values from RPC take precedence; keep existing if RPC is None
+    for k, v in cro_entry.items():
+        if v is not None:
+            merged_cro[k] = v
+    merged_cro["qty"] = cro_entry.get("qty", merged_cro.get("qty", "0"))
+    merged_cro.setdefault("symbol", "CRO")
+    sanitized["CRO"] = merged_cro
 
-    # Always seed CRO entry from RPC balance data.
-    cro_entry = dict(sanitized.get("CRO") or {})
-    cro_entry["symbol"] = "CRO"
-
-    existing_qty = _to_decimal(cro_entry.get("qty") or cro_entry.get("amount"))
-    cro_qty = cro_balance if cro_balance is not None else existing_qty
-    if cro_qty is None:
-        cro_qty = Decimal("0")
-
-    existing_price = _to_decimal(cro_entry.get("price_usd") or cro_entry.get("price"))
-    cro_price = existing_price or get_price_usd("CRO")
-
-    existing_usd = _to_decimal(cro_entry.get("usd") or cro_entry.get("value_usd"))
-    cro_usd = existing_usd
-    if cro_price is not None and cro_qty is not None:
-        try:
-            cro_usd = (cro_qty * cro_price).quantize(Decimal("0.0001"))
-        except Exception:
-            pass
-
-    cro_entry["qty"] = str(cro_qty.normalize())
-    cro_entry["price_usd"] = str(cro_price) if cro_price is not None else None
-    cro_entry["usd"] = str(cro_usd) if cro_usd is not None else None
-
-    sanitized["CRO"] = cro_entry
-
+    # 4) Normalize tCRO symbol if discovered as 'TCRO'
     if "TCRO" in sanitized and "tCRO" not in sanitized:
         sanitized["tCRO"] = sanitized.pop("TCRO")
 
+    # 5) Always guarantee a CRO row
     if "CRO" not in sanitized:
         sanitized["CRO"] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
 
