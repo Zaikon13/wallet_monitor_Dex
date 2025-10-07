@@ -175,7 +175,7 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     except Exception:
         raw = {}
 
-    # Sanitize & merge CRO (RPC first, then enrich with any discovered fields)
+    # Sanitize & merge CRO (RPC first, then enrich with discovered fields)
     sanitized = _sanitize_snapshot(raw)
     existing_cro = sanitized.get("CRO", {})
     merged_cro = dict(existing_cro)
