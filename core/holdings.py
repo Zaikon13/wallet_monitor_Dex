@@ -42,7 +42,7 @@ def _normalize_symbol(symbol: str) -> str:
     raw = (symbol or "").strip()
     if not raw:
         return "?"
-    return raw.upper()  # no tCRO special-case
+    return raw.upper()  # normalized; no tCRO special casing
 
 
 def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -145,7 +145,6 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
 def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     """Return a sanitized snapshot dict suitable for formatting.
     Guarantees a CRO entry seeded from RPC, then merges with discovered data.
-    No tCRO normalization.
     """
     address = (os.getenv("WALLET_ADDRESS") or "").strip()
 
