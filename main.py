@@ -1457,24 +1457,34 @@ def run_forever() -> None:
         time.sleep(1)
 
 
-def main() -> None:
-    init_app()
-    start_services()
-    run_forever()
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point that wires up signals and long-running services."""
+    _ = argv  # CLI arguments are not currently used
 
-
-if __name__ == "__main__":
     signal.signal(signal.SIGINT, _graceful_exit)
     signal.signal(signal.SIGTERM, _graceful_exit)
+
     try:
         init_app()
         start_services()
         logging.getLogger(__name__).info("✅ Cronos DeFi Sentinel started and is online.")
         run_forever()
+    except KeyboardInterrupt:
+        if not shutdown_event.is_set():
+            shutdown_event.set()
+        log.info("Received interrupt, shutting down.")
     except Exception as exc:
         log.exception("fatal: %s", exc)
         try:
             send_telegram(f"💥 Fatal error: {exc}")
         except Exception:
             log.debug("Failed to send fatal telegram", exc_info=True)
-        sys.exit(1)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(main())
