@@ -12,6 +12,7 @@ from core.providers.etherscan_like import (
     token_balance,
 )
 from core.pricing import get_price_usd
+from core.rpc import get_native_balance
 
 
 def _map_from_env(key: str) -> Dict[str, str]:
@@ -58,23 +59,53 @@ def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, An
 
 def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optional[str]]]:
     """Build a snapshot of wallet holdings (CRO native + configured ERC-20 tokens)."""
-    address = address or os.getenv("WALLET_ADDRESS", "")
+    address = (address or os.getenv("WALLET_ADDRESS") or "").strip()
     if not address:
         return {}
 
     snap: Dict[str, Dict[str, Optional[str]]] = {}
 
+    # Seed CRO balance via RPC before touching ERC-20 discovery so it's always present.
+    cro_qty = Decimal("0")
+    try:
+        cro_qty = Decimal(str(get_native_balance(address)))
+    except Exception:
+        cro_qty = Decimal("0")
+
+    cro_price = get_price_usd("CRO")
+    cro_usd: Optional[Decimal] = None
+    if cro_price is not None:
+        try:
+            cro_usd = (cro_qty * cro_price).quantize(Decimal("0.0001"))
+        except Exception:
+            cro_usd = None
+
+    snap["CRO"] = {
+        "qty": str(cro_qty.normalize()),
+        "price_usd": (str(cro_price) if cro_price is not None else None),
+        "usd": (str(cro_usd) if cro_usd is not None else None),
+    }
+
+    # Retain legacy fallback in case RPC fails silently.
     try:
         bal = account_balance(address).get("result")
         if bal is not None:
-            cro = Decimal(str(bal)) / (Decimal(10) ** 18)
-            px = get_price_usd("CRO")
-            usd = (cro * px).quantize(Decimal("0.0001")) if px is not None else None
-            snap["CRO"] = {
-                "qty": str(cro.normalize()),
-                "price_usd": (str(px) if px is not None else None),
-                "usd": (str(usd) if usd is not None else None),
-            }
+            cro_etherscan = Decimal(str(bal)) / (Decimal(10) ** 18)
+            if cro_etherscan != cro_qty:
+                px = cro_price or get_price_usd("CRO")
+                usd_val: Optional[Decimal] = None
+                if px is not None:
+                    try:
+                        usd_val = (cro_etherscan * px).quantize(Decimal("0.0001"))
+                    except Exception:
+                        usd_val = None
+                snap["CRO"].update(
+                    {
+                        "qty": str(cro_etherscan.normalize()),
+                        "price_usd": (str(px) if px is not None else snap["CRO"].get("price_usd")),
+                        "usd": (str(usd_val) if usd_val is not None else snap["CRO"].get("usd")),
+                    }
+                )
     except Exception:
         pass
 
@@ -119,7 +150,13 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
         raw = get_wallet_snapshot()
     except Exception:
         raw = {}
+
     sanitized = _sanitize_snapshot(raw)
+
+    # Ensure CRO entry always exists even if upstream sanitization removed it.
+    if "CRO" not in sanitized:
+        sanitized["CRO"] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
+
     if "TCRO" in sanitized and "tCRO" not in sanitized:
         sanitized["tCRO"] = sanitized.pop("TCRO")
     return sanitized
