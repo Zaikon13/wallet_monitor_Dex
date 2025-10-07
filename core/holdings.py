@@ -257,12 +257,15 @@ def _delta_value(info: Dict[str, Any]) -> Optional[Decimal]:
 
 
 def _ordered_symbols(snapshot: Dict[str, Dict[str, Any]]) -> Iterable[str]:
+    if not snapshot:
+        return []
+
     keys = list(snapshot.keys())
     ordered: list[str] = []
-    for special in ("CRO", "tCRO"):
-        if special in keys:
-            ordered.append(special)
-            keys.remove(special)
+
+    if "CRO" in keys:
+        ordered.append("CRO")
+        keys.remove("CRO")
 
     keys.sort(
         key=lambda sym: (
@@ -271,6 +274,7 @@ def _ordered_symbols(snapshot: Dict[str, Dict[str, Any]]) -> Iterable[str]:
         ),
         reverse=True,
     )
+
     ordered.extend(keys)
     return ordered
 
