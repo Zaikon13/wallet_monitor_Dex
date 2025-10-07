@@ -12,11 +12,12 @@ from core.providers.etherscan_like import (
     token_balance,
 )
 from core.pricing import get_price_usd
+    # NOTE: get_native_balance must NOT be called at import time; only inside functions
 from core.rpc import get_native_balance
 
 
 def _map_from_env(key: str) -> Dict[str, str]:
-    """Parse an env var like "SYMA=0x1234,SYMB=0xabcd" into a dict."""
+    """Parse an env var like 'SYMA=0x1234,SYMB=0xabcd' into a dict."""
     s = os.getenv(key, "").strip()
     if not s:
         return {}
@@ -84,7 +85,7 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
         "usd": (str(cro_usd) if cro_usd is not None else None),
     }
 
-    # Retain legacy fallback in case RPC fails silently.
+    # Legacy fallback using etherscan-like API in case RPC silently fails.
     try:
         bal = account_balance(address).get("result")
         if bal is not None:
@@ -149,7 +150,7 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     address = (os.getenv("WALLET_ADDRESS") or "").strip()
 
     # Seed CRO via RPC (never raise)
-    cro_entry: Dict[str, Any] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
+    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
     if address:
         try:
             balance_cro = Decimal(str(get_native_balance(address)))
@@ -164,7 +165,6 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
         except Exception:
             usd = None
         cro_entry = {
-            "symbol": "CRO",
             "qty": str(balance_cro.normalize()),
             "price_usd": (str(px) if px is not None else None),
             "usd": (str(usd) if usd is not None else None),
