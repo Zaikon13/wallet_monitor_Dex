@@ -15,7 +15,7 @@ from core.pricing import get_price_usd
 from core.rpc import get_native_balance
 
 def _env_addr() -> str:
-    """Return the first non-empty wallet address env var."""
+    """Return wallet address from env (supports WALLET_ADDRESS & WALLETADDRESS)."""
     for key in ("WALLET_ADDRESS", "WALLETADDRESS"):
         value = os.getenv(key, "").strip()
         if value:
