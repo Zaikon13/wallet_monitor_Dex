@@ -15,6 +15,11 @@ from reports.aggregates import aggregate_per_asset, totals as totals_aggregated
 from reports.day_report import build_day_report_text
 from reports.ledger import iter_all_entries, read_ledger
 from reports.weekly import build_weekly_report_text
+from core.holdings_adapters import build_holdings_snapshot
+try:
+    from telegram.formatters import format_holdings as _format_holdings  # preferred
+except Exception:
+    _format_holdings = None
 
 
 # ---------- helpers ----------
@@ -95,17 +100,38 @@ def _ordered_assets(snapshot: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Deci
 
 
 def holdings(limit: int = 20) -> str:
+    """
+    Returns a text summary of current holdings using live adapters.
+    Keeps CRO distinct from tCRO and computes merged unrealized PnL.
+    """
     try:
-        snapshot = holdings_snapshot()
-    except Exception:
-        snapshot = {}
-    if not snapshot:
-        return "No holdings data."
-
-    ordered = _ordered_assets(snapshot)
-    limited_symbols = [symbol for symbol, _ in ordered[:limit]]
-    filtered_snapshot = {symbol: snapshot.get(symbol, {}) for symbol in limited_symbols}
-    return holdings_text(filtered_snapshot)
+        snap = build_holdings_snapshot(base_ccy="USD")
+    except Exception as e:
+        return f"⚠️ Failed to build holdings snapshot: {e}"
+    # Prefer repo formatter if available
+    if _format_holdings:
+        try:
+            return _format_holdings(snap, limit=limit)
+        except Exception:
+            pass
+    # Fallback minimal text formatter
+    totals = snap.get("totals", {})
+    assets = snap.get("assets", [])[: max(1, limit)]
+    lines = []
+    lines.append("📊 Holdings")
+    for a in assets:
+        lines.append(
+            f"{a.get('symbol','?')}: amt={a.get('amount','0')}  "
+            f"px=${a.get('price_usd','0')}  "
+            f"val=${a.get('value_usd','0')}  "
+            f"Δ=${a.get('u_pnl_usd','0')} ({a.get('u_pnl_pct','0')}%)"
+        )
+    lines.append(
+        f"— Totals: val=${totals.get('value_usd','0')}  "
+        f"cost=${totals.get('cost_usd','0')}  "
+        f"Δ=${totals.get('u_pnl_usd','0')} ({totals.get('u_pnl_pct','0')}%)"
+    )
+    return "\n".join(lines)
 
 
 def totals() -> str:
@@ -199,47 +225,76 @@ def pnl(symbol: Optional[str] = None) -> str:
         if not entries:
             return f"No ledger entries for {symbol}."
 
-        buys = [e for e in entries if str(e.get("side")).upper() == "IN"]
-        sells = [e for e in entries if str(e.get("side")).upper() == "OUT"]
-        realized = sum(_to_decimal(e.get("realized_usd")) for e in entries)
-        qty_net = sum(
-            _to_decimal(e.get("qty"))
-            * (1 if str(e.get("side")).upper() == "IN" else -1)
-            for e in entries
+        summary: Dict[str, Decimal] = {
+            "in": Decimal("0"),
+            "out": Decimal("0"),
+            "net": Decimal("0"),
+            "realized": Decimal("0"),
+        }
+        for entry in entries:
+            summary["in"] += _to_decimal(entry.get("in_usd"))
+            summary["out"] += _to_decimal(entry.get("out_usd"))
+            summary["net"] += _to_decimal(entry.get("net_usd"))
+            summary["realized"] += _to_decimal(entry.get("realized_usd"))
+
+        return (
+            f"PnL {symbol} — IN {_fmt_money(summary['in'])} / OUT {_fmt_money(summary['out'])}"
+            f" / NET {_fmt_money(summary['net'])} / Realized {_fmt_money(summary['realized'])}"
         )
-        spent = sum(_to_decimal(e.get("usd")) for e in buys)
-        received = sum(_to_decimal(e.get("usd")) for e in sells)
 
-        lines = [f"PnL for {symbol}:"]
-        lines.append(f" - Buys: {len(buys)} totaling {_fmt_money(spent)}")
-        lines.append(f" - Sells: {len(sells)} totaling {_fmt_money(received)}")
-        lines.append(f" - Net qty: {_fmt_qty(qty_net)}")
-        lines.append(f" - Realized PnL: {_fmt_money(realized)}")
-        return "\n".join(lines)
-
-    rows = aggregate_per_asset(iter_all_entries())
-    if not rows:
-        return "Ledger is empty."
-    rows.sort(key=lambda row: abs(_to_decimal(row.get("realized_usd"))), reverse=True)
-    top = rows[:5]
-
-    lines = ["Top movers by realized PnL:"]
-    for row in top:
-        realized = _to_decimal(row.get("realized_usd"))
-        direction = "+" if realized >= 0 else ""
-        lines.append(
-            f" - {row.get('asset', '?')}: {direction}{_fmt_money(realized)} "
-            f"(net {_fmt_money(_to_decimal(row.get('net_usd')))} )"
-        )
-    return "\n".join(lines)
-
-
-def tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
-    target_day = day or ymd()
+    # If no symbol provided, default to totals over all assets
     try:
-        entries = read_ledger(target_day) or []
+        ledger = read_ledger()
+    except Exception:
+        return "PnL unavailable."
+
+    totals: Dict[str, Decimal] = {
+        "in": Decimal("0"),
+        "out": Decimal("0"),
+        "net": Decimal("0"),
+        "realized": Decimal("0"),
+    }
+    for entry in ledger:
+        totals["in"] += _to_decimal(entry.get("in_usd"))
+        totals["out"] += _to_decimal(entry.get("out_usd"))
+        totals["net"] += _to_decimal(entry.get("net_usd"))
+        totals["realized"] += _to_decimal(entry.get("realized_usd"))
+
+    return (
+        "PnL — IN {in_usd} / OUT {out_usd} / NET {net_usd} / Realized {realized}".format(
+            in_usd=_fmt_money(totals["in"]),
+            out_usd=_fmt_money(totals["out"]),
+            net_usd=_fmt_money(totals["net"]),
+            realized=_fmt_money(totals["realized"]),
+        )
+    )
+
+
+def daily_report_for_date(target_date: Optional[str] = None) -> str:
+    if not target_date:
+        target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        return build_day_report_text(target_date=target_date)
+    except Exception:
+        return f"Daily report unavailable for {target_date}."
+
+
+def weekly_report_for_date(target_date: Optional[str] = None, days: int = 7) -> str:
+    if not target_date:
+        target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        return build_weekly_report_text(target_date=target_date, days=days)
+    except Exception:
+        return f"Weekly report unavailable for {target_date}."
+
+
+def ledger_entries(symbol: Optional[str] = None, limit: int = 10) -> str:
+    try:
+        entries = list(iter_all_entries())
     except Exception:
         entries = []
+    if not entries:
+        return "No ledger entries available."
 
     if symbol:
         symbol = symbol.upper()
@@ -248,74 +303,19 @@ def tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
             for entry in entries
             if str(entry.get("asset") or "").upper() == symbol
         ]
+        if not entries:
+            return f"No ledger entries for {symbol}."
 
-    if not entries:
-        target = f" for {symbol}" if symbol else ""
-        return f"No transactions on {target_day}{target}."
-
-    limit = 20
-    lines: List[str] = [f"Transactions on {target_day}{(' for ' + symbol) if symbol else ''}:"]
-    for entry in entries[:limit]:
-        ts = entry.get("time")
-        if ts:
-            try:
-                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-                ts_text = dt.strftime("%H:%M:%S")
-            except Exception:
-                ts_text = str(ts)
-        else:
-            ts_text = "--"
-
+    entries = entries[:limit]
+    lines = [f"Last {len(entries)} ledger entries:"]
+    for entry in entries:
+        date = entry.get("date") or ymd(entry.get("timestamp"))
+        asset = entry.get("asset", "?")
+        in_usd = _fmt_money(_to_decimal(entry.get("in_usd")))
+        out_usd = _fmt_money(_to_decimal(entry.get("out_usd")))
+        net_usd = _fmt_money(_to_decimal(entry.get("net_usd")))
+        realized_usd = _fmt_money(_to_decimal(entry.get("realized_usd")))
         lines.append(
-            " - {ts} {side} {asset} {qty} @ ${usd}".format(
-                ts=ts_text,
-                side=str(entry.get("side") or "?").upper(),
-                asset=str(entry.get("asset") or "?").upper(),
-                qty=_fmt_qty(_to_decimal(entry.get("qty"))),
-                usd=_fmt_money(_to_decimal(entry.get("usd"))),
-            )
+            f" - {date} {asset}: IN {in_usd} / OUT {out_usd} / NET {net_usd} / Realized {realized_usd}"
         )
-
-    if len(entries) > limit:
-        lines.append(f"{len(entries) - limit} more ...")
-
     return "\n".join(lines)
-
-
-# ---------- compatibility wrappers ----------
-
-
-def handle_holdings(limit: int = 20) -> str:
-    return holdings(limit=limit)
-
-
-def handle_totals() -> str:
-    return totals()
-
-
-def handle_daily() -> str:
-    return daily()
-
-
-def handle_show(limit: int = 5) -> str:
-    return show(limit=limit)
-
-
-def handle_status() -> str:
-    return status()
-
-
-def handle_diag() -> str:
-    return diag()
-
-
-def handle_weekly(days: int = 7) -> str:
-    return weekly(days=days)
-
-
-def handle_pnl(symbol: Optional[str] = None) -> str:
-    return pnl(symbol=symbol)
-
-
-def handle_tx(symbol: Optional[str] = None, day: Optional[str] = None) -> str:
-    return tx(symbol=symbol, day=day)
