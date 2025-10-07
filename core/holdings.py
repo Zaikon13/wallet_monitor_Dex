@@ -146,19 +146,53 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
 
 def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     """Return a sanitized snapshot dict suitable for formatting."""
+    address = (os.getenv("WALLET_ADDRESS") or "").strip()
+    cro_balance: Optional[Decimal] = None
+    if address:
+        try:
+            cro_balance = Decimal(str(get_native_balance(address)))
+        except Exception:
+            cro_balance = None
+
     try:
-        raw = get_wallet_snapshot()
+        raw = get_wallet_snapshot(address=address or None)
     except Exception:
         raw = {}
 
     sanitized = _sanitize_snapshot(raw)
 
-    # Ensure CRO entry always exists even if upstream sanitization removed it.
-    if "CRO" not in sanitized:
-        sanitized["CRO"] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
+    # Always seed CRO entry from RPC balance data.
+    cro_entry = dict(sanitized.get("CRO") or {})
+    cro_entry["symbol"] = "CRO"
+
+    existing_qty = _to_decimal(cro_entry.get("qty") or cro_entry.get("amount"))
+    cro_qty = cro_balance if cro_balance is not None else existing_qty
+    if cro_qty is None:
+        cro_qty = Decimal("0")
+
+    existing_price = _to_decimal(cro_entry.get("price_usd") or cro_entry.get("price"))
+    cro_price = existing_price or get_price_usd("CRO")
+
+    existing_usd = _to_decimal(cro_entry.get("usd") or cro_entry.get("value_usd"))
+    cro_usd = existing_usd
+    if cro_price is not None and cro_qty is not None:
+        try:
+            cro_usd = (cro_qty * cro_price).quantize(Decimal("0.0001"))
+        except Exception:
+            pass
+
+    cro_entry["qty"] = str(cro_qty.normalize())
+    cro_entry["price_usd"] = str(cro_price) if cro_price is not None else None
+    cro_entry["usd"] = str(cro_usd) if cro_usd is not None else None
+
+    sanitized["CRO"] = cro_entry
 
     if "TCRO" in sanitized and "tCRO" not in sanitized:
         sanitized["tCRO"] = sanitized.pop("TCRO")
+
+    if "CRO" not in sanitized:
+        sanitized["CRO"] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
+
     return sanitized
 
 
