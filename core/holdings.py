@@ -12,7 +12,6 @@ from core.providers.etherscan_like import (
     token_balance,
 )
 from core.pricing import get_price_usd
-    # NOTE: get_native_balance must NOT be called at import time; only inside functions
 from core.rpc import get_native_balance
 
 
