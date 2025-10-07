@@ -14,6 +14,14 @@ from core.providers.etherscan_like import (
 from core.pricing import get_price_usd
 from core.rpc import get_native_balance
 
+def _env_addr() -> str:
+    """Return the first non-empty wallet address env var."""
+    for key in ("WALLET_ADDRESS", "WALLETADDRESS"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
+
 
 def _map_from_env(key: str) -> Dict[str, str]:
     """Parse an env var like 'SYMA=0x1234,SYMB=0xabcd' into a dict."""
@@ -57,7 +65,7 @@ def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, An
 
 def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optional[str]]]:
     """Build a snapshot of wallet holdings (CRO native + configured ERC-20 tokens)."""
-    address = (address or os.getenv("WALLET_ADDRESS") or "").strip()
+    address = (address or _env_addr()).strip()
     if not address:
         return {}
 
@@ -146,7 +154,7 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     """Return a sanitized snapshot dict suitable for formatting.
     Guarantees a CRO entry seeded from RPC, then merges with discovered data.
     """
-    address = (os.getenv("WALLET_ADDRESS") or "").strip()
+    address = _env_addr()
 
     # Seed CRO via RPC (never raise)
     cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
