@@ -16,7 +16,7 @@ from core.rpc import get_native_balance
 
 
 def _map_from_env(key: str) -> Dict[str, str]:
-    """Parse an env var like "SYMA=0x1234,SYMB=0xabcd" into a dict."""
+    """Parse an env var like 'SYMA=0x1234,SYMB=0xabcd' into a dict."""
     s = os.getenv(key, "").strip()
     if not s:
         return {}
@@ -40,11 +40,9 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
 
 def _normalize_symbol(symbol: str) -> str:
     raw = (symbol or "").strip()
-    if raw.lower() == "tcro":
-        return "tCRO"
     if not raw:
         return "?"
-    return raw.upper()
+    return raw.upper()  # normalized; no tCRO special casing
 
 
 def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -59,23 +57,53 @@ def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, An
 
 def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optional[str]]]:
     """Build a snapshot of wallet holdings (CRO native + configured ERC-20 tokens)."""
-    address = address or os.getenv("WALLET_ADDRESS", "")
+    address = (address or os.getenv("WALLET_ADDRESS") or "").strip()
     if not address:
         return {}
 
     snap: Dict[str, Dict[str, Optional[str]]] = {}
 
+    # Seed CRO balance via RPC before touching ERC-20 discovery so it's always present.
+    cro_qty = Decimal("0")
+    try:
+        cro_qty = Decimal(str(get_native_balance(address)))
+    except Exception:
+        cro_qty = Decimal("0")
+
+    cro_price = get_price_usd("CRO")
+    cro_usd: Optional[Decimal] = None
+    if cro_price is not None:
+        try:
+            cro_usd = (cro_qty * cro_price).quantize(Decimal("0.0001"))
+        except Exception:
+            cro_usd = None
+
+    snap["CRO"] = {
+        "qty": str(cro_qty.normalize()),
+        "price_usd": (str(cro_price) if cro_price is not None else None),
+        "usd": (str(cro_usd) if cro_usd is not None else None),
+    }
+
+    # Legacy fallback using etherscan-like API in case RPC silently fails.
     try:
         bal = account_balance(address).get("result")
         if bal is not None:
-            cro = Decimal(str(bal)) / (Decimal(10) ** 18)
-            px = get_price_usd("CRO")
-            usd = (cro * px).quantize(Decimal("0.0001")) if px is not None else None
-            snap["CRO"] = {
-                "qty": str(cro.normalize()),
-                "price_usd": (str(px) if px is not None else None),
-                "usd": (str(usd) if usd is not None else None),
-            }
+            cro_etherscan = Decimal(str(bal)) / (Decimal(10) ** 18)
+            if cro_etherscan != cro_qty:
+                px = cro_price or get_price_usd("CRO")
+                usd_val: Optional[Decimal] = None
+                if px is not None:
+                    try:
+                        usd_val = (cro_etherscan * px).quantize(Decimal("0.0001"))
+                    except Exception:
+                        usd_val = None
+                snap["CRO"].update(
+                    {
+                        "qty": str(cro_etherscan.normalize()),
+                        "price_usd": (str(px) if px is not None else snap["CRO"].get("price_usd")),
+                        "usd": (str(usd_val) if usd_val is not None else snap["CRO"].get("usd")),
+                    }
+                )
     except Exception:
         pass
 
@@ -115,37 +143,53 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
 
 
 def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
-    """Return a sanitized snapshot dict suitable for formatting."""
-    wallet_address = (os.getenv("WALLET_ADDRESS") or "").strip()
-    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
-    if wallet_address:
-        try:
-            balance_cro = Decimal(str(get_native_balance(wallet_address)))
-            px = get_price_usd("CRO")
-            usd = (balance_cro * px).quantize(Decimal("0.0001")) if px is not None else None
-            cro_entry = {
-                "qty": str(balance_cro.normalize()),
-                "price_usd": (str(px) if px is not None else None),
-                "usd": (str(usd) if usd is not None else None),
-            }
-        except Exception:
-            cro_entry = {"qty": "0", "price_usd": None, "usd": None}
+    """Return a sanitized snapshot dict suitable for formatting.
+    Guarantees a CRO entry seeded from RPC, then merges with discovered data.
+    """
+    address = (os.getenv("WALLET_ADDRESS") or "").strip()
 
+    # Seed CRO via RPC (never raise)
+    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
+    if address:
+        try:
+            balance_cro = Decimal(str(get_native_balance(address)))
+        except Exception:
+            balance_cro = Decimal("0")
+        try:
+            px = get_price_usd("CRO")
+        except Exception:
+            px = None
+        try:
+            usd = (balance_cro * px).quantize(Decimal("0.0001")) if px is not None else None
+        except Exception:
+            usd = None
+        cro_entry = {
+            "qty": str(balance_cro.normalize()),
+            "price_usd": (str(px) if px is not None else None),
+            "usd": (str(usd) if usd is not None else None),
+        }
+
+    # Build raw snapshot (may include CRO/tokens); never raise
     try:
-        raw = get_wallet_snapshot()
+        raw = get_wallet_snapshot(address=address or None)
     except Exception:
         raw = {}
 
+    # Sanitize & merge CRO (RPC first, then enrich with discovered data)
     sanitized = _sanitize_snapshot(raw)
     existing_cro = sanitized.get("CRO", {})
     merged_cro = dict(existing_cro)
-    merged_cro.update({k: v for k, v in cro_entry.items() if v is not None})
+    for k, v in cro_entry.items():
+        if v is not None:
+            merged_cro[k] = v
     merged_cro["qty"] = cro_entry.get("qty", merged_cro.get("qty", "0"))
     merged_cro.setdefault("symbol", "CRO")
     sanitized["CRO"] = merged_cro
 
-    if "TCRO" in sanitized and "tCRO" not in sanitized:
-        sanitized["tCRO"] = sanitized.pop("TCRO")
+    # Always guarantee a CRO row
+    if "CRO" not in sanitized:
+        sanitized["CRO"] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
+
     return sanitized
 
 
@@ -210,12 +254,15 @@ def _delta_value(info: Dict[str, Any]) -> Optional[Decimal]:
 
 
 def _ordered_symbols(snapshot: Dict[str, Dict[str, Any]]) -> Iterable[str]:
+    if not snapshot:
+        return []
+
     keys = list(snapshot.keys())
     ordered: list[str] = []
-    for special in ("CRO", "tCRO"):
-        if special in keys:
-            ordered.append(special)
-            keys.remove(special)
+
+    if "CRO" in keys:
+        ordered.append("CRO")
+        keys.remove("CRO")
 
     keys.sort(
         key=lambda sym: (
@@ -224,6 +271,7 @@ def _ordered_symbols(snapshot: Dict[str, Dict[str, Any]]) -> Iterable[str]:
         ),
         reverse=True,
     )
+
     ordered.extend(keys)
     return ordered
 
