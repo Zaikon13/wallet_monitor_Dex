@@ -149,7 +149,7 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     address = (os.getenv("WALLET_ADDRESS") or "").strip()
 
     # Seed CRO via RPC (never raise)
-    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
+    cro_entry: Dict[str, Any] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
     if address:
         try:
             balance_cro = Decimal(str(get_native_balance(address)))
@@ -164,6 +164,7 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
         except Exception:
             usd = None
         cro_entry = {
+            "symbol": "CRO",
             "qty": str(balance_cro.normalize()),
             "price_usd": (str(px) if px is not None else None),
             "usd": (str(usd) if usd is not None else None),
