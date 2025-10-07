@@ -1,38 +1,45 @@
 from __future__ import annotations
 
-"""Wallet holdings snapshot helpers.
+"""Wallet holdings snapshot helpers with stable schema outputs.
 
-This module builds sanitized wallet snapshots that always include CRO seeded
-from the RPC balance. Environment fallbacks are used throughout to keep the
-module side-effect free under missing configuration.
+This module centralizes wallet snapshot building with a deterministic schema
+that downstream formatters and reports can rely upon. Key properties:
+
+* Native CRO is kept separate from tokenized CRO (tCRO) by grouping holdings
+  on ``(symbol, address, is_native)`` and normalizing non-native CRO symbols to
+  ``tCRO`` when necessary.
+* Rows carry ``value_usd`` and optional ``cost_usd`` fields; ``unrealized_usd``
+  is derived as ``value_usd - cost_usd`` whenever both inputs are available.
+* Snapshot rows expose stable keys (``qty``, ``amount``, ``price_usd``,
+  ``value_usd``, ``cost_usd``, ``unrealized_usd``) so Telegram/report
+  formatters no longer need to guard for schema drift.
+* Ordering places CRO first followed by remaining assets sorted by descending
+  USD value to match UI expectations.
 """
 
 import os
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, Mapping, Optional
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from core.providers.etherscan_like import (
-    account_balance,
-    account_tokentx,
-    token_balance,
-)
 from core.pricing import get_price_usd
+from core.providers.etherscan_like import account_balance, account_tokentx, token_balance
 from core.rpc import get_native_balance
 
 __all__ = [
-    "_env_addr",
     "get_wallet_snapshot",
     "holdings_snapshot",
     "holdings_text",
 ]
 
 _DECIMAL_ZERO = Decimal("0")
-_USD_QUANTIZE = Decimal("0.0001")
+_PRICE_QUANT = Decimal("0.00000001")
+_USD_QUANT = Decimal("0.0001")
+_AMOUNT_QUANT = Decimal("0.000000000000000001")
 
 
 def _env_addr(env: Mapping[str, str] | None = None) -> str:
-    """Return the first non-empty wallet address from the environment."""
-
     env = env or os.environ
     for key in ("WALLET_ADDRESS", "WALLETADDRESS"):
         value = (env.get(key) or "").strip()
@@ -42,18 +49,15 @@ def _env_addr(env: Mapping[str, str] | None = None) -> str:
 
 
 def _map_from_env(key: str, env: Mapping[str, str] | None = None) -> Dict[str, str]:
-    """Parse an env var like ``SYMA=0x1234,SYMB=0xabcd`` into a dict."""
-
     raw = (env or os.environ).get(key, "").strip()
     if not raw:
         return {}
-
     out: Dict[str, str] = {}
     for part in raw.split(","):
         if not part or "=" not in part:
             continue
         sym, addr = part.split("=", 1)
-        sym = sym.strip().upper()
+        sym = sym.strip()
         addr = addr.strip()
         if sym and addr:
             out[sym] = addr
@@ -63,45 +67,50 @@ def _map_from_env(key: str, env: Mapping[str, str] | None = None) -> Dict[str, s
 def _to_decimal(value: Any) -> Optional[Decimal]:
     if isinstance(value, Decimal):
         return value
+    if value is None:
+        return None
     try:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
 
 
-def _decimal_to_str(value: Decimal) -> str:
-    if value == 0:
-        return "0"
-    text = format(value.normalize(), "f")
+def _decimal_or_zero(value: Any) -> Decimal:
+    dec = _to_decimal(value)
+    return dec if dec is not None else _DECIMAL_ZERO
+
+
+def _decimal_to_str(value: Optional[Decimal]) -> Optional[str]:
+    if value is None:
+        return None
+    quantized = value.normalize()
+    text = format(quantized, "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 
-def _normalize_symbol(symbol: str) -> str:
+def _canonical_symbol(symbol: str, is_native: bool) -> str:
     raw = (symbol or "").strip()
     if not raw:
         return "?"
+    lowered = raw.lower()
+    if is_native:
+        return raw.upper()
+    if lowered in ("tcro", "t.cro"):
+        return "tCRO"
+    if lowered == "cro":
+        return "tCRO"
+    if lowered == "wcro":
+        return "WCRO"
     return raw.upper()
 
 
-def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    sanitized: Dict[str, Dict[str, Any]] = {}
-    for symbol, data in (raw or {}).items():
-        key = _normalize_symbol(symbol)
-        payload = dict(data or {})
-        payload.setdefault("symbol", key)
-        sanitized[key] = payload
-    return sanitized
-
-
-def _safe_mul(a: Optional[Decimal], b: Optional[Decimal]) -> Optional[Decimal]:
-    if a is None or b is None:
-        return None
+def _safe_int(value: Any, default: int = 18) -> int:
     try:
-        return (a * b).quantize(_USD_QUANTIZE)
-    except Exception:
-        return None
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_price(symbol: str) -> Optional[Decimal]:
@@ -109,7 +118,8 @@ def _safe_price(symbol: str) -> Optional[Decimal]:
         price = get_price_usd(symbol)
     except Exception:
         return None
-    return _to_decimal(price)
+    dec = _to_decimal(price)
+    return dec
 
 
 def _cro_rpc_balance(address: str) -> Decimal:
@@ -117,8 +127,7 @@ def _cro_rpc_balance(address: str) -> Decimal:
         value = get_native_balance(address)
     except Exception:
         return _DECIMAL_ZERO
-    dec = _to_decimal(value)
-    return dec if dec is not None else _DECIMAL_ZERO
+    return _decimal_or_zero(value)
 
 
 def _cro_etherscan_balance(address: str) -> Optional[Decimal]:
@@ -144,125 +153,282 @@ def _token_balance(contract: str, address: str, decimals: int) -> Optional[Decim
     if value is None:
         return None
     try:
-        scale = Decimal(10) ** max(0, int(decimals))
+        scale = Decimal(10) ** max(0, decimals)
         return value / scale
     except Exception:
         return None
 
 
-def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optional[str]]]:
-    """Return a raw snapshot of holdings (includes CRO + configured tokens)."""
+@dataclass
+class HoldingRow:
+    """Internal mutable representation of a single holding row."""
 
-    address = (address or _env_addr()).strip()
-    if not address:
-        return {}
+    symbol: str
+    address: Optional[str]
+    is_native: bool
+    amount: Decimal = field(default_factory=lambda: _DECIMAL_ZERO)
+    price_usd: Optional[Decimal] = None
+    value_usd: Optional[Decimal] = None
+    cost_usd: Optional[Decimal] = None
+    unrealized_usd: Optional[Decimal] = None
+    sources: set[str] = field(default_factory=set)
+    priority: int = 0
 
-    snapshot: Dict[str, Dict[str, Optional[str]]] = {}
+    def __post_init__(self) -> None:
+        self.symbol = _canonical_symbol(self.symbol, self.is_native)
+        addr = (self.address or "").strip().lower()
+        self.address = addr or None
+        self.amount = self._ensure_decimal(self.amount)
+        self.price_usd = self._ensure_optional_decimal(self.price_usd)
+        self.value_usd = self._ensure_optional_decimal(self.value_usd)
+        self.cost_usd = self._ensure_optional_decimal(self.cost_usd)
+        self.unrealized_usd = self._ensure_optional_decimal(self.unrealized_usd)
+        self.sources = set(self.sources or set())
 
-    cro_qty = _cro_rpc_balance(address)
-    cro_price = _safe_price("CRO")
-    cro_usd = _safe_mul(cro_qty, cro_price)
-    snapshot["CRO"] = {
-        "qty": _decimal_to_str(cro_qty),
-        "price_usd": (_decimal_to_str(cro_price) if cro_price is not None else None),
-        "usd": (_decimal_to_str(cro_usd) if cro_usd is not None else None),
-    }
+    @staticmethod
+    def _ensure_decimal(value: Any) -> Decimal:
+        dec = _to_decimal(value)
+        if dec is None:
+            return _DECIMAL_ZERO
+        return dec
 
-    etherscan_qty = _cro_etherscan_balance(address)
-    if etherscan_qty is not None:
-        etherscan_price = cro_price or _safe_price("CRO")
-        etherscan_usd = _safe_mul(etherscan_qty, etherscan_price)
-        snapshot["CRO"].update(
-            {
-                "qty": _decimal_to_str(etherscan_qty),
-                "price_usd": (
-                    _decimal_to_str(etherscan_price)
-                    if etherscan_price is not None
-                    else snapshot["CRO"].get("price_usd")
-                ),
-                "usd": (
-                    _decimal_to_str(etherscan_usd)
-                    if etherscan_usd is not None
-                    else snapshot["CRO"].get("usd")
-                ),
-            }
-        )
+    @staticmethod
+    def _ensure_optional_decimal(value: Any) -> Optional[Decimal]:
+        dec = _to_decimal(value)
+        return dec
 
-    addr_map = _map_from_env("TOKENS_ADDRS")
-    dec_map = _map_from_env("TOKENS_DECIMALS")
-    for symbol, contract in addr_map.items():
-        decimals = int(dec_map.get(symbol, "18") or 18)
-        qty = _token_balance(contract, address, decimals)
-        if qty is None:
-            snapshot.setdefault(symbol, {"qty": "0", "price_usd": None, "usd": None})
-            continue
+    @property
+    def key(self) -> Tuple[str, Optional[str], bool]:
+        return (self.symbol, self.address, self.is_native)
 
-        price = _safe_price(symbol)
-        usd = _safe_mul(qty, price)
-        snapshot[symbol] = {
-            "qty": _decimal_to_str(qty),
-            "price_usd": (_decimal_to_str(price) if price is not None else None),
-            "usd": (_decimal_to_str(usd) if usd is not None else None),
+    def merge(self, other: "HoldingRow") -> None:
+        if self.key != other.key:
+            raise ValueError("Cannot merge holdings with different identities")
+        self.sources.update(other.sources)
+        if other.priority > self.priority:
+            self.amount = other.amount
+            self.priority = other.priority
+        elif other.priority == self.priority:
+            self.amount += other.amount
+        if other.price_usd is not None:
+            self.price_usd = other.price_usd
+        if other.cost_usd is not None:
+            base = self.cost_usd or _DECIMAL_ZERO
+            self.cost_usd = base + other.cost_usd
+        if other.value_usd is not None:
+            self.value_usd = other.value_usd
+        if other.unrealized_usd is not None:
+            self.unrealized_usd = other.unrealized_usd
+
+    def finalize(self) -> None:
+        self.amount = self.amount.quantize(_AMOUNT_QUANT, rounding=ROUND_HALF_UP)
+        if self.price_usd is not None:
+            self.price_usd = self.price_usd.quantize(_PRICE_QUANT, rounding=ROUND_HALF_UP)
+        if self.value_usd is None and self.price_usd is not None:
+            self.value_usd = (self.amount * self.price_usd).quantize(_USD_QUANT, rounding=ROUND_HALF_UP)
+        elif self.value_usd is not None:
+            self.value_usd = self.value_usd.quantize(_USD_QUANT, rounding=ROUND_HALF_UP)
+        if self.cost_usd is not None:
+            self.cost_usd = self.cost_usd.quantize(_USD_QUANT, rounding=ROUND_HALF_UP)
+        if self.cost_usd is not None and self.value_usd is not None:
+            self.unrealized_usd = (self.value_usd - self.cost_usd).quantize(_USD_QUANT, rounding=ROUND_HALF_UP)
+        elif self.unrealized_usd is not None:
+            self.unrealized_usd = self.unrealized_usd.quantize(_USD_QUANT, rounding=ROUND_HALF_UP)
+
+    def to_snapshot_row(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "address": self.address,
+            "is_native": self.is_native,
+            "qty": _decimal_to_str(self.amount),
+            "amount": _decimal_to_str(self.amount),
+            "price_usd": _decimal_to_str(self.price_usd),
+            "value_usd": _decimal_to_str(self.value_usd),
+            "usd": _decimal_to_str(self.value_usd),
+            "cost_usd": _decimal_to_str(self.cost_usd),
+            "unrealized_usd": _decimal_to_str(self.unrealized_usd),
+            "sources": sorted(self.sources),
         }
 
+
+def _collect_native_rows(address: str) -> List[HoldingRow]:
+    price = _safe_price("CRO")
+    rpc_qty = _cro_rpc_balance(address)
+    rows = [
+        HoldingRow(
+            symbol="CRO",
+            address=address,
+            is_native=True,
+            amount=rpc_qty,
+            price_usd=price,
+            sources={"rpc"},
+            priority=5,
+        )
+    ]
+    etherscan_qty = _cro_etherscan_balance(address)
+    if etherscan_qty is not None:
+        rows.append(
+            HoldingRow(
+                symbol="CRO",
+                address=address,
+                is_native=True,
+                amount=etherscan_qty,
+                price_usd=price,
+                sources={"cronoscan"},
+                priority=10,
+            )
+        )
+    return rows
+
+
+def _collect_token_rows(address: str) -> List[HoldingRow]:
+    addr_map = _map_from_env("TOKENS_ADDRS")
+    dec_map = _map_from_env("TOKENS_DECIMALS")
+    rows: List[HoldingRow] = []
+    for raw_symbol, contract in addr_map.items():
+        decimals = _safe_int(dec_map.get(raw_symbol))
+        qty = _token_balance(contract, address, decimals)
+        amount = qty if qty is not None else _DECIMAL_ZERO
+        price = _safe_price(raw_symbol)
+        rows.append(
+            HoldingRow(
+                symbol=raw_symbol,
+                address=contract,
+                is_native=False,
+                amount=amount,
+                price_usd=price,
+                sources={"erc20"},
+                priority=5,
+            )
+        )
+    return rows
+
+
+def _collect_history_rows(address: str, existing: MutableMapping[Tuple[str, Optional[str], bool], HoldingRow]) -> List[HoldingRow]:
     try:
         token_txs = (account_tokentx(address) or {}).get("result") or []
     except Exception:
         token_txs = []
+    rows: List[HoldingRow] = []
+    for tx in token_txs[-100:]:
+        if not isinstance(tx, dict):
+            continue
+        raw_symbol = tx.get("tokenSymbol") or ""
+        contract = (tx.get("contractAddress") or "").strip().lower() or None
+        row = HoldingRow(
+            symbol=raw_symbol,
+            address=contract,
+            is_native=False,
+            amount=_DECIMAL_ZERO,
+            sources={"history"},
+            priority=-10,
+        )
+        if row.key in existing:
+            continue
+        existing[row.key] = row
+        rows.append(row)
+    return rows
 
-    for tx in token_txs[-50:]:
-        sym = _normalize_symbol(tx.get("tokenSymbol", ""))
-        snapshot.setdefault(sym, {"qty": "?", "price_usd": None, "usd": None})
 
+def _group_rows(rows: Sequence[HoldingRow]) -> List[HoldingRow]:
+    grouped: Dict[Tuple[str, Optional[str], bool], HoldingRow] = {}
+    for row in rows:
+        existing = grouped.get(row.key)
+        if existing is None:
+            grouped[row.key] = row
+            continue
+        existing.merge(row)
+    return list(grouped.values())
+
+
+def _order_rows(rows: Iterable[HoldingRow]) -> List[HoldingRow]:
+    def order_key(row: HoldingRow) -> Tuple[int, Decimal, str, str]:
+        rank = 0 if row.symbol == "CRO" and row.is_native else 1
+        value = row.value_usd if row.value_usd is not None else _DECIMAL_ZERO
+        return (rank, -value, row.symbol, row.address or "")
+
+    finalized: List[HoldingRow] = []
+    for row in rows:
+        row.finalize()
+        finalized.append(row)
+    return sorted(finalized, key=order_key)
+
+
+def _rows_to_snapshot(rows: Iterable[HoldingRow]) -> OrderedDict[str, Dict[str, Any]]:
+    ordered_rows = _order_rows(rows)
+    snapshot: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    counters: Dict[str, int] = {}
+    for row in ordered_rows:
+        base_key = row.symbol
+        index = counters.get(base_key, 0)
+        counters[base_key] = index + 1
+        key = base_key if index == 0 else f"{base_key}#{index + 1}"
+        snapshot[key] = row.to_snapshot_row()
     return snapshot
 
 
-def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
-    """Return a sanitized holdings snapshot with CRO guaranteed via RPC."""
+def _build_rows(address: str) -> List[HoldingRow]:
+    rows: List[HoldingRow] = []
+    rows.extend(_collect_native_rows(address))
+    rows.extend(_collect_token_rows(address))
+    tracker: Dict[Tuple[str, Optional[str], bool], HoldingRow] = {row.key: row for row in rows}
+    rows.extend(_collect_history_rows(address, tracker))
+    return rows
 
+
+def get_wallet_snapshot(address: str | None = None) -> OrderedDict[str, Dict[str, Any]]:
+    address = (address or _env_addr()).strip()
+    if not address:
+        return OrderedDict()
+    rows = _build_rows(address)
+    grouped = _group_rows(rows)
+    return _rows_to_snapshot(grouped)
+
+
+def holdings_snapshot() -> OrderedDict[str, Dict[str, Any]]:
     address = _env_addr()
-
-    cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None, "symbol": "CRO"}
-    if address:
-        qty = _cro_rpc_balance(address)
-        price = _safe_price("CRO")
-        usd = _safe_mul(qty, price)
-        cro_entry.update(
-            {
-                "qty": _decimal_to_str(qty),
-                "price_usd": (_decimal_to_str(price) if price is not None else None),
-                "usd": (_decimal_to_str(usd) if usd is not None else None),
-            }
+    if not address:
+        placeholder = HoldingRow(
+            symbol="CRO",
+            address=None,
+            is_native=True,
+            amount=_DECIMAL_ZERO,
+            price_usd=_safe_price("CRO"),
+            sources={"fallback"},
+            priority=-20,
         )
+        placeholder.finalize()
+        snap = OrderedDict()
+        snap["CRO"] = placeholder.to_snapshot_row()
+        return snap
 
-    try:
-        raw = get_wallet_snapshot(address or None)
-    except Exception:
-        raw = {}
-
-    sanitized = _sanitize_snapshot(raw)
-    merged_cro = sanitized.get("CRO", {}).copy()
-    merged_cro.update({k: v for k, v in cro_entry.items() if v is not None})
-    merged_cro.setdefault("symbol", "CRO")
-    merged_cro.setdefault("qty", cro_entry.get("qty", "0"))
-    merged_cro.setdefault("price_usd", cro_entry.get("price_usd"))
-    merged_cro.setdefault("usd", cro_entry.get("usd"))
-    sanitized["CRO"] = merged_cro
-
-    return sanitized
+    rows = _build_rows(address)
+    grouped = _group_rows(rows)
+    has_cro = any(row.symbol == "CRO" and row.is_native for row in grouped)
+    if not has_cro:
+        grouped.append(
+            HoldingRow(
+                symbol="CRO",
+                address=address,
+                is_native=True,
+                amount=_DECIMAL_ZERO,
+                price_usd=_safe_price("CRO"),
+                sources={"fallback"},
+                priority=-20,
+            )
+        )
+    return _rows_to_snapshot(grouped)
 
 
 def _format_money(value: Optional[Decimal]) -> str:
     if value is None:
         return "n/a"
     try:
-        sign = "-" if value < 0 else ""
-        magnitude = abs(value)
-        if magnitude == 0:
+        if value == 0:
             return "$0.00"
-        if magnitude >= 1:
-            return f"{sign}${magnitude:,.2f}"
-        return f"{sign}${magnitude:.6f}"
+        if abs(value) >= 1:
+            return f"${value:,.2f}"
+        return f"${value:.6f}"
     except Exception:
         return "n/a"
 
@@ -287,77 +453,53 @@ def _format_delta(value: Optional[Decimal]) -> str:
         if value == 0:
             return "$0.00"
         prefix = "+" if value > 0 else ""
-        magnitude = abs(value)
-        if magnitude >= 1:
-            return f"{prefix}${magnitude:,.2f}"
-        return f"{prefix}${magnitude:.6f}"
+        if abs(value) >= 1:
+            return f"{prefix}${abs(value):,.2f}"
+        return f"{prefix}${abs(value):.6f}"
     except Exception:
         return "n/a"
 
 
-def _usd_value(info: Dict[str, Any]) -> Optional[Decimal]:
-    return _to_decimal(info.get("usd") or info.get("value_usd"))
+def _usd_value(info: Mapping[str, Any]) -> Optional[Decimal]:
+    return _to_decimal(info.get("value_usd") or info.get("usd"))
 
 
-def _price_value(info: Dict[str, Any]) -> Optional[Decimal]:
+def _price_value(info: Mapping[str, Any]) -> Optional[Decimal]:
     return _to_decimal(info.get("price_usd") or info.get("price"))
 
 
-def _delta_value(info: Dict[str, Any]) -> Optional[Decimal]:
-    for key in ("pnl_usd", "delta_usd", "pnl", "change_usd", "unrealized_usd"):
+def _delta_value(info: Mapping[str, Any]) -> Optional[Decimal]:
+    for key in ("unrealized_usd", "pnl_usd", "delta_usd", "pnl", "change_usd"):
         val = _to_decimal(info.get(key))
         if val is not None:
             return val
     return None
 
 
-def _ordered_symbols(snapshot: Dict[str, Dict[str, Any]]) -> Iterable[str]:
-    if not snapshot:
-        return []
-
-    symbols = list(snapshot.keys())
-    ordered: list[str] = []
-    if "CRO" in symbols:
-        ordered.append("CRO")
-        symbols.remove("CRO")
-
-    symbols.sort(
-        key=lambda sym: (
-            _usd_value(snapshot.get(sym, {})) or _DECIMAL_ZERO,
-            sym,
-        ),
-        reverse=True,
-    )
-    ordered.extend(symbols)
-    return ordered
-
-
-def holdings_text(snapshot: Dict[str, Dict[str, Any]] | None = None) -> str:
-    """Format holdings with CRO-first ordering and defensive fallbacks."""
-
+def holdings_text(snapshot: Mapping[str, Dict[str, Any]] | None = None) -> str:
     data = snapshot
     if data is None:
         try:
             data = holdings_snapshot()
         except Exception:
             data = {}
-
     if not data:
         return "No holdings data."
 
     lines = ["Holdings:"]
     total_usd = Decimal("0")
-    for symbol in _ordered_symbols(data):
-        info = data.get(symbol) or {}
-        qty = _format_qty(_to_decimal(info.get("qty") or info.get("amount")))
-        usd_val = _usd_value(info)
-        price_val = _price_value(info)
-        delta_val = _delta_value(info)
-        total_usd += usd_val or Decimal("0")
+    for key, info in data.items():
+        symbol = str((info or {}).get("symbol") or key)
+        qty = _to_decimal((info or {}).get("qty") or (info or {}).get("amount")) or Decimal("0")
+        price_val = _price_value(info or {})
+        usd_val = _usd_value(info or {})
+        delta_val = _delta_value(info or {})
+        if usd_val is not None:
+            total_usd += usd_val
         lines.append(
-            " - {sym:<6} {qty} @ {price} → USD {usd} (Δ {delta})".format(
+            " - {sym:<8} {qty_str} @ {price} → USD {usd} (Δ {delta})".format(
                 sym=symbol,
-                qty=qty,
+                qty_str=_format_qty(qty),
                 price=_format_money(price_val),
                 usd=_format_money(usd_val),
                 delta=_format_delta(delta_val),
