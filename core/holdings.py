@@ -40,11 +40,9 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
 
 def _normalize_symbol(symbol: str) -> str:
     raw = (symbol or "").strip()
-    if raw.lower() == "tcro":
-        return "tCRO"
     if not raw:
         return "?"
-    return raw.upper()
+    return raw.upper()   # no tCRO special-case
 
 
 def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -147,10 +145,11 @@ def get_wallet_snapshot(address: str | None = None) -> Dict[str, Dict[str, Optio
 def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     """Return a sanitized snapshot dict suitable for formatting.
     Guarantees a CRO entry seeded from RPC, then merges with discovered data.
+    No tCRO normalization.
     """
     address = (os.getenv("WALLET_ADDRESS") or "").strip()
 
-    # 1) Seed CRO via RPC (never raise)
+    # Seed CRO via RPC (never raise)
     cro_entry: Dict[str, Any] = {"qty": "0", "price_usd": None, "usd": None}
     if address:
         try:
@@ -171,17 +170,16 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
             "usd": (str(usd) if usd is not None else None),
         }
 
-    # 2) Build raw snapshot (may include CRO/tokens); never raise
+    # Build raw snapshot (may include CRO/tokens); never raise
     try:
         raw = get_wallet_snapshot(address=address or None)
     except Exception:
         raw = {}
 
-    # 3) Sanitize & merge CRO (RPC first, then enrich with any discovered fields)
+    # Sanitize & merge CRO (RPC first, then enrich with any discovered fields)
     sanitized = _sanitize_snapshot(raw)
     existing_cro = sanitized.get("CRO", {})
     merged_cro = dict(existing_cro)
-    # values from RPC take precedence; keep existing if RPC is None
     for k, v in cro_entry.items():
         if v is not None:
             merged_cro[k] = v
@@ -189,11 +187,7 @@ def holdings_snapshot() -> Dict[str, Dict[str, Any]]:
     merged_cro.setdefault("symbol", "CRO")
     sanitized["CRO"] = merged_cro
 
-    # 4) Normalize tCRO symbol if discovered as 'TCRO'
-    if "TCRO" in sanitized and "tCRO" not in sanitized:
-        sanitized["tCRO"] = sanitized.pop("TCRO")
-
-    # 5) Always guarantee a CRO row
+    # Always guarantee a CRO row
     if "CRO" not in sanitized:
         sanitized["CRO"] = {"symbol": "CRO", "qty": "0", "price_usd": None, "usd": None}
 
