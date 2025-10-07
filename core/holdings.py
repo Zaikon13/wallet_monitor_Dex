@@ -42,7 +42,7 @@ def _normalize_symbol(symbol: str) -> str:
     raw = (symbol or "").strip()
     if not raw:
         return "?"
-    return raw.upper()   # no tCRO special-case
+    return raw.upper()  # no tCRO special-case
 
 
 def _sanitize_snapshot(raw: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
