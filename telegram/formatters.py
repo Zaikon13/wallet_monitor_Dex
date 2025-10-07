@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import math
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Iterable, List
 
 __all__ = [
@@ -15,31 +14,49 @@ __all__ = [
 
 
 # --- Markdown escaping helpers ---
+_MD_V1_ESCAPE_RE = re.compile(r'([_*`\[\]()~>#+\-=|{}.!])')
+_MD_V2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#+\-=|{}.!\\])')
+
+
+def _ensure_text(value: object) -> str:
+    return "" if value is None else str(value)
+
+
 def escape_md(text: str) -> str:
-    if not text:
+    """Escape Markdown v1 special characters for Telegram bots."""
+
+    raw = _ensure_text(text)
+    if not raw:
         return ""
-    return re.sub(r"([_*`\\[\\]()~>#+\-=|{}.!])", r"\\\\\\1", str(text))
+    return _MD_V1_ESCAPE_RE.sub(r'\\\1', raw)
 
 
 def escape_md_v2(text: str) -> str:
-    if not text:
+    """Escape MarkdownV2 special characters according to Telegram docs."""
+
+    raw = _ensure_text(text)
+    if not raw:
         return ""
-    return re.sub(r"([_*\\[\\]()~`>#+\-=|{}.!])", r"\\\\\\1", str(text))
+    return _MD_V2_ESCAPE_RE.sub(r'\\\1', raw)
 
 
 def chunk(text: str, size: int = 3800) -> Iterable[str]:
-    if not text:
+    """Yield chunks of ``text`` limited to ``size`` characters (>=1)."""
+
+    raw = _ensure_text(text)
+    if not raw:
         return []
     safe_size = max(1, int(size))
-    total = max(1, math.ceil(len(text) / safe_size))
-    return [text[idx * safe_size : (idx + 1) * safe_size] for idx in range(total)]
+    return [raw[idx : idx + safe_size] for idx in range(0, len(raw), safe_size)]
 
 
 # --- Helpers ---
 def _dec(value: object) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
     try:
         return Decimal(str(value))
-    except Exception:
+    except (InvalidOperation, ValueError, TypeError):
         return Decimal("0")
 
 

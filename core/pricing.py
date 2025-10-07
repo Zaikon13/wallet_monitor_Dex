@@ -23,18 +23,40 @@ from __future__ import annotations
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from time import monotonic
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from utils.http import get_json
 
 
 # ---------- General helpers ----------
-def _map_from_env(prefix: str) -> dict:
-    """Return a dict of environment variables filtered by ``prefix_``."""
+def _map_from_env(key: str, env: Mapping[str, str] | None = None) -> Dict[str, str]:
+    """Return symbol->value mapping from CSV env vars or KEY_* entries."""
     import os
 
-    needle = f"{prefix}_"
-    return {k[len(needle) :]: v for k, v in os.environ.items() if k.startswith(needle)}
+    source = env or os.environ
+    mapping: Dict[str, str] = {}
+
+    raw = (source.get(key) or "").strip()
+    if raw:
+        for part in raw.split(","):
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip().upper()
+            value = value.strip()
+            if name and value:
+                mapping[name] = value
+
+    prefix = f"{key}_"
+    for env_key, value in source.items():
+        if not env_key.startswith(prefix):
+            continue
+        name = env_key[len(prefix) :].strip().upper()
+        val = (value or "").strip()
+        if name and val:
+            mapping[name] = val
+
+    return mapping
 
 
 # ---------- Cache settings ----------
