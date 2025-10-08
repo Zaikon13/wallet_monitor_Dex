@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
       - name: Run AST diagnostics
         run: |
-          python scripts/diag_ast.py || true
+          python scripts/ast_repair.py || true
       - name: Summary
         run: |
           echo "[CI] AST diagnostics completed at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
