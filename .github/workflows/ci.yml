@@ -1,55 +1,42 @@
-name: CI
-
+name: CI (AST + tests) on PR
 on:
-  push:
-    branches: ["main"]
   pull_request:
-    branches: ["main"]
-
+    branches: [ main ]
 jobs:
-  build:
+  ast_and_tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
+          python-version: "3.12"
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install pytest flake8
-
-      # ΜΗΝ αποτυγχάνει το job από το flake8
-      - name: Lint (flake8 - non-fatal)
+          pip install -r requirements.txt
+          pip install pytest
+      - name: AST pre-repair sweep (diagnostic)
         run: |
-          flake8 --config setup.cfg . || true
-
-      # Syntax check non-fatal για να μη μπλοκάρεις
-      - name: Syntax check (non-fatal)
+          python scripts/ast_repair.py || true
+      - name: AST parse all .py (post-repair)
         run: |
           python - <<'PY'
-          import py_compile, sys
-          try:
-              py_compile.compile('main.py', doraise=True)
-              print("py_compile: OK")
-          except Exception as e:
-              print("py_compile error:", e)
-              sys.exit(0)
+          import ast, pathlib, sys
+          bad=[]
+          for p in pathlib.Path(".").rglob("*.py"):
+              if any(x in p.parts for x in (".venv","__pycache__")):
+                  continue
+              try:
+                  ast.parse(p.read_text(encoding="utf-8"))
+              except Exception as e:
+                  bad.append((str(p), type(e).__name__, str(e)))
+          if bad:
+              for f, t, msg in bad:
+                  print(f"[SYNTAX] {f}: {t}: {msg}")
+              sys.exit(1)
+          print("AST OK")
           PY
-
-      # Ultra-smoke pytest χωρίς 3rd-party plugins
-      - name: Pytest (ultra smoke)
-        env:
-          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-          TZ: "Europe/Athens"
-          TELEGRAM_BOT_TOKEN: ""
-          TELEGRAM_CHAT_ID: ""
-          WALLET_ADDRESS: "0x0000000000000000000000000000000000000000"
-          ETHERSCAN_API: ""
-          CRONOS_RPC_URL: ""
-        run: |
-          pytest -q -p no:all tests/test_smoke.py || true
+      - name: Run tests
+        run: pytest -q
