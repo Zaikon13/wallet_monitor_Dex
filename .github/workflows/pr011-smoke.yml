@@ -1,1 +1,47 @@
+name: PR-011 Smoke (No-Exec, AST-only)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ast_only:
+    runs-on: ubuntu-latest
     timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: AST parse all .py (no imports, no exec)
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          errors=[]
+          skip_dirs={'.venv','venv','build','dist','node_modules','.git','.github'}
+          for f in pathlib.Path('.').rglob('*.py'):
+              parts=set(f.parts)
+              if any(x in parts for x in skip_dirs):
+                  continue
+              try:
+                  ast.parse(f.read_text(encoding='utf-8'), filename=str(f))
+              except Exception as e:
+                  errors.append((str(f), repr(e)))
+          if errors:
+              for f,e in errors:
+                  print(f"[AST ERR] {f}: {e}")
+              sys.exit(1)
+          print("AST OK")
+          PY
+
+      - name: Smoke marker
+        run: |
+          echo "[SMOKE] Done (AST-only)."
