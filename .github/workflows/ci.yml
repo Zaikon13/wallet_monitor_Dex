@@ -1,20 +1,11 @@
-name: CI (AST-only + Diagnostics)
-
+name: CI (AST-only)
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [ main ]
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
-
 jobs:
-  ast_diag:
-    name: AST check + verbose diagnostics
+  ast_check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,9 +13,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run AST diagnostics
+      - name: AST Syntax Check
         run: |
-          python scripts/ast_repair.py || true
-      - name: Summary
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad=[]
+          for p in pathlib.Path(".").rglob("*.py"):
+              if any(x in p.parts for x in (".venv","__pycache__",".github")): continue
+              try: ast.parse(p.read_text(encoding="utf-8"))
+              except Exception as e: bad.append((str(p), type(e).__name__, str(e)))
+          if bad:
+              for f,t,m in bad:
+                  print(f"[AST ERROR] {f}: {t}: {m}")
+              sys.exit(1)
+          print("✅ AST check passed")
+          PY
+      - name: Run Auto Repair (optional)
         run: |
-          echo "[CI] AST diagnostics completed at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if [ -f scripts/ast_repair.py ]; then
+            python scripts/ast_repair.py || true
+          fi
