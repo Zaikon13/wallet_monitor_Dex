@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
@@ -19,8 +20,24 @@ try:  # Optional dependency used in deployments
 except Exception:  # pragma: no cover - dotenv is optional
     load_dotenv = None  # type: ignore
 
+
+def _read_dry_run_from_env() -> bool:
+    """Return whether DRY_RUN is enabled based on the current environment."""
+
+    value = str(os.getenv("DRY_RUN", "0")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _refresh_dry_run() -> bool:
+    """Update the module-level DRY_RUN flag from the environment."""
+
+    global DRY_RUN
+    DRY_RUN = _read_dry_run_from_env()
+    return DRY_RUN
+
+
 # --- PR-011 safety toggles -------------------------------------------------
-DRY_RUN = os.getenv("DRY_RUN", "0") in ("1", "true", "True", "yes", "on")
+DRY_RUN = _read_dry_run_from_env()
 
 try:  # Adapter is optional in some test environments
     from core.holdings_adapters import build_holdings_snapshot
@@ -147,14 +164,27 @@ def send_holdings(limit: int = 20) -> None:
     print(text)
 
 
-def start_scheduler() -> None:
-    """Configure scheduler jobs without triggering at import time."""
+def _idle_until_interrupt(interval_seconds: float = 60.0) -> None:
+    """Keep the process alive until a KeyboardInterrupt is received."""
+
+    try:
+        while True:
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by user; exiting main loop")
+
+
+def start_scheduler() -> bool:
+    """Configure scheduler jobs without triggering at import time.
+
+    Returns True when a background scheduler loop was successfully started.
+    """
 
     try:
         import schedule  # type: ignore
     except Exception:  # pragma: no cover - schedule optional in tests
         logger.debug("schedule module not available; skipping scheduler setup")
-        return
+        return False
 
     try:
         schedule.clear("holdings")
@@ -167,12 +197,25 @@ def start_scheduler() -> None:
         logger.info("Scheduled hourly holdings snapshot job")
     except Exception:  # pragma: no cover - scheduler failures should not crash
         logger.exception("Failed to schedule holdings snapshot job")
+        return False
 
     if DRY_RUN:
         logger.info("DRY_RUN enabled; skipping network-heavy scheduled jobs")
-        return
+        return False
 
-    # Additional network-bound jobs can be registered here guarded by DRY_RUN.
+    try:
+        from reports.scheduler import run_scheduler as _run_scheduler
+    except Exception:  # pragma: no cover - scheduler wiring optional in tests
+        logger.exception("Background scheduler unavailable")
+        return False
+
+    try:
+        _run_scheduler()
+        logger.info("Background scheduler loop started")
+        return True
+    except Exception:
+        logger.exception("Failed to start background scheduler loop")
+        return False
 
 
 def app_boot() -> None:
@@ -184,14 +227,16 @@ def app_boot() -> None:
         except Exception:  # pragma: no cover - dotenv is best effort
             logger.debug("dotenv load failed", exc_info=True)
 
+    dry_run_active = _refresh_dry_run()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    logger.info("Cronos DeFi Sentinel booting%s", " [DRY_RUN]" if DRY_RUN else "")
+    logger.info("Cronos DeFi Sentinel booting%s", " [DRY_RUN]" if dry_run_active else "")
 
-    if DRY_RUN:
+    if dry_run_active:
         logger.info("DRY_RUN active: network calls will be skipped where possible")
 
 
@@ -201,8 +246,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     _ = argv  # Reserved for future argument parsing
     app_boot()
 
+    scheduler_active = False
     try:
-        start_scheduler()
+        scheduler_active = start_scheduler()
     except Exception:  # pragma: no cover - scheduler wiring is optional
         logger.exception("Scheduler setup failed")
 
@@ -210,6 +256,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         send_holdings(limit=20)
     except Exception:  # pragma: no cover - snapshot errors should not crash CLI
         logger.exception("Holdings snapshot generation failed")
+
+    if scheduler_active:
+        logger.info("Entering scheduler loop (Ctrl+C to exit)")
+        _idle_until_interrupt()
 
     return 0
 
