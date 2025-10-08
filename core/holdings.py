@@ -18,6 +18,8 @@ Notes
 from __future__ import annotations
 
 import os
+import math
+import time
 import logging
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -79,6 +81,16 @@ def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _topic_pad_addr(addr_hex: str) -> str:
+    """Return 32-byte topic for an address: 0x000...<40-hex> (lowercase)."""
+    a = (addr_hex or "").lower()
+    if a.startswith("0x"):
+        a = a[2:]
+    if len(a) != 40:
+        return "0x" + ("0" * 64)
+    return "0x" + ("0" * 24) + a
+
+
 D = Decimal
 
 CRO_ALIASES = {"TCRO", "tCRO", "tcro", "T-CRO", "t-cro", "WCRO-RECEIPT"}
@@ -125,50 +137,93 @@ class AssetSnap:
         }
 
 
-def _discover_erc20_contracts_from_logs(blocks_back: int = 120_000) -> list[str]:
+def _discover_erc20_contracts_from_logs(blocks_back: int = 120_000, chunk: int = 3_000, max_contracts: int = 200) -> list[str]:
     """
-    Use eth_getLogs over the last `blocks_back` blocks to find contracts that emitted Transfer(address,address,uint256)
-    where our wallet is sender or receiver. Returns unique token contract addresses (checksum).
-    Requires CRONOS_RPC_URL + WALLET_ADDRESS.
+    Scan recent blocks in chunks for ERC-20 Transfer events where our wallet is sender or receiver.
+    Correctly encodes address topics (32-byte padded). Falls back to topic0-only + client-side filter.
     """
     rpc_url = os.getenv("CRONOS_RPC_URL") or os.getenv("CRONOSRPCURL")
     wallet = os.getenv("WALLET_ADDRESS") or os.getenv("WALLETADDRESS")
     if not rpc_url or not wallet:
+        _dbg("discover: missing RPC or WALLET")
         return []
     try:
         from web3 import Web3  # type: ignore
-
         w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
         if not w3.is_connected():
+            _dbg("discover: RPC not connected")
             return []
-        acct = Web3.to_checksum_address(wallet)
-        acct_topic = "0x" + acct[2:].lower().rjust(64, "0")
-        latest = w3.eth.block_number
-        start = max(0, latest - int(blocks_back))
+        acct_cs = Web3.to_checksum_address(wallet)
+        acct_topic = _topic_pad_addr(acct_cs)
         topic0 = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+        latest = int(w3.eth.block_number)
+        earliest = max(0, latest - int(blocks_back))
+        found: set[str] = set()
 
-        params_common = {"fromBlock": hex(start), "toBlock": hex(latest), "topics": [topic0]}
-        logs_to = []
-        logs_from = []
-        try:
-            logs_to = w3.eth.get_logs({**params_common, "topics": [topic0, None, acct_topic]})  # type: ignore[assignment]
-        except Exception:
-            logs_to = []
-        try:
-            logs_from = w3.eth.get_logs({**params_common, "topics": [topic0, acct_topic, None]})  # type: ignore[assignment]
-        except Exception:
-            logs_from = []
-
-        addrs: Set[str] = set()
-        for lg in list(logs_to or []) + list(logs_from or []):
+        def scan_range(fb: int, tb: int) -> None:
+            nonlocal found
+            fb_h, tb_h = hex(fb), hex(tb)
+            # to = wallet
             try:
-                contract_address = Web3.to_checksum_address(lg["address"])
-                addrs.add(contract_address)
-            except Exception:
-                continue
-        return sorted(addrs)
-    except Exception:
+                logs_to = w3.eth.get_logs({"fromBlock": fb_h, "toBlock": tb_h, "topics": [topic0, None, acct_topic]})
+            except Exception as e:
+                _dbg(f"discover: get_logs(to) {fb}-{tb} error={e!r}")
+                logs_to = []
+            # from = wallet
+            try:
+                logs_from = w3.eth.get_logs({"fromBlock": fb_h, "toBlock": tb_h, "topics": [topic0, acct_topic, None]})
+            except Exception as e:
+                _dbg(f"discover: get_logs(from) {fb}-{tb} error={e!r}")
+                logs_from = []
+            for lg in (logs_to or []) + (logs_from or []):
+                try:
+                    c = Web3.to_checksum_address(lg["address"])
+                    found.add(c)
+                    if len(found) >= max_contracts:
+                        return
+                except Exception:
+                    continue
+            # Fallback: topic0-only + client-side filter (parse topics[1]/[2])
+            if len(found) < max_contracts:
+                try:
+                    logs_any = w3.eth.get_logs({"fromBlock": fb_h, "toBlock": tb_h, "topics": [topic0]})
+                except Exception as e:
+                    _dbg(f"discover: get_logs(any) {fb}-{tb} error={e!r}")
+                    logs_any = []
+                topic_pad = acct_topic[2:]  # strip 0x, 64 hex chars with addr at rightmost 40
+                for lg in logs_any or []:
+                    try:
+                        tps = lg.get("topics") or []
+                        if len(tps) >= 3:
+                            t1 = (tps[1] or "").lower()
+                            t2 = (tps[2] or "").lower()
+                            if t1.endswith(topic_pad[24:]) or t2.endswith(topic_pad[24:]):  # match by last 40 hex chars
+                                c = Web3.to_checksum_address(lg["address"])
+                                found.add(c)
+                                if len(found) >= max_contracts:
+                                    return
+                    except Exception:
+                        continue
+
+        # Chunked backward scan
+        _dbg(f"discover: latest={latest} earliest={earliest} chunk={chunk}")
+        for tb in range(latest, earliest, -chunk):
+            fb = max(earliest, tb - (chunk - 1))
+            scan_range(fb, tb)
+            _dbg(f"discover: scanned {fb}-{tb}, contracts={len(found)}")
+            if len(found) >= 1 and (tb < latest - 2*chunk):
+                # We have some hits; we can stop early to reduce load
+                break
+            # polite small delay to avoid provider rate limits
+            time.sleep(0.1)
+
+        out = sorted(found)
+        _dbg(f"discover: total contracts={len(out)}")
+        return out
+    except Exception as e:
+        _dbg(f"discover: fatal error={e!r}")
         return []
+
 
 
 def _fetch_erc20_balances_for_contracts(contracts: list[str]) -> list[Dict[str, Any]]:
