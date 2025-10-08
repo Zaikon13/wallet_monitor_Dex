@@ -18,6 +18,8 @@ Notes
 from __future__ import annotations
 
 import os
+import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -39,6 +41,43 @@ try:
 except Exception:  # pragma: no cover
     def get_avg_cost_usd(symbol: str) -> Optional[Decimal]:
         return None
+
+DEBUG_HOLDINGS = os.getenv("DEBUG_HOLDINGS", "0")
+_DH_LEVEL = (
+    int(DEBUG_HOLDINGS)
+    if DEBUG_HOLDINGS.isdigit()
+    else (
+        2
+        if DEBUG_HOLDINGS.lower() in ("2", "telegram", "tg")
+        else (1 if DEBUG_HOLDINGS.lower() in ("1", "true", "yes", "on") else 0)
+    )
+)
+_log = logging.getLogger("holdings")
+_log.setLevel(logging.DEBUG)
+if not _log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s holdings %(message)s"))
+    _log.addHandler(_h)
+try:
+    # optional telegram for DEBUG_HOLDINGS=2
+    from telegram.api import send_telegram as _send_tg  # type: ignore
+except Exception:
+    _send_tg = None
+
+
+def _dbg(msg: str) -> None:
+    if _DH_LEVEL >= 1:
+        _log.debug(msg)
+    if _DH_LEVEL >= 2 and _send_tg:
+        try:
+            _send_tg(f"🪵 [holdings-debug] {msg}")
+        except Exception:
+            pass
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 D = Decimal
 
@@ -204,50 +243,76 @@ def _fetch_erc20_balances_for_contracts(contracts: list[str]) -> list[Dict[str, 
 
 
 # ---- Core snapshot ------------------------------------------------------
+_dbg(
+    f"boot fetch_balances ts={_ts()} rpc={'ok' if rpc is not None else 'missing'} pricing={'ok' if pricing is not None else 'missing'}"
+)
+
+
 def _fetch_balances() -> Iterable[Dict[str, Any]]:
     """
-    Final strategy:
-      1) rpc.list_balances()
+    Strategy:
+      1) Live rpc.list_balances()
       2) If empty: rpc.rescan() and retry
-      3) If empty: native CRO via Web3
-      4) If empty: dynamic discovery — scan logs (recent blocks) to find token contracts, then balanceOf() each
-      5) If still empty: local cache
+      3) If still empty: native CRO via Web3
+      4) If still empty: ERC20 discovery/fallbacks (if present)
+      5) If still empty: local cache files
     """
     balances: list[Dict[str, Any]] = []
 
-    # 1) direct
+    # 1) direct list_balances()
     if rpc is not None and hasattr(rpc, "list_balances"):
         try:
             data = rpc.list_balances() or []
-            if isinstance(data, list):
+            _dbg(f"list_balances() -> len={len(data) if isinstance(data, list) else 'n/a'}")
+            if isinstance(data, list) and data:
                 balances = data
-        except Exception:
-            balances = []
+        except Exception as e:
+            _dbg(f"list_balances() error={e!r}")
 
     # 2) rescan
     if (not balances) and (rpc is not None) and hasattr(rpc, "rescan"):
         try:
+            _dbg("rescan() starting…")
             rpc.rescan()
-        except Exception:
-            pass
+            _dbg("rescan() done.")
+        except Exception as e:
+            _dbg(f"rescan() error={e!r}")
         try:
             data = rpc.list_balances() or []
-            if isinstance(data, list):
+            _dbg(
+                "list_balances() after rescan -> len="
+                f"{len(data) if isinstance(data, list) else 'n/a'}"
+            )
+            if isinstance(data, list) and data:
                 balances = data
-        except Exception:
-            balances = []
+        except Exception as e:
+            _dbg(f"list_balances() after rescan error={e!r}")
 
     # 3) native CRO
     if not balances:
+        _dbg("native CRO fallback…")
         cro = _fallback_native_cro_balance()
+        _dbg(f"native CRO result amount={str(cro.get('amount')) if cro else 'None'}")
         if cro is not None and _to_decimal(cro.get("amount")) > 0:
             balances = [cro]
 
-    # 4) dynamic ERC-20 discovery via logs + balanceOf()
+    # 4) ERC20 discovery / fallback if present
     if not balances:
-        contracts = _discover_erc20_contracts_from_logs()
-        if contracts:
-            erc20s = _fetch_erc20_balances_for_contracts(contracts)
+        if "_discover_erc20_contracts_from_logs" in globals():
+            contracts: list[str] = []
+            try:
+                contracts = _discover_erc20_contracts_from_logs()  # type: ignore
+            except Exception as e:
+                _dbg(f"discover logs error={e!r}")
+            else:
+                _dbg(f"discover logs -> contracts={len(contracts)}")
+            erc20s: list[Dict[str, Any]] = []
+            if contracts:
+                try:
+                    erc20s = _fetch_erc20_balances_for_contracts(contracts)  # type: ignore
+                except Exception as e:
+                    _dbg(f"erc20 balances error={e!r}")
+            _dbg(f"erc20 balances found={len(erc20s)}")
             if erc20s:
                 balances = erc20s
 
@@ -261,12 +326,14 @@ def _fetch_balances() -> Iterable[Dict[str, Any]]:
                 p = pathlib.Path(c)
                 if p.exists() and p.is_file():
                     data = json.loads(p.read_text(encoding="utf-8")) or []
+                    _dbg(f"cache probe {c} -> len={len(data) if isinstance(data, list) else 'n/a'}")
                     if isinstance(data, list) and data:
                         balances = data
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"cache read error={e!r}")
 
+    _dbg(f"_fetch_balances() final len={len(balances)}")
     return balances or []
 
 
@@ -395,6 +462,16 @@ def get_wallet_snapshot(base_ccy: str = "USD", limit: int = 9999) -> Dict[str, A
             "u_pnl_pct": str(total_upct.quantize(D("0.01"))),
         },
     }
+
+
+# Attach a light debug wrapper so we can emit totals when enabled
+def get_wallet_snapshot_debug(base_ccy: str = "USD", limit: int = 9999) -> Dict[str, Any]:
+    snap = get_wallet_snapshot(base_ccy=base_ccy, limit=limit)
+    if _DH_LEVEL >= 1:
+        assets = snap.get("assets", [])
+        totals = snap.get("totals", {})
+        _dbg(f"snapshot assets={len(assets)} totals_val={totals.get('value_usd')}")
+    return snap
 
 
 # Back-compat alias some projects used
