@@ -1,0 +1,1 @@
+PR-011 verification run: added PR-only DRY_RUN smoke, promoted PR, auto-merged if checks green.
