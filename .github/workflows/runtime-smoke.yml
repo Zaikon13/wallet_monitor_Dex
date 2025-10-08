@@ -1,65 +1,49 @@
-name: Runtime Smoke (run main.py for 45s with timeout)
-
+name: runtime-smoke
 on:
   workflow_dispatch: {}
-  push:
-    branches: [ main ]
-
-permissions:
-  contents: read
-
 jobs:
-  runtime_smoke:
+  smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
     env:
-      DRY_RUN: "1"          # ζητάμε “στεγνή” λειτουργία αν τη σέβεται το main.py
-      PYTHONUNBUFFERED: "1"
-      TZ: "Europe/Athens"
+      TZ: Europe/Athens
+      DRY_RUN: "1"
+      DEBUG_HOLDINGS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install dependencies (best effort)
+      - name: Install deps (best-effort)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt || true; fi
-
-      - name: Run main.py with hard timeout (collect logs)
-        shell: bash
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+      - name: AST sanity
         run: |
-          set -euo pipefail
-          mkdir -p ci_logs
-          # Το coreutils `timeout` υπάρχει στα runners. Τρέχουμε 45s και κόβουμε.
-          # Exit κωδικός 124 = timeout: το θεωρούμε ΟΚ για smoke.
-          set +e
-          timeout 45s python main.py > ci_logs/runtime.log 2>&1
-          code=$?
-          set -e
-          echo "Runtime exit code: $code" | tee ci_logs/exit_code.txt
-          # Δεν σκοτώνουμε το job σε 124 (timeout) ή 0. Μόνο αν υπάρχει “άσχημο” exit.
-          if [ "$code" != "0" ] && [ "$code" != "124" ]; then
-            echo "::warning::main.py exited with non-zero code ($code). See artifact logs."
-            # Δεν κάνουμε fail εδώ για να μη μπλοκάρει το main push — αλλά το βλέπεις στα logs.
-          fi
-
-      - name: Tail last 80 log lines (to build summary)
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad=[]
+          for p in pathlib.Path(".").rglob("*.py"):
+              if any(x in p.parts for x in (".venv","__pycache__")): continue
+              try: ast.parse(p.read_text(encoding="utf-8"))
+              except Exception as e: bad.append((str(p),type(e).__name__,str(e)))
+          if bad:
+              for f,t,m in bad: print(f"[SYNTAX] {f}: {t}: {m}")
+              sys.exit(1)
+          print("AST OK")
+          PY
+      - name: Holdings diagnostics (if present)
         run: |
-          if [ -f ci_logs/runtime.log ]; then
-            echo "----- LAST 80 LOG LINES -----"
-            tail -n 80 ci_logs/runtime.log || true
+          if [ -f scripts/diag_holdings.py ]; then
+            python scripts/diag_holdings.py || true
           else
-            echo "No runtime.log produced."
+            echo "diag_holdings.py not present — skipping"
           fi
-
-      - name: Upload runtime logs
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-smoke-logs_${{ github.sha }}
-          path: ci_logs/
-          if-no-files-found: warn
+      - name: Run main.py (DRY_RUN)
+        run: |
+          if [ -f main.py ]; then
+            python main.py | tail -n 120
+          else
+            echo "main.py missing"
+          fi
