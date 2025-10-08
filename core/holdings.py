@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # ---- Optional dependencies (guarded) -----------------------------------
 try:
@@ -86,19 +86,49 @@ class AssetSnap:
         }
 
 
+def _erc20_candidates() -> Sequence[tuple[str, str]]:
+    """
+    Return (symbol, contract) pairs to probe on Cronos.
+    Extend from env CRO_TOKENS='SYMBOL:0xaddr,SYMBOL2:0xaddr2' if present.
+    Includes a small built-in set as a safety net.
+    """
+    env = os.getenv("CRO_TOKENS", "").strip()
+    pairs: list[tuple[str, str]] = []
+    if env:
+        for part in env.split(","):
+            if ":" in part:
+                s, a = part.strip().split(":", 1)
+                if s and a:
+                    pairs.append((s.strip(), a.strip()))
+    # Minimal built-ins (safe/popular Cronos tokens — edit if needed)
+    builtins = [
+        ("VVS", "0x2D03bece6747ADC00E1a131BBA1469C15fD11e03"),
+        ("TONIC", "0xEcbF7bA5a39d3b0B8E1406E1FF07C1a1e2D12dE2"),
+        ("USDC", "0xc21223249CA28397B4B6541dfFaEcC539BfF0c59"),
+        ("USDT", "0x66e428c3f67a68878562E79A0234c1F83c208770"),
+        ("DAI", "0xf2001B145b43032AAF5Ee2884e456CCd805F677D"),
+    ]
+    # Append builtins only if not duplicated by env
+    existing = {a.lower() for _, a in pairs}
+    for s, a in builtins:
+        if a.lower() not in existing:
+            pairs.append((s, a))
+    return pairs
+
+
 # ---- Core snapshot ------------------------------------------------------
 def _fetch_balances() -> Iterable[Dict[str, Any]]:
     """
     Strategy:
       1) Live rpc.list_balances()
       2) If empty: rpc.rescan() and retry
-      3) If still empty: direct native CRO from Web3 (CRONOS_RPC_URL + WALLET_ADDRESS)
-      4) If still empty: local cache files (best-effort)
-    Returns a list of dicts like: {"symbol": "CRO", "amount": Decimal|str, "address": None|str}
+      3) If still empty: native CRO via Web3 (get_balance)
+      4) If still empty: ERC20 balanceOf() scan for a small set of tokens
+      5) If still empty: local cache files
     """
     balances: list[Dict[str, Any]] = []
 
-    # 1) Try direct list_balances()
+    # 1) direct
     if rpc is not None and hasattr(rpc, "list_balances"):
         try:
             data = rpc.list_balances() or []
@@ -107,7 +137,7 @@ def _fetch_balances() -> Iterable[Dict[str, Any]]:
         except Exception:
             balances = []
 
-    # 2) If empty, try a rescan (historical behavior)
+    # 2) rescan
     if (not balances) and (rpc is not None) and hasattr(rpc, "rescan"):
         try:
             rpc.rescan()
@@ -120,24 +150,25 @@ def _fetch_balances() -> Iterable[Dict[str, Any]]:
         except Exception:
             balances = []
 
-    # 3) If still empty, try native CRO via Web3
+    # 3) native CRO
     if not balances:
         cro = _fallback_native_cro_balance()
         if cro is not None:
             balances = [cro]
 
-    # 4) If still empty, try local cache files
+    # 4) ERC20 fallback
+    if not balances:
+        erc20s = _fallback_erc20_balances()
+        if erc20s:
+            balances = erc20s
+
+    # 5) cache
     if not balances:
         try:
             import json
             import pathlib
 
-            candidates = (
-                "./.cache/balances.json",
-                "./data/balances.json",
-                "./.ledger/balances.json",
-            )
-            for c in candidates:
+            for c in ("./.cache/balances.json", "./data/balances.json", "./.ledger/balances.json"):
                 p = pathlib.Path(c)
                 if p.exists() and p.is_file():
                     data = json.loads(p.read_text(encoding="utf-8")) or []
@@ -176,6 +207,47 @@ def _fallback_native_cro_balance() -> Optional[Dict[str, Any]]:
         return {"symbol": "CRO", "amount": cro, "address": None}
     except Exception:
         return None
+
+
+def _fallback_erc20_balances() -> list[Dict[str, Any]]:
+    """
+    Probe a small set of known ERC20 tokens on Cronos using balanceOf.
+    Requires CRONOS_RPC_URL + WALLET_ADDRESS.
+    """
+    rpc_url = os.getenv("CRONOS_RPC_URL") or os.getenv("CRONOSRPCURL")
+    wallet = os.getenv("WALLET_ADDRESS") or os.getenv("WALLETADDRESS")
+    if not rpc_url or not wallet:
+        return []
+    try:
+        from web3 import Web3  # type: ignore
+        from eth_abi import abi  # type: ignore  # noqa: F401
+    except Exception:
+        return []
+    try:
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+        if not w3.is_connected():
+            return []
+        acct = Web3.to_checksum_address(wallet)
+        sig = Web3.keccak(text="balanceOf(address)")[:4]  # function selector
+        out: list[Dict[str, Any]] = []
+        for symbol, contract in _erc20_candidates():
+            try:
+                addr = Web3.to_checksum_address(contract)
+                data = sig + bytes.fromhex(acct[2:].rjust(64, "0"))
+                raw = w3.eth.call({"to": addr, "data": "0x" + data.hex()})
+                if raw and raw != b"\x00" * 32:
+                    bal = int(raw.hex(), 16)
+                    dec_sig = Web3.keccak(text="decimals()")[:4]
+                    dec_raw = w3.eth.call({"to": addr, "data": "0x" + dec_sig.hex()})
+                    decimals = int(dec_raw.hex(), 16) if dec_raw else 18
+                    qty = Decimal(bal) / (Decimal(10) ** Decimal(decimals))
+                    if qty > Decimal("0"):
+                        out.append({"symbol": symbol, "amount": qty, "address": addr})
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
 
 
 def _spot_usd(symbol: str, address: Optional[str]) -> Decimal:
