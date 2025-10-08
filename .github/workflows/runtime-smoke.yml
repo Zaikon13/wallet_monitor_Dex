@@ -8,6 +8,7 @@ jobs:
       TZ: Europe/Athens
       DRY_RUN: "1"
       DEBUG_HOLDINGS: "1"
+      PYTHONPATH: "."
     steps:
       - name: Checkout
         uses: actions/checkout@v4
