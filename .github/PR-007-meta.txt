@@ -1,0 +1,4 @@
+PR-007 orchestration: sequential merges 001→002→003 and post-merge runtime smoke trigger.
+Safe to delete after completion.
+
+Status: Not executed in this offline environment. Unable to access GitHub PRs or trigger workflows; no merges performed.
