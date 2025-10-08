@@ -18,23 +18,31 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Print HEAD info
+      - name: Debug info
         run: |
-          echo "HEAD: $(git rev-parse --short HEAD)"
-          echo "Branch: ${GITHUB_REF}"
+          echo "HEAD: $(git rev-parse HEAD)"
+          echo "SHORT: $(git rev-parse --short HEAD)"
+          echo "Branch ref: ${GITHUB_REF}"
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+          ls -la
 
-      - name: Create tarball
+      - name: Create ZIP snapshot (exclude .git/.github/venv/node_modules)
+        shell: bash
         run: |
-          SNAP="wallet_monitor_Dex_${GITHUB_SHA::7}.tar.gz"
-          tar --exclude='.git' --exclude='.github' \
-              --exclude='node_modules' --exclude='.venv' --exclude='venv' \
-              -czf "${SNAP}" .
-          echo "SNAP=${SNAP}" >> $GITHUB_ENV
-          ls -lh "${SNAP}"
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          SNAP="wallet_monitor_Dex_${SHORT_SHA}.zip"
+          echo "SNAP=${SNAP}" >> "$GITHUB_ENV"
+          # Install zip if missing (usually present)
+          command -v zip >/dev/null 2>&1 || sudo apt-get update && sudo apt-get install -y zip
+          zip -r "$SNAP" . \
+            -x ".git/*" ".github/*" "node_modules/*" "venv/*" ".venv/*" "build/*" "dist/*"
+          echo "Created: $SNAP"
+          ls -lh "$SNAP"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: repo-snapshot_${{ github.sha }}
           path: ${{ env.SNAP }}
-          if-no-files-found: error
+          if-no-files-found: warn
