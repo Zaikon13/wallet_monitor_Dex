@@ -1,4 +1,4 @@
-name: PR-011 Smoke (No-Exec, AST-only)
+name: PR-011 Smoke (AST-only)
 
 on:
   pull_request:
@@ -9,9 +9,10 @@ permissions:
   contents: read
 
 jobs:
-  ast_only:
+  ast_check:
     runs-on: ubuntu-latest
     timeout-minutes: 3
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,27 +22,25 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: AST parse all .py (no imports, no exec)
+      - name: AST check (no imports, no exec)
         run: |
           python - <<'PY'
           import ast, pathlib, sys
-          errors=[]
-          skip_dirs={'.venv','venv','build','dist','node_modules','.git','.github'}
+          bad=[]
+          skip={'.venv','venv','build','dist','node_modules','.git','.github'}
           for f in pathlib.Path('.').rglob('*.py'):
-              parts=set(f.parts)
-              if any(x in parts for x in skip_dirs):
+              if any(x in f.parts for x in skip):
                   continue
               try:
                   ast.parse(f.read_text(encoding='utf-8'), filename=str(f))
               except Exception as e:
-                  errors.append((str(f), repr(e)))
-          if errors:
-              for f,e in errors:
+                  bad.append((str(f), e))
+          if bad:
+              for f,e in bad:
                   print(f"[AST ERR] {f}: {e}")
               sys.exit(1)
-          print("AST OK")
+          print("[AST] OK — all files parsed successfully.")
           PY
 
-      - name: Smoke marker
-        run: |
-          echo "[SMOKE] Done (AST-only)."
+      - name: Marker
+        run: echo "[SMOKE] PR-011 AST-only check completed."
