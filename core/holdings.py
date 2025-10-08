@@ -16,8 +16,10 @@ Notes
 """
 
 from __future__ import annotations
-from decimal import Decimal, InvalidOperation
+
+import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ---- Optional dependencies (guarded) -----------------------------------
@@ -42,6 +44,7 @@ D = Decimal
 
 CRO_ALIASES = {"TCRO", "tCRO", "tcro", "T-CRO", "t-cro", "WCRO-RECEIPT"}
 
+
 def _norm_symbol(symbol: str) -> str:
     s = (symbol or "").strip()
     if s in CRO_ALIASES:
@@ -51,6 +54,7 @@ def _norm_symbol(symbol: str) -> str:
         return "CRO"
     return s or "?"
 
+
 def _to_decimal(x: Any) -> Decimal:
     if isinstance(x, Decimal):
         return x
@@ -58,6 +62,7 @@ def _to_decimal(x: Any) -> Decimal:
         return D(str(x))
     except (InvalidOperation, ValueError, TypeError):
         return D("0")
+
 
 @dataclass
 class AssetSnap:
@@ -80,15 +85,98 @@ class AssetSnap:
             "u_pnl_pct": str(self.u_pnl_pct.quantize(D("0.01"))),
         }
 
+
 # ---- Core snapshot ------------------------------------------------------
 def _fetch_balances() -> Iterable[Dict[str, Any]]:
-    if rpc is None or not hasattr(rpc, "list_balances"):
-        return []
+    """
+    Strategy:
+      1) Live rpc.list_balances()
+      2) If empty: rpc.rescan() and retry
+      3) If still empty: direct native CRO from Web3 (CRONOS_RPC_URL + WALLET_ADDRESS)
+      4) If still empty: local cache files (best-effort)
+    Returns a list of dicts like: {"symbol": "CRO", "amount": Decimal|str, "address": None|str}
+    """
+    balances: list[Dict[str, Any]] = []
+
+    # 1) Try direct list_balances()
+    if rpc is not None and hasattr(rpc, "list_balances"):
+        try:
+            data = rpc.list_balances() or []
+            if isinstance(data, list):
+                balances = data
+        except Exception:
+            balances = []
+
+    # 2) If empty, try a rescan (historical behavior)
+    if (not balances) and (rpc is not None) and hasattr(rpc, "rescan"):
+        try:
+            rpc.rescan()
+        except Exception:
+            pass
+        try:
+            data = rpc.list_balances() or []
+            if isinstance(data, list):
+                balances = data
+        except Exception:
+            balances = []
+
+    # 3) If still empty, try native CRO via Web3
+    if not balances:
+        cro = _fallback_native_cro_balance()
+        if cro is not None:
+            balances = [cro]
+
+    # 4) If still empty, try local cache files
+    if not balances:
+        try:
+            import json
+            import pathlib
+
+            candidates = (
+                "./.cache/balances.json",
+                "./data/balances.json",
+                "./.ledger/balances.json",
+            )
+            for c in candidates:
+                p = pathlib.Path(c)
+                if p.exists() and p.is_file():
+                    data = json.loads(p.read_text(encoding="utf-8")) or []
+                    if isinstance(data, list) and data:
+                        balances = data
+                        break
+        except Exception:
+            pass
+
+    return balances or []
+
+
+def _fallback_native_cro_balance() -> Optional[Dict[str, Any]]:
+    """
+    Read native CRO balance directly from RPC when higher-level adapter returns empty.
+    Requires:
+      - CRONOS_RPC_URL
+      - WALLET_ADDRESS (hex)
+    Returns a balance row or None if not available.
+    """
+    rpc_url = os.getenv("CRONOS_RPC_URL") or os.getenv("CRONOSRPCURL")
+    wallet = os.getenv("WALLET_ADDRESS") or os.getenv("WALLETADDRESS")
+    if not rpc_url or not wallet:
+        return None
     try:
-        balances = rpc.list_balances()  # [{symbol, amount, address?}, ...]
-        return balances or []
+        from web3 import Web3  # type: ignore
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+        if not w3.is_connected():
+            return None
+        wei = w3.eth.get_balance(Web3.to_checksum_address(wallet))
+        cro = Decimal(wei) / Decimal(10**18)
+        # Ignore dust-level noise; treat < 1e-12 as zero
+        if cro.compare(Decimal("0.000000000001")) <= 0:
+            return {"symbol": "CRO", "amount": Decimal("0"), "address": None}
+        return {"symbol": "CRO", "amount": cro, "address": None}
     except Exception:
-        return []
+        return None
+
 
 def _spot_usd(symbol: str, address: Optional[str]) -> Decimal:
     if pricing is None or not hasattr(pricing, "get_spot_usd"):
@@ -99,12 +187,14 @@ def _spot_usd(symbol: str, address: Optional[str]) -> Decimal:
     except Exception:
         return D("0")
 
+
 def _avg_cost(symbol: str) -> Decimal:
     try:
         c = get_avg_cost_usd(symbol)  # type: ignore
         return _to_decimal(c)
     except Exception:
         return D("0")
+
 
 def _merge_rows(rows: Iterable[Dict[str, Any]]) -> List[Tuple[str, Decimal, Optional[str]]]:
     """
@@ -128,6 +218,7 @@ def _merge_rows(rows: Iterable[Dict[str, Any]]) -> List[Tuple[str, Decimal, Opti
     # sort by symbol for deterministic output
     out.sort(key=lambda t: t[0])
     return out
+
 
 def get_wallet_snapshot(base_ccy: str = "USD", limit: int = 9999) -> Dict[str, Any]:
     """
@@ -184,6 +275,7 @@ def get_wallet_snapshot(base_ccy: str = "USD", limit: int = 9999) -> Dict[str, A
             "u_pnl_pct": str(total_upct.quantize(D("0.01"))),
         },
     }
+
 
 # Back-compat alias some projects used
 wallet_snapshot = get_wallet_snapshot
