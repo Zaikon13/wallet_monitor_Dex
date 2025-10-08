@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 # ---- Optional dependencies (guarded) -----------------------------------
 try:
@@ -86,45 +86,132 @@ class AssetSnap:
         }
 
 
-def _erc20_candidates() -> Sequence[tuple[str, str]]:
+def _discover_erc20_contracts_from_logs(blocks_back: int = 120_000) -> list[str]:
     """
-    Return (symbol, contract) pairs to probe on Cronos.
-    Extend from env CRO_TOKENS='SYMBOL:0xaddr,SYMBOL2:0xaddr2' if present.
-    Includes a small built-in set as a safety net.
+    Use eth_getLogs over the last `blocks_back` blocks to find contracts that emitted Transfer(address,address,uint256)
+    where our wallet is sender or receiver. Returns unique token contract addresses (checksum).
+    Requires CRONOS_RPC_URL + WALLET_ADDRESS.
     """
-    env = os.getenv("CRO_TOKENS", "").strip()
-    pairs: list[tuple[str, str]] = []
-    if env:
-        for part in env.split(","):
-            if ":" in part:
-                s, a = part.strip().split(":", 1)
-                if s and a:
-                    pairs.append((s.strip(), a.strip()))
-    # Minimal built-ins (safe/popular Cronos tokens — edit if needed)
-    builtins = [
-        ("VVS", "0x2D03bece6747ADC00E1a131BBA1469C15fD11e03"),
-        ("TONIC", "0xEcbF7bA5a39d3b0B8E1406E1FF07C1a1e2D12dE2"),
-        ("USDC", "0xc21223249CA28397B4B6541dfFaEcC539BfF0c59"),
-        ("USDT", "0x66e428c3f67a68878562E79A0234c1F83c208770"),
-        ("DAI", "0xf2001B145b43032AAF5Ee2884e456CCd805F677D"),
-    ]
-    # Append builtins only if not duplicated by env
-    existing = {a.lower() for _, a in pairs}
-    for s, a in builtins:
-        if a.lower() not in existing:
-            pairs.append((s, a))
-    return pairs
+    rpc_url = os.getenv("CRONOS_RPC_URL") or os.getenv("CRONOSRPCURL")
+    wallet = os.getenv("WALLET_ADDRESS") or os.getenv("WALLETADDRESS")
+    if not rpc_url or not wallet:
+        return []
+    try:
+        from web3 import Web3  # type: ignore
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
+        if not w3.is_connected():
+            return []
+        acct = Web3.to_checksum_address(wallet)
+        acct_topic = "0x" + acct[2:].lower().rjust(64, "0")
+        latest = w3.eth.block_number
+        start = max(0, latest - int(blocks_back))
+        topic0 = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+
+        params_common = {"fromBlock": hex(start), "toBlock": hex(latest), "topics": [topic0]}
+        logs_to = []
+        logs_from = []
+        try:
+            logs_to = w3.eth.get_logs({**params_common, "topics": [topic0, None, acct_topic]})  # type: ignore[assignment]
+        except Exception:
+            logs_to = []
+        try:
+            logs_from = w3.eth.get_logs({**params_common, "topics": [topic0, acct_topic, None]})  # type: ignore[assignment]
+        except Exception:
+            logs_from = []
+
+        addrs: Set[str] = set()
+        for lg in list(logs_to or []) + list(logs_from or []):
+            try:
+                contract_address = Web3.to_checksum_address(lg["address"])
+                addrs.add(contract_address)
+            except Exception:
+                continue
+        return sorted(addrs)
+    except Exception:
+        return []
+
+
+def _fetch_erc20_balances_for_contracts(contracts: list[str]) -> list[Dict[str, Any]]:
+    """
+    For a list of token contract addresses, query balanceOf(wallet) and decimals(), and compose balance rows.
+    Symbol resolution is best-effort using pricing.get_symbol or contract symbol() if available; falls back to address.
+    """
+    rpc_url = os.getenv("CRONOS_RPC_URL") or os.getenv("CRONOSRPCURL")
+    wallet = os.getenv("WALLET_ADDRESS") or os.getenv("WALLETADDRESS")
+    if not rpc_url or not wallet or not contracts:
+        return []
+    try:
+        from web3 import Web3  # type: ignore
+    except Exception:
+        return []
+    try:
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
+        if not w3.is_connected():
+            return []
+        acct = Web3.to_checksum_address(wallet)
+        acct_bytes = bytes.fromhex(acct[2:].rjust(64, "0"))
+        sel_balance = Web3.keccak(text="balanceOf(address)")[:4]
+        sel_dec = Web3.keccak(text="decimals()")[:4]
+        sel_sym = Web3.keccak(text="symbol()")[:4]
+        out: list[Dict[str, Any]] = []
+        for ca in contracts:
+            try:
+                addr = Web3.to_checksum_address(ca)
+                data = sel_balance + acct_bytes
+                raw = w3.eth.call({"to": addr, "data": "0x" + data.hex()})
+                raw_bytes = bytes(raw) if raw else b""
+                bal = int.from_bytes(raw_bytes, "big") if raw_bytes else 0
+                if bal <= 0:
+                    continue
+
+                dec_raw = w3.eth.call({"to": addr, "data": "0x" + sel_dec.hex()}) or b""
+                dec_bytes = bytes(dec_raw)
+                decimals = int.from_bytes(dec_bytes, "big") if dec_bytes else 18
+                if decimals < 0 or decimals > 36:
+                    decimals = 18
+
+                qty = Decimal(bal) / (Decimal(10) ** Decimal(decimals))
+                if qty <= Decimal("0"):
+                    continue
+
+                symbol = None
+                try:
+                    sym_raw = w3.eth.call({"to": addr, "data": "0x" + sel_sym.hex()}) or b""
+                    sym_bytes = bytes(sym_raw).rstrip(b"\x00")
+                    if sym_bytes:
+                        symbol_candidate = sym_bytes.decode("utf-8", "ignore").strip()
+                        if symbol_candidate:
+                            symbol = symbol_candidate
+                except Exception:
+                    pass
+
+                if not symbol and pricing is not None and hasattr(pricing, "get_symbol_for_address"):
+                    try:
+                        symbol = pricing.get_symbol_for_address(addr)  # type: ignore[attr-defined]
+                    except Exception:
+                        symbol = None
+
+                if not symbol:
+                    symbol = addr[-6:]
+
+                out.append({"symbol": symbol, "amount": qty, "address": addr})
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
 
 
 # ---- Core snapshot ------------------------------------------------------
 def _fetch_balances() -> Iterable[Dict[str, Any]]:
     """
-    Strategy:
-      1) Live rpc.list_balances()
+    Final strategy:
+      1) rpc.list_balances()
       2) If empty: rpc.rescan() and retry
-      3) If still empty: native CRO via Web3 (get_balance)
-      4) If still empty: ERC20 balanceOf() scan for a small set of tokens
-      5) If still empty: local cache files
+      3) If empty: native CRO via Web3
+      4) If empty: dynamic discovery — scan logs (recent blocks) to find token contracts, then balanceOf() each
+      5) If still empty: local cache
     """
     balances: list[Dict[str, Any]] = []
 
@@ -153,14 +240,16 @@ def _fetch_balances() -> Iterable[Dict[str, Any]]:
     # 3) native CRO
     if not balances:
         cro = _fallback_native_cro_balance()
-        if cro is not None:
+        if cro is not None and _to_decimal(cro.get("amount")) > 0:
             balances = [cro]
 
-    # 4) ERC20 fallback
+    # 4) dynamic ERC-20 discovery via logs + balanceOf()
     if not balances:
-        erc20s = _fallback_erc20_balances()
-        if erc20s:
-            balances = erc20s
+        contracts = _discover_erc20_contracts_from_logs()
+        if contracts:
+            erc20s = _fetch_erc20_balances_for_contracts(contracts)
+            if erc20s:
+                balances = erc20s
 
     # 5) cache
     if not balances:
@@ -207,47 +296,6 @@ def _fallback_native_cro_balance() -> Optional[Dict[str, Any]]:
         return {"symbol": "CRO", "amount": cro, "address": None}
     except Exception:
         return None
-
-
-def _fallback_erc20_balances() -> list[Dict[str, Any]]:
-    """
-    Probe a small set of known ERC20 tokens on Cronos using balanceOf.
-    Requires CRONOS_RPC_URL + WALLET_ADDRESS.
-    """
-    rpc_url = os.getenv("CRONOS_RPC_URL") or os.getenv("CRONOSRPCURL")
-    wallet = os.getenv("WALLET_ADDRESS") or os.getenv("WALLETADDRESS")
-    if not rpc_url or not wallet:
-        return []
-    try:
-        from web3 import Web3  # type: ignore
-        from eth_abi import abi  # type: ignore  # noqa: F401
-    except Exception:
-        return []
-    try:
-        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-        if not w3.is_connected():
-            return []
-        acct = Web3.to_checksum_address(wallet)
-        sig = Web3.keccak(text="balanceOf(address)")[:4]  # function selector
-        out: list[Dict[str, Any]] = []
-        for symbol, contract in _erc20_candidates():
-            try:
-                addr = Web3.to_checksum_address(contract)
-                data = sig + bytes.fromhex(acct[2:].rjust(64, "0"))
-                raw = w3.eth.call({"to": addr, "data": "0x" + data.hex()})
-                if raw and raw != b"\x00" * 32:
-                    bal = int(raw.hex(), 16)
-                    dec_sig = Web3.keccak(text="decimals()")[:4]
-                    dec_raw = w3.eth.call({"to": addr, "data": "0x" + dec_sig.hex()})
-                    decimals = int(dec_raw.hex(), 16) if dec_raw else 18
-                    qty = Decimal(bal) / (Decimal(10) ** Decimal(decimals))
-                    if qty > Decimal("0"):
-                        out.append({"symbol": symbol, "amount": qty, "address": addr})
-            except Exception:
-                continue
-        return out
-    except Exception:
-        return []
 
 
 def _spot_usd(symbol: str, address: Optional[str]) -> Decimal:
