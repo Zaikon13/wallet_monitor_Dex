@@ -1,7 +1,11 @@
 # Cronos DeFi Sentinel
 
-Compact Python bot (<1000 lines) που παρακολουθεί το Cronos wallet σου, 
-κρατάει ledger με συναλλαγές, υπολογίζει PnL (realized & unrealized), 
+[![CI (AST only)](https://github.com/Zaikon13/wallet_monitor_Dex/actions/workflows/ci.yml/badge.svg)](https://github.com/Zaikon13/wallet_monitor_Dex/actions/workflows/ci.yml)
+[![Tests (manual)](https://github.com/Zaikon13/wallet_monitor_Dex/actions/workflows/tests-manual.yml/badge.svg)](https://github.com/Zaikon13/wallet_monitor_Dex/actions/workflows/tests-manual.yml)
+[![Runtime Smoke](https://github.com/Zaikon13/wallet_monitor_Dex/actions/workflows/runtime-smoke.yml/badge.svg)](https://github.com/Zaikon13/wallet_monitor_Dex/actions/workflows/runtime-smoke.yml)
+
+Compact Python bot (<1000 lines) που παρακολουθεί το Cronos wallet σου,
+κρατάει ledger με συναλλαγές, υπολογίζει PnL (realized & unrealized),
 και στέλνει reports / alerts στο Telegram.
 
 ---
