@@ -1,2 +1,0 @@
-RESET-002 executed: rebased PR branches on main, promoted drafts to Ready, nudged CI.
-Safe to remove after merges.
