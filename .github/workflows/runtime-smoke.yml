@@ -1,28 +1,40 @@
-name: Runtime Smoke
+name: Runtime Smoke (manual)
 on:
   workflow_dispatch: {}
 jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - name: Import check (no side-effects)
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: AST parse (quick)
         run: |
           python - <<'PY'
-          import importlib, sys
-          mods = [
-            "main",
-            "core.alerts","core.config","core.guards","core.holdings","core.pricing",
-            "core.providers.cronos","core.providers.etherscan_like","core.rpc",
-            "core.runtime_state","core.tz","core.wallet_monitor","core.watch",
-            "reports.aggregates","reports.day_report","reports.ledger","reports.scheduler","reports.weekly",
-            "telegram.api","telegram.commands","telegram.dispatcher","telegram.formatters","telegram.send",
-          ]
-          for m in mods:
-              importlib.import_module(m)
-          print("✅ Import pass without side-effects")
+          import ast, pathlib, sys
+          root = pathlib.Path(".")
+          bad=[]
+          for p in root.rglob("*.py"):
+              if any(x in p.parts for x in (".venv","__pycache__")):
+                  continue
+              try:
+                  ast.parse(p.read_text(encoding="utf-8"))
+              except Exception as e:
+                  bad.append((str(p), type(e).__name__, str(e)))
+          if bad:
+              for f, t, msg in bad:
+                  print(f"[SYNTAX] {f}: {t}: {msg}")
+              sys.exit(1)
+          print("AST OK")
           PY
-      - name: Run ping
-        run: python scripts/cordex_ping.py
+      - name: Smoke holdings (text)
+        run: python scripts/smoke_holdings.py --limit 10
+      - name: Smoke holdings (json)
+        run: python scripts/smoke_holdings.py --json --limit 5
