@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+"""Telegram command handlers that return plain text responses."""
+
 import os
 import time
 from datetime import datetime, timezone
