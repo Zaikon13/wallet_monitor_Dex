@@ -19,39 +19,50 @@ jobs:
         uses: actions/setup-python@v5
         with: { python-version: "3.12" }
 
-      - name: Dedent inline
+      - name: Dedent inline (with logs)
         id: dedent
         run: |
           python - <<'PY'
-          import pathlib, textwrap, sys, json, os
+          import pathlib, textwrap, json, sys
           ROOT = pathlib.Path('.').resolve()
           IGN = {".git",".github","__pycache__","venv",".venv","node_modules","dist","build",".mypy_cache",".pytest_cache"}
-          def files():
+          def py_files():
               for p in ROOT.rglob("*.py"):
-                  if any(part in IGN for part in p.parts): 
+                  if any(part in IGN for part in p.parts):
                       continue
                   yield p
-          def needs_dedent(s, sample=50):
-              # Αν τα περισσότερα από τα πρώτα 'sample' μη-κενά lines ξεκινούν με space/tab, θεωρούμε ότι χρειάζεται dedent
-              nz = [ln for ln in s.splitlines() if ln.strip()]
-              head = nz[:sample] if nz else []
-              if not head:
-                  return False
-              num_ind = sum(1 for ln in head if ln[:1] in (" ", "\t"))
-              return num_ind >= max(1, int(0.8 * len(head)))  # 80% heuristic
+
+          def needs_dedent(s, head=80):
+              # Αν το 1ο μη-κενό line είναι indented, ή αν >=70% των πρώτων μη-κενών είναι indented
+              lines = [ln for ln in s.splitlines() if ln.strip()]
+              if not lines: return False
+              first = lines[0][:1] in (" ","\t")
+              sample = lines[:head]
+              ratio = (sum(1 for ln in sample if ln[:1] in (" ","\t")) / max(1, len(sample)))
+              return first or ratio >= 0.70
+
           changed = []
-          for p in files():
+          for p in py_files():
               s = p.read_text(encoding="utf-8")
               if needs_dedent(s):
                   d = textwrap.dedent(s)
                   if d != s:
                       p.write_text(d, encoding="utf-8")
                       changed.append(str(p))
-          print(f"Dedented {len(changed)} file(s).")
-          # Εκτύπωσε λίστα για downstream steps
-          print("::set-output name=changed_count::%d" % len(changed))
-          print("::set-output name=changed_list::%s" % json.dumps(changed))
+
+          print(f"[dedent] changed files: {len(changed)}")
+          for c in changed[:50]:
+              print(f"  - {c}")
+          # outputs (new way)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"changed_count={len(changed)}\n")
+              fh.write(f"changed_list={json.dumps(changed)}\n")
           PY
+
+      - name: Show git status (debug)
+        run: |
+          git status --porcelain
+          git diff --name-only
 
       - name: Fail if non-Python files changed
         run: |
@@ -78,8 +89,8 @@ jobs:
           commit-message: "fix: dedent python files with accidental global indentation"
           body: |
             Automated dedent across Python files.
-            - Removes accidental leading indentation detected on first non-empty lines (≈80% of head lines indented).
-            - No functional changes intended beyond syntax unblocking.
+            - Detects first non-empty line or ≥70% of head lines indented.
+            - Adds logs of changed files.
             - Includes a compile check to ensure imports succeed.
 
             **Checklist**
