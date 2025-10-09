@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Daily Markdown report builder with resilient fallbacks."""
 
 from decimal import Decimal, InvalidOperation
