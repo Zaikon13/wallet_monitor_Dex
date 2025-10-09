@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-"""Telegram command handlers that return plain text responses."""
+"""Telegram command handlers that return plain text responses.
+
+Includes back-compat shims for older names (holdings_snapshot, holdings_text)
+that now route through the modular API:
+- core.holdings.get_wallet_snapshot
+- telegram.formatters.format_holdings
+"""
 
 import os
 import time
@@ -8,13 +14,47 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.holdings import holdings_snapshot, holdings_text
+# --- Back-compat shims PRELUDE (must be before the rest to avoid import cycles) ---
+try:
+    # New modular API
+    from core.holdings import get_wallet_snapshot  # canonical snapshot getter
+    from telegram.formatters import format_holdings  # canonical formatter
+except Exception as _e:
+    # Defer error until call-time (so test discovery doesn't crash)
+    get_wallet_snapshot = None  # type: ignore[assignment]
+    format_holdings = None      # type: ignore[assignment]
+    _shim_import_error = _e
+else:
+    _shim_import_error = None
+
+
+def holdings_snapshot() -> Dict[str, Dict[str, Any]]:  # back-compat shim
+    """
+    Old API name: returns the current wallet snapshot using the new modular API.
+    """
+    if _shim_import_error is not None:
+        raise _shim_import_error
+    return get_wallet_snapshot()  # type: ignore[misc]
+
+
+def holdings_text() -> str:  # back-compat shim
+    """
+    Old API name: returns formatted holdings text using the modular flow.
+    """
+    if _shim_import_error is not None:
+        raise _shim_import_error
+    snap = get_wallet_snapshot()  # type: ignore[misc]
+    return format_holdings(snap)  # type: ignore[misc]
+# -------------------------------------------------------------------------------
+
 from core.runtime_state import get_state
 from core.tz import ymd
 from reports.aggregates import aggregate_per_asset, totals as totals_aggregated
 from reports.day_report import build_day_report_text
 from reports.ledger import iter_all_entries, read_ledger
 from reports.weekly import build_weekly_report_text
+
+# Preferred live snapshot adapter + optional pretty formatter
 from core.holdings_adapters import build_holdings_snapshot
 try:
     from telegram.formatters import format_holdings as _format_holdings  # preferred
@@ -86,6 +126,7 @@ def _asset_usd(snapshot: Dict[str, Dict[str, Any]], symbol: str) -> Decimal:
 def _ordered_assets(snapshot: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Decimal]]:
     symbols = list(snapshot.keys())
     ordered: List[Tuple[str, Decimal]] = []
+    # keep CRO and tCRO visible first as per project rules
     for special in ("CRO", "tCRO"):
         if special in symbols:
             ordered.append((special, _asset_usd(snapshot, special)))
@@ -159,7 +200,7 @@ def daily() -> str:
 
 def show(limit: int = 5) -> str:
     try:
-        snapshot = holdings_snapshot()
+        snapshot = holdings_snapshot()  # uses shim → get_wallet_snapshot()
     except Exception:
         snapshot = {}
     if not snapshot:
@@ -248,24 +289,24 @@ def pnl(symbol: Optional[str] = None) -> str:
     except Exception:
         return "PnL unavailable."
 
-    totals: Dict[str, Decimal] = {
+    totals_map: Dict[str, Decimal] = {
         "in": Decimal("0"),
         "out": Decimal("0"),
         "net": Decimal("0"),
         "realized": Decimal("0"),
     }
     for entry in ledger:
-        totals["in"] += _to_decimal(entry.get("in_usd"))
-        totals["out"] += _to_decimal(entry.get("out_usd"))
-        totals["net"] += _to_decimal(entry.get("net_usd"))
-        totals["realized"] += _to_decimal(entry.get("realized_usd"))
+        totals_map["in"] += _to_decimal(entry.get("in_usd"))
+        totals_map["out"] += _to_decimal(entry.get("out_usd"))
+        totals_map["net"] += _to_decimal(entry.get("net_usd"))
+        totals_map["realized"] += _to_decimal(entry.get("realized_usd"))
 
     return (
         "PnL — IN {in_usd} / OUT {out_usd} / NET {net_usd} / Realized {realized}".format(
-            in_usd=_fmt_money(totals["in"]),
-            out_usd=_fmt_money(totals["out"]),
-            net_usd=_fmt_money(totals["net"]),
-            realized=_fmt_money(totals["realized"]),
+            in_usd=_fmt_money(totals_map["in"]),
+            out_usd=_fmt_money(totals_map["out"]),
+            net_usd=_fmt_money(totals_map["net"]),
+            realized=_fmt_money(totals_map["realized"]),
         )
     )
 
