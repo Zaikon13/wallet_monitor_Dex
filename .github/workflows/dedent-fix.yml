@@ -23,7 +23,7 @@ jobs:
         id: dedent
         run: |
           python - <<'PY'
-          import pathlib, textwrap, json, sys
+          import pathlib, textwrap, json, sys, os   # 👈 προστέθηκε os
           ROOT = pathlib.Path('.').resolve()
           IGN = {".git",".github","__pycache__","venv",".venv","node_modules","dist","build",".mypy_cache",".pytest_cache"}
           def py_files():
@@ -33,9 +33,9 @@ jobs:
                   yield p
 
           def needs_dedent(s, head=80):
-              # Αν το 1ο μη-κενό line είναι indented, ή αν >=70% των πρώτων μη-κενών είναι indented
               lines = [ln for ln in s.splitlines() if ln.strip()]
-              if not lines: return False
+              if not lines: 
+                  return False
               first = lines[0][:1] in (" ","\t")
               sample = lines[:head]
               ratio = (sum(1 for ln in sample if ln[:1] in (" ","\t")) / max(1, len(sample)))
@@ -53,8 +53,9 @@ jobs:
           print(f"[dedent] changed files: {len(changed)}")
           for c in changed[:50]:
               print(f"  - {c}")
-          # outputs (new way)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+
+          # outputs (νέα μέθοδος)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"changed_count={len(changed)}\n")
               fh.write(f"changed_list={json.dumps(changed)}\n")
           PY
