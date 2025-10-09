@@ -73,11 +73,24 @@ jobs:
             exit 1
           fi
 
-      - name: Compile all Python files (sanity)
+      - name: Compile tracked Python files (sanity)
         run: |
           python - <<'PY'
-          import compileall, sys
-          ok = compileall.compile_dir('.', quiet=1, force=False)
+          import subprocess, sys, py_compile
+          # Πάρε μόνο τα tracked *.py από το repo (όχι .git/)
+          files = subprocess.check_output(
+              ["git", "ls-files", "*.py"], text=True
+          ).splitlines()
+
+          ok = True
+          for f in files:
+              try:
+                  py_compile.compile(f, doraise=True)
+              except Exception as e:
+                  print(f"[py_compile] FAIL: {f} -> {e}")
+                  ok = False
+
+          print(f"[py_compile] Checked {len(files)} tracked .py files")
           sys.exit(0 if ok else 1)
           PY
 
