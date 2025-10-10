@@ -2,19 +2,13 @@
 from __future__ import annotations
 import os
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
 
-# Χρησιμοποιούμε ΤΑ ΚΑΝΟΝΙΚΑ modules σου
-from core.holdings import get_wallet_snapshot, format_snapshot_lines  # <- δικά σου
-
-# Προαιρετικά χρησιμοποιούμε το δικό σου helper αν υπάρχει chat_id-less send
-try:
-    from telegram.api import send_telegram as _repo_send  # sends to TELEGRAM_CHAT_ID (broadcast)
-except Exception:
-    _repo_send = None  # fallback σε direct HTTP προς Telegram με chat_id
+# ΜΟΝΟ αυτό υπάρχει σίγουρα στο repo σου:
+from core.holdings import get_wallet_snapshot  # <- δικό σου (επιστρέφει dict)  # :contentReference[oaicite:0]{index=0}
 
 app = FastAPI(title="Cronos DeFi Sentinel — Telegram Webhook (prod)")
 
@@ -23,7 +17,6 @@ if not TELEGRAM_BOT_TOKEN:
     logging.warning("Missing TELEGRAM_BOT_TOKEN env — fallback sender will not work.")
 
 def _fallback_send_message(text: str, chat_id: Optional[int]) -> None:
-    """Απευθείας sendMessage με chat_id όταν δεν καλεί ο repo helper."""
     if not chat_id:
         logging.warning("No chat_id provided to fallback sender; dropping message.")
         return
@@ -42,21 +35,60 @@ def _fallback_send_message(text: str, chat_id: Optional[int]) -> None:
         logging.exception("Telegram sendMessage exception")
 
 def send_message(text: str, chat_id: Optional[int]) -> None:
-    """
-    Ενιαίο API: Αν υπάρχει repo helper (broadcast στο TELEGRAM_CHAT_ID) τον χρησιμοποιούμε,
-    αλλιώς στέλνουμε απευθείας στο chat_id του αιτήματος.
-    """
-    if _repo_send:
-        try:
-            _repo_send(text)  # broadcast
-            return
-        except Exception:
-            logging.exception("telegram.api.send_telegram failed; using fallback…")
+    # Δεν βασιζόμαστε σε telegram.api helper (στο repo είναι κενό)  # :contentReference[oaicite:1]{index=1}
     _fallback_send_message(text, chat_id)
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "wallet_monitor_Dex", "status": "running"}
+
+def _fmt_money(x: str) -> str:
+    try:
+        # κρατάμε 2 δεκαδικά για USD, βγάζουμε τυχόν επιστημονική μορφή
+        from decimal import Decimal
+        d = Decimal(str(x))
+        return f"{d.quantize(Decimal('0.01')):,}"
+    except Exception:
+        return str(x)
+
+def _fmt_price(x: str) -> str:
+    try:
+        from decimal import Decimal
+        d = Decimal(str(x))
+        # μέχρι 8 δεκαδικά για price
+        q = d.quantize(Decimal("0.00000001"))
+        return f"{q:,}"
+    except Exception:
+        return str(x)
+
+def _format_holdings_text(snapshot: Dict[str, Any]) -> str:
+    assets: List[Dict[str, Any]] = snapshot.get("assets", []) or []
+    totals: Dict[str, Any] = snapshot.get("totals", {}) or {}
+    if not assets:
+        return "📦 Holdings\n— Δεν βρέθηκαν assets."
+
+    lines = ["📦 Holdings"]
+    for a in assets:
+        sym = a.get("symbol", "?")
+        amt = a.get("amount", "0")
+        px = a.get("price_usd", "0")
+        val = a.get("value_usd", "0")
+        # amount όπως είναι (το core/holdings επιστρέφει stringified Decimal)  # :contentReference[oaicite:2]{index=2}
+        lines.append(f"• {sym}: {amt}  @ ${_fmt_price(px)}  (= ${_fmt_money(val)})")
+
+    if totals:
+        tv = _fmt_money(totals.get("value_usd", "0"))
+        tc = _fmt_money(totals.get("cost_usd", "0"))
+        tu = _fmt_money(totals.get("u_pnl_usd", "0"))
+        tp = totals.get("u_pnl_pct", "0")
+        try:
+            from decimal import Decimal
+            tp = str(Decimal(str(tp)).quantize(Decimal('0.01')))
+        except Exception:
+            tp = str(tp)
+        lines.append("")
+        lines.append(f"Σύνολα:  V=${tv} | C=${tc} | uPnL=${tu} ({tp}%)")
+    return "\n".join(lines)
 
 def _handle_start() -> str:
     return (
@@ -74,16 +106,12 @@ def _handle_help() -> str:
     )
 
 def _handle_holdings() -> str:
-    """
-    Χτίζει snapshot με τα ΚΑΝΟΝΙΚΑ modules σου (RPC, pricing, etherscan-like),
-    και το φορμάρει με format_snapshot_lines() από core/holdings.py.
-    """
     try:
-        snap = get_wallet_snapshot()
-        return "📦 Holdings\n" + format_snapshot_lines(snap)
+        snap = get_wallet_snapshot()  # φέρνει balances, prices, totals από τα ΚΑΝΟΝΙΚΑ modules  # :contentReference[oaicite:3]{index=3}
+        return _format_holdings_text(snap)
     except Exception as e:
         logging.exception("Failed to build /holdings: %s", e)
-        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings (check logs)."
+        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings (δες logs)."
 
 def _dispatch_command(text: str) -> str:
     cmd = (text or "").strip().split()[0].lower()
