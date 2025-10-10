@@ -1,9 +1,11 @@
 # app.py
 # FastAPI entrypoint για το Cronos DeFi Sentinel bot (Telegram webhook + commands)
 from __future__ import annotations
+
 import os
 import logging
 from typing import Optional
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -38,14 +40,14 @@ def _fallback_send_message(text: str, chat_id: Optional[int] = None):
     3) raw HTTP fallback στο Bot API (αν αποτύχουν τα παραπάνω)
     """
     try:
-        # 1) Προτιμώμενο: send_telegram_message(text, chat_id) (χωρίς keyword args)
+        # 1) send_telegram_message(text, chat_id) (χωρίς keyword args)
         if hasattr(tg_api, "send_telegram_message"):
             return tg_api.send_telegram_message(text, chat_id)
-        # 2) Εναλλακτικό: send_telegram(text, chat_id)
+        # 2) send_telegram(text, chat_id)
         if hasattr(tg_api, "send_telegram"):
             return tg_api.send_telegram(text, chat_id)
     except TypeError:
-        # Αν το module δέχεται μόνο text (χωρίς chat_id), ξαναδοκίμασε χωρίς δεύτερο arg
+        # module δέχεται μόνο text (χωρίς chat_id)
         try:
             if hasattr(tg_api, "send_telegram_message"):
                 return tg_api.send_telegram_message(text)
@@ -92,6 +94,49 @@ def send_message(text: str, chat_id: Optional[int] = None) -> None:
     _send_long_text(text, chat_id)
 
 # --------------------------------------------------
+# Snapshot normalization helpers (για formatters)
+# --------------------------------------------------
+from decimal import Decimal, InvalidOperation
+
+def _to_dec(x):
+    if isinstance(x, Decimal):
+        return x
+    try:
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError, TypeError):
+        return x
+
+def _asset_as_dict(a):
+    # Αν είναι ήδη dict, απλώς επέστρεψέ το
+    if isinstance(a, dict):
+        return a
+    # Αν είναι list/tuple, χαρτογράφησέ το σε κλασική μορφή
+    if isinstance(a, (list, tuple)):
+        # Συνηθισμένη σειρά: symbol, amount, price_usd, value_usd
+        fields = ["symbol", "amount", "price_usd", "value_usd"]
+        d = {}
+        for i, v in enumerate(a):
+            key = fields[i] if i < len(fields) else f"extra_{i}"
+            d[key] = v
+        return d
+    # Οτιδήποτε άλλο: τουλάχιστον δώσε symbol
+    return {"symbol": str(a)}
+
+def _normalize_snapshot_for_formatter(snap: dict) -> dict:
+    out = dict(snap or {})
+    assets = out.get("assets") or []
+    out["assets"] = [_asset_as_dict(x) for x in assets]
+    # Τυποποίηση σε Decimal όπου είναι εφικτό
+    for a in out["assets"]:
+        if "amount" in a:
+            a["amount"] = _to_dec(a["amount"])
+        if "price_usd" in a:
+            a["price_usd"] = _to_dec(a["price_usd"])
+        if "value_usd" in a:
+            a["value_usd"] = _to_dec(a["value_usd"])
+    return out
+
+# --------------------------------------------------
 # Command Handlers
 # --------------------------------------------------
 def _handle_start() -> str:
@@ -136,6 +181,7 @@ def _handle_holdings(wallet_address: str) -> str:
     try:
         snap = get_wallet_snapshot(wallet_address)
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
+        snap = _normalize_snapshot_for_formatter(snap)  # <<— ΝΕΟ: νορμαλοποίηση για formatters
         return format_holdings(snap)
     except Exception as e:
         logging.exception("Failed to build /holdings")
