@@ -1,10 +1,18 @@
-# core/augment.py — merge base snapshot with discovered tokens (non-invasive)
+# core/augment.py — merge base snapshot with discovered tokens (non-invasive, Decimal-safe)
 from __future__ import annotations
-from decimal import Decimal
-from typing import Dict, Any, List, Set
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Any, List, Set, Optional
 
 from core.discovery import discover_tokens_for_wallet
 from core.pricing import get_spot_usd
+
+def _to_dec(x: Any) -> Optional[Decimal]:
+    if isinstance(x, Decimal):
+        return x
+    try:
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
 def _index_existing_symbols(snapshot: Dict[str, Any]) -> Set[str]:
     existing: Set[str] = set()
@@ -22,35 +30,31 @@ def augment_with_discovered_tokens(snapshot: Dict[str, Any], wallet_address: str
     if not wallet_address:
         return snapshot
 
-    assets: List[Dict[str, Any]] = list(snapshot.get("assets", []) or [])
+    base_assets: List[Dict[str, Any]] = list(snapshot.get("assets", []) or [])
+    assets: List[Dict[str, Any]] = list(base_assets)
     existing_syms = _index_existing_symbols(snapshot)
 
     discovered = discover_tokens_for_wallet(wallet_address)
     added_any = False
 
     for t in discovered:
-        sym = str(t.get("symbol", "")).upper() or t.get("address", "")[:6]
+        sym = str(t.get("symbol", "")).upper() or (t.get("address", "")[:6]).upper()
         if sym in existing_syms:
             continue  # skip duplicates
-        amt = t.get("amount")
-        if amt is None:
-            continue
-        try:
-            dec_amt = Decimal(str(amt))
-        except Exception:
-            continue
-        if dec_amt <= 0:
+        amt_dec = _to_dec(t.get("amount"))
+        if amt_dec is None or amt_dec <= 0:
             continue
 
         addr = t.get("address")
-        price = get_spot_usd(sym, token_address=addr)
-        val = price * dec_amt if price is not None else Decimal("0")
+        price = get_spot_usd(sym, token_address=addr)  # μπορεί να είναι None
+        price_dec = _to_dec(price) or Decimal("0")
+        val_dec = (amt_dec * price_dec) if price_dec is not None else Decimal("0")
 
         assets.append({
             "symbol": sym,
-            "amount": dec_amt,
-            "price_usd": price or Decimal("0"),
-            "value_usd": val,
+            "amount": amt_dec,           # Decimal
+            "price_usd": price_dec,      # Decimal
+            "value_usd": val_dec,        # Decimal
             "address": addr,
             "decimals": t.get("decimals"),
         })
@@ -60,8 +64,13 @@ def augment_with_discovered_tokens(snapshot: Dict[str, Any], wallet_address: str
     if not added_any:
         return snapshot
 
-    # Recompute simple totals (value only; cost/uPnL keep from base if exist)
-    total_value = sum((a.get("value_usd") or 0) for a in assets)
+    # Recompute simple totals (value only; cost/uPnL κρατάμε/συγχωνεύουμε προσεκτικά)
+    # Μαζεύουμε ΟΛΕΣ τις τιμές (ακόμα κι από base assets) ως Decimal
+    total_value = Decimal("0")
+    for a in assets:
+        v = _to_dec(a.get("value_usd")) or Decimal("0")
+        total_value += v
+
     totals = dict(snapshot.get("totals") or {})
     totals["value_usd"] = total_value
 
