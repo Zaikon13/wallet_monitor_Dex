@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 
 from core.holdings import get_wallet_snapshot          # base snapshot (balances/prices/totals if διαθέσιμα)
 from core.augment import augment_with_discovered_tokens # merge με discovery χωρίς να αλλάξουμε holdings.py
+from core.discovery import discover_tokens_for_wallet
 
 app = FastAPI(title="Cronos DeFi Sentinel — Telegram Webhook (prod)")
 
@@ -145,7 +146,26 @@ def _dispatch_command(text: str) -> str:
         return _handle_help()
     if cmd == "/holdings":
         return _handle_holdings()
+    if cmd == "/scan":
+        return _handle_scan(WALLET_ADDRESS)
     return "🤖 Δεν αναγνωρίζω την εντολή. Δοκίμασε /help."
+
+def _handle_scan(wallet_address: str) -> str:
+    if not wallet_address:
+        return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
+    try:
+        toks = discover_tokens_for_wallet(wallet_address)
+        if not toks:
+            return "🔍 Δεν βρέθηκαν ERC-20 tokens με θετικό balance (ή δεν βρέθηκαν μεταφορές στο lookback)."
+        lines = ["🔍 Discovery results:"]
+        for t in toks:
+            sym = t.get("symbol","?"); addr = t.get("address","?"); amt = t.get("amount","0")
+            dec = t.get("decimals","?")
+            lines.append(f"• {sym}  ({addr})  amount={amt}  decimals={dec}")
+        return "\n".join(lines)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return f"⚠️ Σφάλμα στο discovery: {e}"
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
