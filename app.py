@@ -1,117 +1,63 @@
-# app.py — FastAPI Telegram webhook (prod) with MTM formatting + discovery merge
+# app.py
+# FastAPI entrypoint για το Cronos DeFi Sentinel bot (Telegram webhook + commands)
 from __future__ import annotations
 import os
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-import requests
-from fastapi import FastAPI, Request, HTTPException
-from decimal import Decimal, InvalidOperation
-
-from core.holdings import get_wallet_snapshot          # base snapshot (balances/prices/totals if διαθέσιμα)
-from core.augment import augment_with_discovered_tokens # merge με discovery χωρίς να αλλάξουμε holdings.py
+from telegram import api as tg_api
+from telegram.formatters import format_holdings
+from core.holdings import get_wallet_snapshot
+from core.augment import augment_with_discovered_tokens
 from core.discovery import discover_tokens_for_wallet
 
-app = FastAPI(title="Cronos DeFi Sentinel — Telegram Webhook (prod)")
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0")) or None
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+APP_URL = os.getenv("APP_URL")  # optional if needed for webhook set
+EOD_TIME = os.getenv("EOD_TIME", "23:59")
 
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-WALLET_ADDRESS     = (os.getenv("WALLET_ADDRESS") or "").strip()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
 
-if not TELEGRAM_BOT_TOKEN:
-    logging.warning("Missing TELEGRAM_BOT_TOKEN env — Telegram replies will not work.")
-if not WALLET_ADDRESS:
-    logging.warning("Missing WALLET_ADDRESS env — discovery merge will be disabled.")
+app = FastAPI(title="Cronos DeFi Sentinel", version="1.0")
 
-def _fallback_send_message(text: str, chat_id: Optional[int]) -> None:
-    if not chat_id:
-        logging.warning("No chat_id provided to fallback sender; dropping message.")
-        return
-    if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN missing; cannot send Telegram message.")
-        return
+# --------------------------------------------------
+# Helper: Safe Telegram message splitter
+# --------------------------------------------------
+def _fallback_send_message(text: str, chat_id: Optional[int] = None):
+    """Basic fallback using telegram.api.send_telegram_message"""
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15,
-        )
-        if r.status_code >= 400:
-            logging.error("Telegram sendMessage failed: %s %s", r.status_code, r.text)
-    except Exception:
-        logging.exception("Telegram sendMessage exception")
+        tg_api.send_telegram_message(text, chat_id=chat_id)
+    except Exception as e:
+        logging.exception(f"Telegram sendMessage failed: {e}")
 
-def send_message(text: str, chat_id: Optional[int]) -> None:
-    _fallback_send_message(text, chat_id)
+def _send_long_text(text: str, chat_id: Optional[int], chunk: int = 3500) -> None:
+    """Split μεγάλα μηνύματα (~>4096 chars) σε κομμάτια και τα στέλνει διαδοχικά."""
+    if not text:
+        return
+    t = text
+    while len(t) > chunk:
+        cut = t.rfind("\n", 0, chunk)
+        if cut == -1:
+            cut = chunk
+        part = t[:cut]
+        _fallback_send_message(part, chat_id)
+        t = t[cut:]
+    _fallback_send_message(t, chat_id)
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "service": "wallet_monitor_Dex", "status": "running"}
+def send_message(text: str, chat_id: Optional[int] = None) -> None:
+    """Main send wrapper: ασφαλές split μεγάλων μηνυμάτων"""
+    _send_long_text(text, chat_id)
 
-# ---------- formatting helpers ----------
-def _to_dec(x: Any) -> Optional[Decimal]:
-    if isinstance(x, Decimal):
-        return x
-    try:
-        return Decimal(str(x))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-
-def _fmt_amt(x: Any, places: int = 4) -> str:
-    d = _to_dec(x)
-    if d is None:
-        return str(x)
-    q = d.quantize(Decimal("1." + "0"*places)) if places > 0 else d.quantize(Decimal("1"))
-    return f"{q:,}"
-
-def _fmt_price(x: Any) -> str:
-    d = _to_dec(x)
-    if d is None:
-        return str(x)
-    q = d.quantize(Decimal("0.000001"))
-    return f"{q:,}"
-
-def _fmt_money(x: Any) -> str:
-    d = _to_dec(x)
-    if d is None:
-        return str(x)
-    q = d.quantize(Decimal("0.01"))
-    return f"{q:,}"
-
-def _format_holdings_text(snapshot: Dict[str, Any]) -> str:
-    assets: List[Dict[str, Any]] = snapshot.get("assets", []) or []
-    totals: Dict[str, Any] = snapshot.get("totals", {}) or {}
-
-    lines = ["💼 Wallet Assets (MTM)"]
-    if not assets:
-        lines.append("— Δεν βρέθηκαν assets.")
-    else:
-        for a in assets:
-            sym = a.get("symbol", "?")
-            amt = a.get("amount", "0")
-            px  = a.get("price_usd", None)
-            val = a.get("value_usd", None)
-            lines.append(f"• {sym}: {_fmt_amt(amt, 4)} @ ${_fmt_price(px or 0)} = ${_fmt_money(val or 0)}")
-
-    lines.append("")
-    tv = totals.get("value_usd")
-    tc = totals.get("cost_usd")
-    tu = totals.get("u_pnl_usd")
-    tp = totals.get("u_pnl_pct")
-
-    lines.append(f"Σύνολο: ${_fmt_money(tv) if tv is not None else '—'}")
-    if tu is not None:
-        tp_txt = f"{_fmt_amt(tp, 2)}%" if tp is not None else "—"
-        lines.append(f"Unrealized PnL (open): ${_fmt_money(tu)} ({tp_txt})")
-    else:
-        lines.append("Unrealized PnL (open): —")
-
-    if assets:
-        lines.append("\nQuantities snapshot (runtime):")
-        for a in sorted(assets, key=lambda x: x.get("symbol", "")):
-            lines.append(f"  – {a.get('symbol','?')}: {_fmt_amt(a.get('amount','0'), 4)}")
-    return "\n".join(lines)
-
-# ---------- commands ----------
+# --------------------------------------------------
+# Command Handlers
+# --------------------------------------------------
 def _handle_start() -> str:
     return (
         "👋 Γεια σου! Είμαι το Cronos DeFi Sentinel.\n\n"
@@ -124,33 +70,20 @@ def _handle_help() -> str:
     return (
         "ℹ️ Βοήθεια\n"
         "• /holdings — δείχνει τρέχον snapshot\n"
-        "• /start — βασικές οδηγίες\n"
+        "• /start — βασικές οδηγίες"
     )
 
-def _handle_holdings() -> str:
-    try:
-        snap = get_wallet_snapshot()
-        # Προαιρετικό merge με auto-discovery (αν έχουμε WALLET_ADDRESS)
-        if WALLET_ADDRESS:
-            snap = augment_with_discovered_tokens(snap, wallet_address=WALLET_ADDRESS)
-        return _format_holdings_text(snap)
-    except Exception as e:
-        logging.exception("Failed to build /holdings: %s", e)
-        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings (δες logs)."
-
-def _dispatch_command(text: str) -> str:
-    cmd = (text or "").strip().split()[0].lower()
-    if cmd == "/start":
-        return _handle_start()
-    if cmd == "/help":
-        return _handle_help()
-    if cmd == "/holdings":
-        return _handle_holdings()
-    if cmd == "/scan":
-        return _handle_scan(WALLET_ADDRESS)
-    if cmd == "/rescan":
-        return _handle_rescan(WALLET_ADDRESS)
-    return "🤖 Δεν αναγνωρίζω την εντολή. Δοκίμασε /help."
+def _handle_scan(wallet_address: str) -> str:
+    toks = discover_tokens_for_wallet(wallet_address)
+    if not toks:
+        return "🔍 Δεν βρέθηκαν ERC-20 tokens με θετικό balance (ή δεν βρέθηκαν μεταφορές στο lookback)."
+    lines = ["🔍 Εντοπίστηκαν tokens:"]
+    for t in toks:
+        sym = t.get("symbol", "?")
+        amt = t.get("amount", "0")
+        addr = t.get("address", "")
+        lines.append(f"• {sym}: {amt} ({addr})")
+    return "\n".join(lines)
 
 def _handle_rescan(wallet_address: str) -> str:
     if not wallet_address:
@@ -162,43 +95,68 @@ def _handle_rescan(wallet_address: str) -> str:
     for t in toks:
         lines.append(f"• {t.get('symbol','?')} ({t.get('address','?')}), amount={t.get('amount','0')}")
     return "\n".join(lines)
-    
-def _handle_scan(wallet_address: str) -> str:
-    if not wallet_address:
-        return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
-    try:
-        toks = discover_tokens_for_wallet(wallet_address)
-        if not toks:
-            return "🔍 Δεν βρέθηκαν ERC-20 tokens με θετικό balance (ή δεν βρέθηκαν μεταφορές στο lookback)."
-        lines = ["🔍 Discovery results:"]
-        for t in toks:
-            sym = t.get("symbol","?"); addr = t.get("address","?"); amt = t.get("amount","0")
-            dec = t.get("decimals","?")
-            lines.append(f"• {sym}  ({addr})  amount={amt}  decimals={dec}")
-        return "\n".join(lines)
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return f"⚠️ Σφάλμα στο discovery: {e}"
 
+def _handle_holdings(wallet_address: str) -> str:
+    try:
+        snap = get_wallet_snapshot(wallet_address)
+        snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
+        return format_holdings(snap)
+    except Exception as e:
+        logging.exception("Failed to build /holdings")
+        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
+
+# --------------------------------------------------
+# Command dispatcher
+# --------------------------------------------------
+def _dispatch_command(text: str) -> str:
+    if not text:
+        return ""
+    cmd = text.strip().split()[0].lower()
+    if cmd == "/start":
+        return _handle_start()
+    if cmd == "/help":
+        return _handle_help()
+    if cmd == "/scan":
+        return _handle_scan(WALLET_ADDRESS)
+    if cmd == "/rescan":
+        return _handle_rescan(WALLET_ADDRESS)
+    if cmd == "/holdings":
+        return _handle_holdings(WALLET_ADDRESS)
+    return "❓ Άγνωστη εντολή. Δοκίμασε /help."
+
+# --------------------------------------------------
+# Webhook Endpoint (Telegram)
+# --------------------------------------------------
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
     try:
         update = await request.json()
+        message = update.get("message") or {}
+        text = message.get("text", "")
+        chat = message.get("chat", {})
+        chat_id = chat.get("id", CHAT_ID)
+
+        if text:
+            reply = _dispatch_command(text)
+            send_message(reply, chat_id)
+    except Exception as e:
+        logging.exception("Error handling Telegram webhook")
+    return JSONResponse(content={"ok": True})
+
+# --------------------------------------------------
+# Health endpoint
+# --------------------------------------------------
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse(content={"ok": True, "service": "wallet_monitor_Dex", "status": "running"})
+
+# --------------------------------------------------
+# Startup
+# --------------------------------------------------
+@app.on_event("startup")
+async def on_startup():
+    logging.info("✅ Cronos DeFi Sentinel started and is online.")
+    try:
+        send_message("✅ Cronos DeFi Sentinel started and is online.", CHAT_ID)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return {"ok": True}
-
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    text: Optional[str] = message.get("text")
-
-    if not text:
-        send_message("Μπορώ να απαντώ σε text commands. Δοκίμασε /help 🙂", chat_id)
-        return {"ok": True}
-
-    reply = _dispatch_command(text)
-    send_message(reply, chat_id)
-    return {"ok": True}
+        pass
