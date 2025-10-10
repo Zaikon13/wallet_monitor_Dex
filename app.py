@@ -31,11 +31,47 @@ app = FastAPI(title="Cronos DeFi Sentinel", version="1.0")
 # Helper: Safe Telegram message splitter
 # --------------------------------------------------
 def _fallback_send_message(text: str, chat_id: Optional[int] = None):
-    """Basic fallback using telegram.api.send_telegram_message"""
+    """
+    Στείλε μήνυμα στο Telegram χρησιμοποιώντας:
+    1) telegram.api.send_telegram_message(text, chat_id)  (αν υπάρχει)
+    2) telegram.api.send_telegram(text, chat_id)          (εναλλακτικό όνομα)
+    3) raw HTTP fallback στο Bot API (αν αποτύχουν τα παραπάνω)
+    """
     try:
-        tg_api.send_telegram_message(text, chat_id=chat_id)
+        # 1) Προτιμώμενο: send_telegram_message(text, chat_id) (χωρίς keyword args)
+        if hasattr(tg_api, "send_telegram_message"):
+            return tg_api.send_telegram_message(text, chat_id)
+        # 2) Εναλλακτικό: send_telegram(text, chat_id)
+        if hasattr(tg_api, "send_telegram"):
+            return tg_api.send_telegram(text, chat_id)
+    except TypeError:
+        # Αν το module δέχεται μόνο text (χωρίς chat_id), ξαναδοκίμασε χωρίς δεύτερο arg
+        try:
+            if hasattr(tg_api, "send_telegram_message"):
+                return tg_api.send_telegram_message(text)
+            if hasattr(tg_api, "send_telegram"):
+                return tg_api.send_telegram(text)
+        except Exception:
+            pass
     except Exception as e:
-        logging.exception(f"Telegram sendMessage failed: {e}")
+        logging.exception(f"Telegram send via module failed: {e}")
+
+    # 3) Raw HTTP fallback
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token or not chat_id:
+        logging.error("No BOT_TOKEN or chat_id available for HTTP fallback.")
+        return
+    try:
+        import requests
+        r = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logging.error("Telegram HTTP fallback failed: %s %s", r.status_code, r.text)
+    except Exception as e:
+        logging.exception(f"Telegram HTTP fallback exception: {e}")
 
 def _send_long_text(text: str, chat_id: Optional[int], chunk: int = 3500) -> None:
     """Split μεγάλα μηνύματα (~>4096 chars) σε κομμάτια και τα στέλνει διαδοχικά."""
