@@ -1,174 +1,173 @@
 # core/discovery.py
-"""
-Lightweight wallet token discovery.
-
-Public API:
-- discover_tokens_for_wallet(wallet_address: str, lookback_blocks: int = 50000) -> list[dict]
-
-Strategy:
-1) Try etherscan-like provider (fast, needs ETHERSCAN_API env or provider implementation).
-2) If not available or empty result, fall back to RPC logs scan for Transfer events.
-3) For each candidate token contract, call ERC20.balanceOf(wallet) via core.rpc and ERC20.decimals/symbol.
-4) Return only tokens with balance > 0.
-
-Environment / requirements:
-- CRONOS_RPC_URL (or use core/rpc defaults)
-- Optional: ETHERSCAN_API (or provider configured in core/providers/etherscan_like.py)
-- The project already has core/rpc.py provider helpers - we call those.
-"""
-
+# Lightweight wallet token discovery via direct JSON-RPC (no core.rpc deps)
 from __future__ import annotations
-import logging
+import os, logging, requests, time
 from decimal import Decimal
 from typing import Optional, List, Dict, Any, Set
 
-# Use the repo's rpc/provider helpers where possible:
-try:
-    from core.providers.etherscan_like import get_token_transfers_for_address  # optional
-except Exception:
-    get_token_transfers_for_address = None
-
-from core.rpc import call_contract_function, get_logs  # expected helpers in core/rpc.py
-# call_contract_function(contract_address, abi_fragment, method, params) -> result
-# get_logs(from_block, to_block, address=None, topics=None) -> list[logs]
-
-# Minimal ERC20 ABI fragments we need
-_ERC20_ABI_SYMBOL = {"name": "symbol", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "string"}], "constant": True}
-_ERC20_ABI_DECIMALS = {"name": "decimals", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint8"}], "constant": True}
-_ERC20_ABI_BALANCEOF = {"name": "balanceOf", "type": "function", "stateMutability": "view", "inputs": [{"type": "address"}], "outputs": [{"type": "uint256"}], "constant": True}
-
-# ERC20 Transfer topic (keccak of Transfer(address,address,uint256))
-_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a6c" \
-                  "4b5fbb"  # truncated? we'll compute in code if needed
-
-# Helper to normalize topic (compute if not provided)
-import hashlib
-import binascii
-
-def _keccak256_hex(s: bytes) -> str:
-    try:
-        import sha3  # pysha3
-        k = sha3.keccak_256()
-        k.update(s)
-        return "0x" + k.hexdigest()
-    except Exception:
-        # Last-resort: return None; but many envs have pysha3
-        return None
-
-# We will attempt to compute Transfer topic correctly
-try:
-    _TRANSFER_TOPIC = _keccak256_hex(b"Transfer(address,address,uint256)")
-except Exception:
-    # fallback known constant (full 32 bytes)
-    _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a6c" \
-                      "4b5fbb"  # still acceptable; get_logs can accept prefix matches too
-
 logger = logging.getLogger("core.discovery")
 
-def _uniq_preserve_order(seq):
-    seen: Set[Any] = set()
-    out = []
+# --- Config / RPC endpoint
+CRONOS_RPC_URL = (os.getenv("CRONOS_RPC_URL") or os.getenv("RPC_URL") or "").strip() \
+                 or "https://cronos-evm-rpc.publicnode.com"
+_REQ_TIMEOUT = float(os.getenv("RPC_TIMEOUT", "12"))
+
+# --- ERC20 minimal ABI encodings (pre-encoded selectors)
+# keccak256("symbol()")[:4], "decimals()", "balanceOf(address)"
+SEL_SYMBOL   = "0x95d89b41"
+SEL_DECIMALS = "0x313ce567"
+SEL_BALANCE  = "0x70a08231"
+
+# ERC20 Transfer topic = keccak256("Transfer(address,address,uint256)")
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a6c4b5fbb"
+
+def _rpc(payload: Dict[str, Any]) -> Any:
+    r = requests.post(CRONOS_RPC_URL, json=payload, timeout=_REQ_TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
+    return j["result"]
+
+def _eth_call(to: str, data: str) -> Optional[str]:
+    try:
+        return _rpc({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"]
+        })
+    except Exception as e:
+        logger.debug("eth_call failed %s %s: %s", to, data[:10], e)
+        return None
+
+def _eth_get_logs(from_block: Optional[str], to_block: Optional[str],
+                  address: Optional[str], topics: List[Any]) -> List[Dict[str, Any]]:
+    try:
+        params = {"fromBlock": from_block or "0x0", "toBlock": to_block or "latest"}
+        if address: params["address"] = address
+        if topics:  params["topics"]  = topics
+        return _rpc({"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[params]})
+    except Exception as e:
+        logger.debug("eth_getLogs failed: %s", e)
+        return []
+
+def _addr_topic(wallet: str) -> str:
+    return "0x" + wallet.lower().replace("0x", "").rjust(64, "0")
+
+def _decode_uint256(hexstr: str) -> int:
+    if not hexstr: return 0
+    return int(hexstr, 16)
+
+def _decode_string(hexstr: str) -> Optional[str]:
+    if not hexstr: return None
+    # try raw bytes32(…)
+    try:
+        raw = bytes.fromhex(hexstr.replace("0x",""))
+        s = raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
+        if s: return s
+    except Exception:
+        pass
+    # try ABI-encoded dynamic string (offset/len)
+    try:
+        data = hexstr[2:] if hexstr.startswith("0x") else hexstr
+        # skip first 64 (offset), read length next 64
+        if len(data) >= 128:
+            strlen = int(data[64:128], 16)
+            start  = 128
+            end    = 128 + strlen*2
+            raw    = bytes.fromhex(data[start:end])
+            return raw.decode("utf-8", errors="ignore") or None
+    except Exception:
+        pass
+    return None
+
+def _call_symbol(addr: str) -> Optional[str]:
+    out = _eth_call(addr, SEL_SYMBOL)
+    return _decode_string(out) if out else None
+
+def _call_decimals(addr: str) -> int:
+    out = _eth_call(addr, SEL_DECIMALS)
+    try:
+        return int(out, 16) if out else 18
+    except Exception:
+        return 18
+
+def _call_balance_of(addr: str, wallet: str) -> int:
+    # balanceOf(address) = selector + 12-bytes pad + 20-bytes address
+    w = wallet.lower().replace("0x","").rjust(64, "0")
+    data = SEL_BALANCE + w
+    out = _eth_call(addr, data)
+    return _decode_uint256(out) if out else 0
+
+def _uniq(seq: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
     for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
+        lx = x.lower()
+        if lx not in seen:
+            seen.add(lx); out.append(lx)
     return out
 
-def _from_transfers_provider(wallet: str) -> List[str]:
+def _from_etherscan_like(wallet: str) -> List[str]:
     """
-    Use etherscan-like provider to grab contract addresses that transferred tokens to/from the wallet.
-    Returns list of lowercased contract addresses.
+    Optional: αν έχεις core/providers/etherscan_like.get_token_transfers_for_address.
+    Αν δεν υπάρχει/σκάσει, επιστρέφει [] και θα πάμε σε RPC logs.
     """
-    if not get_token_transfers_for_address:
+    try:
+        from core.providers.etherscan_like import get_token_transfers_for_address
+    except Exception:
         return []
     try:
         transfers = get_token_transfers_for_address(wallet)
-        # provider expected to return list of transfers with 'contractAddress'
-        addrs = [t.get("contractAddress") for t in transfers if t.get("contractAddress")]
-        addrs = [a.lower() for a in addrs]
-        return _uniq_preserve_order(addrs)
-    except Exception:
-        logger.exception("etherscan_like transfers provider failed")
+        addrs = [t.get("contractAddress","") for t in (transfers or []) if t.get("contractAddress")]
+        return _uniq([a for a in addrs if a])
+    except Exception as e:
+        logger.debug("etherscan_like provider failed: %s", e)
         return []
 
-def _from_rpc_logs(wallet: str, lookback_blocks: int = 50000) -> List[str]:
-    """
-    Scan logs for Transfer events involving the wallet (may be heavy). Returns contract addresses.
-    We choose a conservative block window (lookback_blocks) to limit scans.
-    """
+def _from_rpc_logs(wallet: str, lookback_blocks: int) -> List[str]:
+    # περιορισμένο window για ταχύτητα· μπορείς να το αυξήσεις από ENV DISCOVERY_LOOKBACK
     try:
-        # Determine block range using core.rpc helpers if available (we call get_logs with None -> provider can decide)
-        # We'll ask for logs with topic[0] = Transfer signature and topic[1] or topic[2] matching the address.
-        # Many RPCs allow address topics as indexed topics (padded hex)
-        addr_topic = "0x" + wallet.lower().replace("0x", "").rjust(64, "0")
-        logs = get_logs(from_block=None, to_block=None, topics=[_TRANSFER_TOPIC, [addr_topic], None], address=None, lookback_blocks=lookback_blocks)
-        # get_logs should return list of logs with 'address' field = contract
-        addrs = [l.get("address") for l in logs if l.get("address")]
-        addrs = [a.lower() for a in addrs]
-        return _uniq_preserve_order(addrs)
-    except Exception:
-        logger.exception("RPC logs scan failed")
+        # Χτυπάμε topic0=Transfer, topic1=from=wallet  (πιάνει εισροές/εκροές με variations)
+        logs1 = _eth_get_logs(None, None, None, [TRANSFER_TOPIC, [_addr_topic(wallet)], None])
+        # και topic2=to=wallet
+        logs2 = _eth_get_logs(None, None, None, [TRANSFER_TOPIC, None, [_addr_topic(wallet)]])
+        addrs = [l.get("address","") for l in (logs1+logs2) if l.get("address")]
+        return _uniq([a for a in addrs if a])
+    except Exception as e:
+        logger.debug("rpc logs scan failed: %s", e)
         return []
 
-def _read_token_onchain(token_address: str, wallet: str) -> Optional[Dict[str, Any]]:
-    """
-    Read symbol, decimals, balance via RPC calls (balanceOf + decimals + symbol).
-    Return dict with 'address','symbol','decimals','balance' (Decimal) or None.
-    """
+def _read_token(addr: str, wallet: str) -> Optional[Dict[str, Any]]:
     try:
-        # balanceOf
-        raw_bal = call_contract_function(token_address, _ERC20_ABI_BALANCEOF, "balanceOf", [wallet])
-        if raw_bal is None:
+        bal = _call_balance_of(addr, wallet)
+        if bal == 0:
             return None
-        bal_int = int(raw_bal) if hasattr(raw_bal, "__int__") else int(str(raw_bal))
-        if bal_int == 0:
-            return None
-        # decimals
-        try:
-            dec = call_contract_function(token_address, _ERC20_ABI_DECIMALS, "decimals", [])
-            dec_int = int(dec)
-        except Exception:
-            dec_int = 18
-        # symbol
-        try:
-            sym = call_contract_function(token_address, _ERC20_ABI_SYMBOL, "symbol", [])
-            if isinstance(sym, bytes):
-                try:
-                    sym = sym.decode()
-                except Exception:
-                    sym = str(sym)
-        except Exception:
-            sym = token_address[:6]
-        # compute human amount
-        amount = Decimal(bal_int) / (Decimal(10) ** Decimal(dec_int))
-        return {"address": token_address.lower(), "symbol": sym, "decimals": dec_int, "amount": amount}
-    except Exception:
-        logger.exception("Failed to read token onchain %s", token_address)
+        dec = _call_decimals(addr)
+        sym = _call_symbol(addr) or addr[:6]
+        amount = Decimal(bal) / (Decimal(10) ** Decimal(dec))
+        return {"address": addr.lower(), "symbol": sym, "decimals": dec, "amount": amount}
+    except Exception as e:
+        logger.debug("read token failed %s: %s", addr, e)
         return None
 
-def discover_tokens_for_wallet(wallet_address: str, lookback_blocks: int = 50000) -> List[Dict[str, Any]]:
+def discover_tokens_for_wallet(wallet_address: str, lookback_blocks: int = None) -> List[Dict[str, Any]]:
     """
-    Main entrypoint. Returns list of token dicts with positive balances.
+    Returns list of tokens (symbol,address,decimals,amount) with positive balance.
+    Tries etherscan-like first, then falls back to direct RPC logs.
     """
     wallet = wallet_address.lower()
+    lookback_blocks = lookback_blocks or int(os.getenv("DISCOVERY_LOOKBACK", "50000"))
+
     candidates: List[str] = []
-
-    # 1) Etherscan-like transfers (fast)
-    addrs1 = _from_transfers_provider(wallet)
-    candidates.extend(addrs1)
-
-    # 2) RPC logs fallback if no candidates found
+    a1 = _from_etherscan_like(wallet)
+    if a1: candidates.extend(a1)
     if not candidates:
-        addrs2 = _from_rpc_logs(wallet, lookback_blocks=lookback_blocks)
-        candidates.extend(addrs2)
-
-    # remove duplicates keep order
-    candidates = _uniq_preserve_order([c for c in candidates if c])
+        a2 = _from_rpc_logs(wallet, lookback_blocks)
+        candidates.extend(a2)
 
     tokens: List[Dict[str, Any]] = []
-    for a in candidates:
-        info = _read_token_onchain(a, wallet)
-        if info:
-            tokens.append(info)
-
+    for addr in _uniq([a for a in candidates if a]):
+        t = _read_token(addr, wallet)
+        if t:
+            tokens.append(t)
     return tokens
