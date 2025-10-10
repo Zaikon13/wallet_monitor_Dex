@@ -148,8 +148,21 @@ def _dispatch_command(text: str) -> str:
         return _handle_holdings()
     if cmd == "/scan":
         return _handle_scan(WALLET_ADDRESS)
+    if cmd == "/rescan":
+        return _handle_rescan(WALLET_ADDRESS)
     return "🤖 Δεν αναγνωρίζω την εντολή. Δοκίμασε /help."
 
+def _handle_rescan(wallet_address: str) -> str:
+    if not wallet_address:
+        return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
+    toks = discover_tokens_for_wallet(wallet_address)
+    if not toks:
+        return "🔁 Rescan ολοκληρώθηκε — δεν βρέθηκαν ERC-20 με θετικό balance."
+    lines = ["🔁 Rescan ολοκληρώθηκε — βρέθηκαν:"]
+    for t in toks:
+        lines.append(f"• {t.get('symbol','?')} ({t.get('address','?')}), amount={t.get('amount','0')}")
+    return "\n".join(lines)
+    
 def _handle_scan(wallet_address: str) -> str:
     if not wallet_address:
         return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
