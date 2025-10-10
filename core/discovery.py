@@ -1,8 +1,7 @@
 # core/discovery.py
-# Wallet token discovery via JSON-RPC with CHUNKED eth_getLogs.
-# Uses existing env names: LOG_SCAN_BLOCKS / LOG_SCAN_CHUNK (no need for new vars).
+# Wallet token discovery via JSON-RPC (chunked eth_getLogs) + seeds από TOKENS env.
 from __future__ import annotations
-import os, logging, requests, math
+import os, re, logging, requests, math
 from decimal import Decimal
 from typing import Optional, List, Dict, Any, Set
 
@@ -13,7 +12,7 @@ CRONOS_RPC_URL = (os.getenv("CRONOS_RPC_URL") or os.getenv("RPC_URL") or "").str
                  or "https://cronos-evm-rpc.publicnode.com"
 REQ_TIMEOUT = float(os.getenv("RPC_TIMEOUT", "15"))
 
-# ---------- Config (read existing envs first) ----------
+# ---------- Config από ΥΠΑΡΧΟΝΤΑ envs ----------
 def _int_env(*names: str, default: int = 0) -> int:
     for n in names:
         v = os.getenv(n)
@@ -22,16 +21,14 @@ def _int_env(*names: str, default: int = 0) -> int:
         try:
             return int(v)
         except Exception:
-            # also accept hex
             try:
                 return int(v, 16) if str(v).startswith("0x") else int(v)
             except Exception:
                 pass
     return default
 
-# Prefer existing names; fall back to DISCOVERY_* if present; else defaults.
-LOOKBACK_BLOCKS = _int_env("LOG_SCAN_BLOCKS", "DISCOVERY_LOOKBACK", default=500000)  # ~αρκετοί μήνες
-CHUNK_SIZE      = _int_env("LOG_SCAN_CHUNK", "DISCOVERY_CHUNK",  default=4000)      # μικρά κομμάτια
+LOOKBACK_BLOCKS = _int_env("LOG_SCAN_BLOCKS", "DISCOVERY_LOOKBACK", default=500000)
+CHUNK_SIZE      = _int_env("LOG_SCAN_CHUNK",  "DISCOVERY_CHUNK",  default=4000)
 
 # ---------- ABI selectors ----------
 SEL_SYMBOL   = "0x95d89b41"
@@ -79,14 +76,14 @@ def _decode_uint256(hexstr: str) -> int:
 
 def _decode_string(hexstr: str) -> Optional[str]:
     if not hexstr: return None
-    # try fixed bytes32-like
+    # fixed bytes32-like
     try:
         raw = bytes.fromhex(hexstr.replace("0x",""))
         s = raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
         if s: return s
     except Exception:
         pass
-    # try dynamic ABI string
+    # dynamic ABI string
     try:
         data = hexstr[2:] if hexstr.startswith("0x") else hexstr
         if len(data) >= 128:
@@ -113,6 +110,54 @@ def _call_balance_of(addr: str, wallet: str) -> int:
     w = wallet.lower().replace("0x","").rjust(64, "0")
     out = _eth_call(addr, SEL_BALANCE + w)
     return _decode_uint256(out) if out else 0
+
+# ---------- Seeds από TOKENS ----------
+_ADDR_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+
+def _seed_contracts_from_tokens_env() -> List[str]:
+    """
+    Διαβάζει το ήδη υπάρχον env TOKENS.
+    Υποστηριζόμενες μορφές:
+      - 'cronos/0xabc...,cronos/0xdef...,0xghi..., CRO/0x...'  (οτιδήποτε με 0x… θα παρθεί)
+    """
+    raw = os.getenv("TOKENS", "") or ""
+    if not raw.strip():
+        return []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    out: List[str] = []
+    for p in parts:
+        m = _ADDR_RE.search(p)
+        if m:
+            out.append(m.group(0).lower())
+    # de-dup
+    seen: Set[str] = set()
+    uniq = []
+    for a in out:
+        if a not in seen:
+            seen.add(a); uniq.append(a)
+    return uniq
+
+# ---------- Blockscout metadata (symbol/decimals) ----------
+# Base URL from official docs
+BLOCKSCOUT_API = "https://cronos.org/explorer/api"  # token.getToken gives symbol/decimals, etc. (no balance)
+# Docs: ?module=token&action=getToken&contractaddress=... (returns symbol/decimals) — we still use RPC for balanceOf
+# Ref: https://cronos.org/explorer/api-docs
+def _token_metadata_via_blockscout(addr: str) -> Dict[str, Any]:
+    try:
+        r = requests.get(BLOCKSCOUT_API, params={
+            "module": "token",
+            "action": "getToken",
+            "contractaddress": addr
+        }, timeout=10)
+        if r.status_code == 200:
+            j = r.json() or {}
+            res = j.get("result") or {}
+            sym = (res.get("symbol") or "").strip()
+            dec = int(res.get("decimals") or 18)
+            return {"symbol": sym or None, "decimals": dec}
+    except Exception:
+        pass
+    return {}
 
 # ---------- Discovery ----------
 def _uniq(seq: List[str]) -> List[str]:
@@ -158,8 +203,9 @@ def _read_token(addr: str, wallet: str) -> Optional[Dict[str, Any]]:
         bal = _call_balance_of(addr, wallet)
         if bal <= 0:
             return None
-        dec = _call_decimals(addr)
-        sym = _call_symbol(addr) or addr[:6]
+        meta = _token_metadata_via_blockscout(addr)  # σύμβολο/decimals αν υπάρχουν
+        dec = meta.get("decimals") or _call_decimals(addr)
+        sym = meta.get("symbol")   or _call_symbol(addr) or addr[:6]
         amount = Decimal(bal) / (Decimal(10) ** Decimal(dec))
         return {"address": addr.lower(), "symbol": sym, "decimals": dec, "amount": amount}
     except Exception as e:
@@ -168,8 +214,9 @@ def _read_token(addr: str, wallet: str) -> Optional[Dict[str, Any]]:
 
 def discover_tokens_for_wallet(wallet_address: str, lookback_blocks: int = None) -> List[Dict[str, Any]]:
     """
-    Returns list of tokens (symbol,address,decimals,amount) with positive balance.
-    - Uses LOG_SCAN_BLOCKS/LOG_SCAN_CHUNK envs for range & chunking (or DISCOVERY_* if provided).
+    Returns tokens (symbol,address,decimals,amount) με balance>0.
+    1) chunked logs (LOG_SCAN_BLOCKS / LOG_SCAN_CHUNK)
+    2) seeds από TOKENS env (π.χ. 'cronos/0xabc...,0xdef...')
     """
     wallet = wallet_address.lower()
     latest = _eth_block_number()
@@ -177,6 +224,10 @@ def discover_tokens_for_wallet(wallet_address: str, lookback_blocks: int = None)
     start = max(latest - lookback, 0)
 
     candidates = _scan_chunks(wallet, start, latest)
+
+    # + seeds από TOKENS (αν έχεις βάλει contracts)
+    seeds = _seed_contracts_from_tokens_env()
+    candidates.extend(seeds)
 
     tokens: List[Dict[str, Any]] = []
     for addr in _uniq(candidates):
