@@ -1,9 +1,15 @@
 # core/discovery.py
-# Wallet token discovery via JSON-RPC (chunked eth_getLogs) + seeds από TOKENS env.
+# Wallet token discovery via JSON-RPC (chunked eth_getLogs) + Blockscout account.tokenlist + seeds από TOKENS.
 from __future__ import annotations
-import os, re, logging, requests, math
+
+import os
+import re
+import math
+import logging
 from decimal import Decimal
 from typing import Optional, List, Dict, Any, Set
+
+import requests
 
 logger = logging.getLogger("core.discovery")
 
@@ -27,6 +33,7 @@ def _int_env(*names: str, default: int = 0) -> int:
                 pass
     return default
 
+# Προτιμά LOG_* (υπάρχοντα), αλλιώς DISCOVERY_* αν υπάρχουν, αλλιώς defaults
 LOOKBACK_BLOCKS = _int_env("LOG_SCAN_BLOCKS", "DISCOVERY_LOOKBACK", default=500000)
 CHUNK_SIZE      = _int_env("LOG_SCAN_CHUNK",  "DISCOVERY_CHUNK",  default=4000)
 
@@ -34,6 +41,8 @@ CHUNK_SIZE      = _int_env("LOG_SCAN_CHUNK",  "DISCOVERY_CHUNK",  default=4000)
 SEL_SYMBOL   = "0x95d89b41"
 SEL_DECIMALS = "0x313ce567"
 SEL_BALANCE  = "0x70a08231"
+
+# ERC20 Transfer topic
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a6c4b5fbb"
 
 # ---------- Low-level RPC ----------
@@ -71,24 +80,28 @@ def _addr_topic(wallet: str) -> str:
     return "0x" + wallet.lower().replace("0x","").rjust(64, "0")
 
 def _decode_uint256(hexstr: str) -> int:
-    if not hexstr: return 0
+    if not hexstr: 
+        return 0
     return int(hexstr, 16)
 
 def _decode_string(hexstr: str) -> Optional[str]:
-    if not hexstr: return None
-    # fixed bytes32-like
+    if not hexstr:
+        return None
+    # try fixed bytes-like
     try:
         raw = bytes.fromhex(hexstr.replace("0x",""))
         s = raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
-        if s: return s
+        if s:
+            return s
     except Exception:
         pass
-    # dynamic ABI string
+    # try dynamic ABI string
     try:
         data = hexstr[2:] if hexstr.startswith("0x") else hexstr
         if len(data) >= 128:
             strlen = int(data[64:128], 16)
-            start  = 128; end = 128 + strlen*2
+            start  = 128
+            end    = 128 + strlen*2
             raw    = bytes.fromhex(data[start:end])
             return raw.decode("utf-8", errors="ignore") or None
     except Exception:
@@ -137,29 +150,77 @@ def _seed_contracts_from_tokens_env() -> List[str]:
             seen.add(a); uniq.append(a)
     return uniq
 
-# ---------- Blockscout metadata (symbol/decimals) ----------
-# Base URL from official docs
-BLOCKSCOUT_API = "https://cronos.org/explorer/api"  # token.getToken gives symbol/decimals, etc. (no balance)
-# Docs: ?module=token&action=getToken&contractaddress=... (returns symbol/decimals) — we still use RPC for balanceOf
-# Ref: https://cronos.org/explorer/api-docs
-def _token_metadata_via_blockscout(addr: str) -> Dict[str, Any]:
-    try:
-        r = requests.get(BLOCKSCOUT_API, params={
-            "module": "token",
-            "action": "getToken",
-            "contractaddress": addr
-        }, timeout=10)
-        if r.status_code == 200:
-            j = r.json() or {}
-            res = j.get("result") or {}
-            sym = (res.get("symbol") or "").strip()
-            dec = int(res.get("decimals") or 18)
-            return {"symbol": sym or None, "decimals": dec}
-    except Exception:
-        pass
-    return {}
+# ========== (A) Βοηθητικές για Blockscout account.tokenlist ==========
+BLOCKSCOUT_BASE = os.getenv("CRONOS_EXPLORER_API", "https://cronos.org/explorer/api")
 
-# ---------- Discovery ----------
+def _blockscout_tokenlist(address: str) -> List[Dict[str, Any]]:
+    """
+    Χτυπάει το Blockscout account API για να πάρει ΟΛΑ τα tokens που κατέχει το wallet.
+    https://cronos.org/explorer/api?module=account&action=tokenlist&address=0x...
+    Επιστρέφει λίστα dicts με τουλάχιστον: contractAddress, balance, symbol, decimals (όπου υπάρχουν).
+    """
+    try:
+        r = requests.get(
+            BLOCKSCOUT_BASE,
+            params={"module":"account","action":"tokenlist","address":address},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        j = r.json() or {}
+        res = j.get("result")
+        if not res or not isinstance(res, list):
+            return []
+        return res
+    except Exception as e:
+        logger.debug("blockscout tokenlist failed: %s", e)
+        return []
+
+def _to_pos_int(x: Any) -> int:
+    try:
+        n = int(str(x))
+        return n if n > 0 else 0
+    except Exception:
+        return 0
+
+# ========== (B) Blockscout-first discovery helper ==========
+def _discover_via_blockscout_tokenlist(wallet: str) -> List[Dict[str, Any]]:
+    """
+    Blockscout-first discovery: γυρνά tokens με balance>0 (symbol/decimals αν υπάρχουν).
+    Αν κάποιο πεδίο λείπει, συμπληρώνουμε από on-chain calls (decimals/symbol/balanceOf).
+    """
+    rows = _blockscout_tokenlist(wallet)
+    if not rows:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        addr = (row.get("contractAddress") or row.get("contractaddress") or "").lower()
+        if not addr.startswith("0x") or len(addr) != 42:
+            continue
+
+        raw_bal_s = row.get("balance")
+        dec_s     = row.get("decimals")
+        sym       = (row.get("symbol") or "").strip()
+
+        # Συμπλήρωσε/διόρθωσε από on-chain όπου λείπει/χαλάει
+        dec = _to_pos_int(dec_s) or _call_decimals(addr)
+        try:
+            raw_bal = int(str(raw_bal_s)) if raw_bal_s is not None else _call_balance_of(addr, wallet)
+        except Exception:
+            raw_bal = _call_balance_of(addr, wallet)
+
+        if raw_bal <= 0:
+            continue
+
+        if not sym:
+            sym = _call_symbol(addr) or addr[:6]
+
+        amount = Decimal(raw_bal) / (Decimal(10) ** Decimal(dec))
+        out.append({"address": addr, "symbol": sym, "decimals": dec, "amount": amount})
+    return out
+
+# ---------- Logs discovery (chunked) ----------
 def _uniq(seq: List[str]) -> List[str]:
     seen: Set[str] = set(); out: List[str] = []
     for x in seq:
@@ -203,35 +264,50 @@ def _read_token(addr: str, wallet: str) -> Optional[Dict[str, Any]]:
         bal = _call_balance_of(addr, wallet)
         if bal <= 0:
             return None
-        meta = _token_metadata_via_blockscout(addr)  # σύμβολο/decimals αν υπάρχουν
-        dec = meta.get("decimals") or _call_decimals(addr)
-        sym = meta.get("symbol")   or _call_symbol(addr) or addr[:6]
+        dec = _call_decimals(addr)
+        sym = _call_symbol(addr) or addr[:6]
         amount = Decimal(bal) / (Decimal(10) ** Decimal(dec))
         return {"address": addr.lower(), "symbol": sym, "decimals": dec, "amount": amount}
     except Exception as e:
         logger.debug("read token failed %s: %s", addr, e)
         return None
 
+# ========== (C) Κύρια συνάρτηση: Blockscout πρώτα, μετά logs, μετά seeds ==========
 def discover_tokens_for_wallet(wallet_address: str, lookback_blocks: int = None) -> List[Dict[str, Any]]:
     """
-    Returns tokens (symbol,address,decimals,amount) με balance>0.
-    1) chunked logs (LOG_SCAN_BLOCKS / LOG_SCAN_CHUNK)
-    2) seeds από TOKENS env (π.χ. 'cronos/0xabc...,0xdef...')
+    Επιστρέφει tokens (symbol,address,decimals,amount) με balance>0.
+    Προτεραιότητα:
+      1) Blockscout account.tokenlist (πλήρης λίστα tokens που κατέχει το wallet)
+      2) chunked logs (LOG_SCAN_BLOCKS / LOG_SCAN_CHUNK) για fallback/εμπλουτισμό
+      3) seeds από TOKENS (αν έχεις ορίσει contracts)
     """
     wallet = wallet_address.lower()
+
+    # 1) Blockscout tokenlist
+    tokens = _discover_via_blockscout_tokenlist(wallet)
+    found_addrs = {t["address"] for t in tokens}
+
+    # 2) Fallback: logs scan για ό,τι δεν γύρισε το API
     latest = _eth_block_number()
     lookback = int(lookback_blocks) if lookback_blocks is not None else LOOKBACK_BLOCKS
     start = max(latest - lookback, 0)
-
     candidates = _scan_chunks(wallet, start, latest)
 
-    # + seeds από TOKENS (αν έχεις βάλει contracts)
-    seeds = _seed_contracts_from_tokens_env()
-    candidates.extend(seeds)
+    # 3) Seeds από TOKENS env (αν υπάρχουν)
+    try:
+        seeds = _seed_contracts_from_tokens_env()
+        if seeds:
+            candidates.extend(seeds)
+    except Exception:
+        pass
 
-    tokens: List[Dict[str, Any]] = []
+    # Εμπλούτισε tokens με ό,τι βρέθηκε από logs/seeds που δεν υπήρχε ήδη
     for addr in _uniq(candidates):
+        if addr in found_addrs:
+            continue
         t = _read_token(addr, wallet)
         if t:
             tokens.append(t)
+            found_addrs.add(addr)
+
     return tokens
