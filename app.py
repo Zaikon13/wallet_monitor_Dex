@@ -179,13 +179,46 @@ def _handle_rescan(wallet_address: str) -> str:
 
 def _handle_holdings(wallet_address: str) -> str:
     try:
+        # 1) Πάρε το βασικό snapshot
         snap = get_wallet_snapshot(wallet_address)
+        # 2) Κάνε merge τα discovered tokens
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
-        snap = _normalize_snapshot_for_formatter(snap)  # <<— ΝΕΟ: νορμαλοποίηση για formatters
-        return format_holdings(snap)
+        # 3) Νοrmalize ώστε κάθε asset να είναι dict με ασφαλείς τύπους
+        snap = _normalize_snapshot_for_formatter(snap)
+
+        # ---- ΚΡΙΣΙΜΟ ----
+        # Το format_holdings φαίνεται να περιμένει ΛΙΣΤΑ από assets (dicts).
+        assets = snap.get("assets") or []
+        if not isinstance(assets, list):
+            assets = [assets]
+        # Εξασφάλισε ότι κάθε στοιχείο είναι dict (διπλή ασφάλεια)
+        assets = [_asset_as_dict(a) for a in assets]
+
+        return format_holdings(assets)
+
     except Exception as e:
         logging.exception("Failed to build /holdings")
-        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
+
+        # Fallback: απλό MTM print για να μη μένεις χωρίς απάντηση
+        try:
+            # προσπάθησε να εμφανίσεις ό,τι έχει ήδη υπολογιστεί
+            lines = ["💼 Wallet Assets (MTM)"]
+            snap = snap if isinstance(snap, dict) else {}
+            assets = (snap.get("assets") or []) if isinstance(snap, dict) else []
+            # μάζεψε βασικές γραμμές
+            total = Decimal("0")
+            for a in assets:
+                d = _asset_as_dict(a)
+                sym = str(d.get("symbol", "?"))
+                amt = _to_dec(d.get("amount", 0)) or Decimal("0")
+                px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
+                val = _to_dec(d.get("value_usd", amt * px)) or Decimal("0")
+                total += val
+                lines.append(f"• {sym}: {amt} @ ${px} (= ${val})")
+            lines.append(f"\nΣύνολο: ${total}")
+            return "\n".join(lines) if assets else "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
+        except Exception:
+            return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
 
 # --------------------------------------------------
 # Command dispatcher
