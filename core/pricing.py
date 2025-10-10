@@ -3,7 +3,7 @@
 core/pricing.py — Spot USD pricing helpers for holdings snapshot.
 
 Public API expected by core/holdings.py:
-- get_spot_usd(symbol: str, address: str | None = None) -> Decimal | None
+- get_spot_usd(symbol: str, token_address: str | None = None) -> Decimal | None
 - (optional) get_symbol_for_address(address: str) -> str | None
 
 Strategy:
@@ -27,7 +27,7 @@ _CACHE_TTL = float(os.getenv("PRICING_CACHE_TTL", "60"))  # seconds
 # Map known symbols → CoinGecko IDs
 _COINGECKO_IDS = {
     "CRO": "crypto-com-chain",
-    # Add more here if θέλεις (USDC/USDT/ETH/WBTC κ.λπ.)
+    # Προσθέτεις εύκολα κι άλλα εδώ (USDC/USDT/ETH/WBTC κ.λπ.)
     # "USDC": "usd-coin",
     # "USDT": "tether",
     # "ETH": "ethereum",
@@ -71,14 +71,15 @@ def _cg_id_for_symbol(symbol: str) -> Optional[str]:
 
 def get_symbol_for_address(address: str) -> Optional[str]:
     """
-    Προαιρετικό helper που μπορεί να χρησιμοποιηθεί από το holdings για ERC-20 discovery.
+    Προαιρετικό helper για ERC-20 discovery.
     Προς το παρόν δεν διατηρούμε mapping συμβολαίου→symbol, επέστρεψε None.
     """
     return None
 
-def get_spot_usd(symbol: str, address: Optional[str] = None) -> Optional[Decimal]:
+def get_spot_usd(symbol: str, token_address: Optional[str] = None) -> Optional[Decimal]:
     """
     Spot USD price for a token symbol (normalized). Returns None on failure.
+    Σημείωση: Η παράμετρος λέγεται token_address για να ταιριάζει με το core/holdings.py
     """
     sym = _norm_symbol(symbol)
 
@@ -94,7 +95,7 @@ def get_spot_usd(symbol: str, address: Optional[str] = None) -> Optional[Decimal
     if coin_id:
         price = _cg_simple_price(coin_id)
 
-    # TODO: Add fallbacks (Dexscreener/CryptoCompare) if needed.
+    # TODO: Fallbacks (Dexscreener/CryptoCompare) αν χρειαστεί.
 
     if price is not None:
         _PRICE_CACHE[sym] = (_now(), price)
