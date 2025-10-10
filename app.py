@@ -1,4 +1,4 @@
-# app.py — FastAPI Telegram webhook using your real modules
+# app.py — FastAPI Telegram webhook (prod) with MTM formatting + discovery merge
 from __future__ import annotations
 import os
 import logging
@@ -6,15 +6,20 @@ from typing import Optional, Dict, Any, List
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
+from decimal import Decimal, InvalidOperation
 
-# ΜΟΝΟ αυτό υπάρχει σίγουρα στο repo σου:
-from core.holdings import get_wallet_snapshot  # <- δικό σου (επιστρέφει dict)  # :contentReference[oaicite:0]{index=0}
+from core.holdings import get_wallet_snapshot          # base snapshot (balances/prices/totals if διαθέσιμα)
+from core.augment import augment_with_discovered_tokens # merge με discovery χωρίς να αλλάξουμε holdings.py
 
 app = FastAPI(title="Cronos DeFi Sentinel — Telegram Webhook (prod)")
 
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+WALLET_ADDRESS     = (os.getenv("WALLET_ADDRESS") or "").strip()
+
 if not TELEGRAM_BOT_TOKEN:
-    logging.warning("Missing TELEGRAM_BOT_TOKEN env — fallback sender will not work.")
+    logging.warning("Missing TELEGRAM_BOT_TOKEN env — Telegram replies will not work.")
+if not WALLET_ADDRESS:
+    logging.warning("Missing WALLET_ADDRESS env — discovery merge will be disabled.")
 
 def _fallback_send_message(text: str, chat_id: Optional[int]) -> None:
     if not chat_id:
@@ -35,61 +40,77 @@ def _fallback_send_message(text: str, chat_id: Optional[int]) -> None:
         logging.exception("Telegram sendMessage exception")
 
 def send_message(text: str, chat_id: Optional[int]) -> None:
-    # Δεν βασιζόμαστε σε telegram.api helper (στο repo είναι κενό)  # :contentReference[oaicite:1]{index=1}
     _fallback_send_message(text, chat_id)
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "wallet_monitor_Dex", "status": "running"}
 
-def _fmt_money(x: str) -> str:
+# ---------- formatting helpers ----------
+def _to_dec(x: Any) -> Optional[Decimal]:
+    if isinstance(x, Decimal):
+        return x
     try:
-        # κρατάμε 2 δεκαδικά για USD, βγάζουμε τυχόν επιστημονική μορφή
-        from decimal import Decimal
-        d = Decimal(str(x))
-        return f"{d.quantize(Decimal('0.01')):,}"
-    except Exception:
-        return str(x)
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
-def _fmt_price(x: str) -> str:
-    try:
-        from decimal import Decimal
-        d = Decimal(str(x))
-        # μέχρι 8 δεκαδικά για price
-        q = d.quantize(Decimal("0.00000001"))
-        return f"{q:,}"
-    except Exception:
+def _fmt_amt(x: Any, places: int = 4) -> str:
+    d = _to_dec(x)
+    if d is None:
         return str(x)
+    q = d.quantize(Decimal("1." + "0"*places)) if places > 0 else d.quantize(Decimal("1"))
+    return f"{q:,}"
+
+def _fmt_price(x: Any) -> str:
+    d = _to_dec(x)
+    if d is None:
+        return str(x)
+    q = d.quantize(Decimal("0.000001"))
+    return f"{q:,}"
+
+def _fmt_money(x: Any) -> str:
+    d = _to_dec(x)
+    if d is None:
+        return str(x)
+    q = d.quantize(Decimal("0.01"))
+    return f"{q:,}"
 
 def _format_holdings_text(snapshot: Dict[str, Any]) -> str:
     assets: List[Dict[str, Any]] = snapshot.get("assets", []) or []
     totals: Dict[str, Any] = snapshot.get("totals", {}) or {}
+
+    lines = ["💼 Wallet Assets (MTM)"]
     if not assets:
-        return "📦 Holdings\n— Δεν βρέθηκαν assets."
+        lines.append("— Δεν βρέθηκαν assets.")
+    else:
+        for a in assets:
+            sym = a.get("symbol", "?")
+            amt = a.get("amount", "0")
+            px  = a.get("price_usd", None)
+            val = a.get("value_usd", None)
+            lines.append(f"• {sym}: {_fmt_amt(amt, 4)} @ ${_fmt_price(px or 0)} = ${_fmt_money(val or 0)}")
 
-    lines = ["📦 Holdings"]
-    for a in assets:
-        sym = a.get("symbol", "?")
-        amt = a.get("amount", "0")
-        px = a.get("price_usd", "0")
-        val = a.get("value_usd", "0")
-        # amount όπως είναι (το core/holdings επιστρέφει stringified Decimal)  # :contentReference[oaicite:2]{index=2}
-        lines.append(f"• {sym}: {amt}  @ ${_fmt_price(px)}  (= ${_fmt_money(val)})")
+    lines.append("")
+    tv = totals.get("value_usd")
+    tc = totals.get("cost_usd")
+    tu = totals.get("u_pnl_usd")
+    tp = totals.get("u_pnl_pct")
 
-    if totals:
-        tv = _fmt_money(totals.get("value_usd", "0"))
-        tc = _fmt_money(totals.get("cost_usd", "0"))
-        tu = _fmt_money(totals.get("u_pnl_usd", "0"))
-        tp = totals.get("u_pnl_pct", "0")
-        try:
-            from decimal import Decimal
-            tp = str(Decimal(str(tp)).quantize(Decimal('0.01')))
-        except Exception:
-            tp = str(tp)
-        lines.append("")
-        lines.append(f"Σύνολα:  V=${tv} | C=${tc} | uPnL=${tu} ({tp}%)")
+    lines.append(f"Σύνολο: ${_fmt_money(tv) if tv is not None else '—'}")
+    if tu is not None:
+        tp_txt = f"{_fmt_amt(tp, 2)}%" if tp is not None else "—"
+        lines.append(f"Unrealized PnL (open): ${_fmt_money(tu)} ({tp_txt})")
+    else:
+        lines.append("Unrealized PnL (open): —")
+
+    if assets:
+        lines.append("\nQuantities snapshot (runtime):")
+        for a in sorted(assets, key=lambda x: x.get("symbol", "")):
+            lines.append(f"  – {a.get('symbol','?')}: {_fmt_amt(a.get('amount','0'), 4)}")
     return "\n".join(lines)
 
+# ---------- commands ----------
 def _handle_start() -> str:
     return (
         "👋 Γεια σου! Είμαι το Cronos DeFi Sentinel.\n\n"
@@ -107,7 +128,10 @@ def _handle_help() -> str:
 
 def _handle_holdings() -> str:
     try:
-        snap = get_wallet_snapshot()  # φέρνει balances, prices, totals από τα ΚΑΝΟΝΙΚΑ modules  # :contentReference[oaicite:3]{index=3}
+        snap = get_wallet_snapshot()
+        # Προαιρετικό merge με auto-discovery (αν έχουμε WALLET_ADDRESS)
+        if WALLET_ADDRESS:
+            snap = augment_with_discovered_tokens(snap, wallet_address=WALLET_ADDRESS)
         return _format_holdings_text(snap)
     except Exception as e:
         logging.exception("Failed to build /holdings: %s", e)
