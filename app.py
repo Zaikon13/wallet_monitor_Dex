@@ -18,6 +18,7 @@ from core.discovery import discover_tokens_for_wallet
 from core.pricing import get_spot_usd
 
 from decimal import Decimal, InvalidOperation
+from collections import OrderedDict
 
 # --------------------------------------------------
 # Configuration
@@ -193,7 +194,6 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         visible = visible[:limit]
 
     return visible, hidden
-from collections import OrderedDict
 
 def _assets_list_to_mapping(assets: list) -> dict:
     """
