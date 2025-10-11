@@ -105,3 +105,36 @@ def format_per_asset_totals(period: str, rows: List[dict]) -> str:
             )
         )
     return "\n".join(lines)
+
+# --- APPEND: Intraday trades & PnL formatters ---
+
+def format_trades_table(trades) -> str:
+    """
+    trades: List[reports.trades.Trade]
+    """
+    if not trades:
+        return "Σήμερα δεν βρέθηκαν συναλλαγές."
+    lines = ["Συναλλαγές (σήμερα):", "ts | symbol | side | qty @ price | fee | tx"]
+    for t in trades:
+        ts_s = t.ts.strftime("%H:%M:%S")
+        tx_s = (t.tx[:8] + "…") if t.tx else "-"
+        lines.append(f"{ts_s} | {t.symbol} | {t.side} | {t.qty:.8f} @ {t.price:.6f} | {t.fee:.6f} | {tx_s}")
+    return "\n".join(lines)
+
+def format_pnl_today(summary) -> str:
+    """
+    summary: reports.trades.RealizedSummary
+    """
+    if not summary.fills:
+        return "Σήμερα δεν υπάρχει realized PnL (καμία πώληση ή κλείσιμο θέσης)."
+    start = summary.window_start.strftime("%Y-%m-%d")
+    lines = [f"Realized PnL (today {start}):"]
+    for sym, d in sorted(summary.per_symbol.items()):
+        realized = d.get("realized", 0.0)
+        fees = d.get("fees", 0.0)
+        qty = d.get("qty_sold", 0.0)
+        net = realized - fees
+        lines.append(f"- {sym}: realized={realized:.2f}, fees={fees:.2f}, qty_sold={qty:.8f}, net={net:.2f}")
+    lines.append(f"\nTOTAL: realized={summary.total_realized:.2f}, fees={summary.total_fees:.2f}, net={summary.total_realized - summary.total_fees:.2f}")
+    return "\n".join(lines)
+
