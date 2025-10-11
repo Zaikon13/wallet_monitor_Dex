@@ -193,6 +193,44 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         visible = visible[:limit]
 
     return visible, hidden
+from collections import OrderedDict
+
+def _assets_list_to_mapping(assets: list) -> dict:
+    """
+    Μετατρέπει λίστα από assets (dicts) σε mapping {SYMBOL: data}.
+    Αν βρεθεί διπλό symbol, τα κάνει aggregate (amount) και
+    ανανεώνει price/value λογικά.
+    """
+    out: dict[str, dict] = OrderedDict()
+    for item in assets:
+        d = _asset_as_dict(item)
+        sym = str(d.get("symbol", "?")).upper().strip() or d.get("address", "")[:6].upper()
+        amt = _to_dec(d.get("amount", 0)) or Decimal("0")
+        px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
+        val = _to_dec(d.get("value_usd", 0))
+        if val is None:
+            val = amt * px
+
+        if sym in out:
+            prev = out[sym]
+            prev_amt = _to_dec(prev.get("amount", 0)) or Decimal("0")
+            # aggregate ποσότητα
+            new_amt = prev_amt + amt
+            # κράτα πιο “πρόσφατη”/μη μηδενική τιμή
+            new_px  = px if px > 0 else (_to_dec(prev.get("price_usd", 0)) or Decimal("0"))
+            # value συνεπές με amount*price, αλλιώς άθροισε values
+            new_val = new_amt * new_px if new_px > 0 else \
+                      ((_to_dec(prev.get("value_usd", 0)) or Decimal("0")) + (val or Decimal("0")))
+            prev.update(d)
+            prev["amount"]    = new_amt
+            prev["price_usd"] = new_px
+            prev["value_usd"] = new_val
+        else:
+            d["amount"]    = amt
+            d["price_usd"] = px
+            d["value_usd"] = val
+            out[sym] = d
+    return out
 
 # --------------------------------------------------
 # Command Handlers
@@ -282,8 +320,13 @@ def _handle_holdings(wallet_address: str) -> str:
         assets = snap.get("assets") or []
         assets = [_asset_as_dict(a) for a in assets]
 
+        # φίλτρα/ταξινόμηση για καθαρή προβολή
         cleaned, hidden_count = _filter_and_sort_assets(assets)
-        body = format_holdings(cleaned)
+
+        # format_holdings περιμένει dict: {symbol: data}
+        mapping = _assets_list_to_mapping(cleaned)
+
+        body = format_holdings(mapping)
         if hidden_count:
             body += f"\n\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)"
         return body
