@@ -166,7 +166,10 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
     - HOLDINGS_DUST_USD (default 0.05)
     - HOLDINGS_BLACKLIST_REGEX (για spammy ονόματα)
     - HOLDINGS_LIMIT (πόσες γραμμές να δείξουμε)
-    Επιστρέφει: (visible_assets, hidden_count)
+
+    Κανόνες για majors (CRO, WCRO, κ.λπ.):
+    - Αν price==0, δοκίμασε live get_spot_usd πριν φιλτράρεις
+    - ΜΗΝ εφαρμόζεις dust filter στα majors
     """
     hide_zero = _env_bool("HOLDINGS_HIDE_ZERO_PRICE", True)
     dust_usd  = _env_dec("HOLDINGS_DUST_USD", "0.05")
@@ -174,38 +177,56 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
     bl_re_pat = os.getenv("HOLDINGS_BLACKLIST_REGEX", r"(?i)(claim|airdrop|promo|mistery|crowithknife|classic|button|ryoshi|ethena\.promo)")
     bl_re = re.compile(bl_re_pat)
 
+    # Majors = δεν κόβονται από dust· αν λείπει τιμή, κάνε live lookup
+    majors = {"USDT","USDC","WCRO","CRO","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC","HBAR"}
+
     visible = []
     hidden  = 0
-    whitelist_zero_price = {"USDT","USDC","WCRO","CRO","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC"}
 
     for a in assets:
         d = _asset_as_dict(a)
         sym = str(d.get("symbol","?")).upper().strip()
+        addr = d.get("address")
         price = _to_dec(d.get("price_usd", 0)) or Decimal("0")
-        val   = _to_dec(d.get("value_usd", 0))
-        if val is None or isinstance(val, (str, float, int)):
-            amt = _to_dec(d.get("amount", 0)) or Decimal("0")
-            val = amt * price
+        amt   = _to_dec(d.get("amount", 0)) or Decimal("0")
 
-        # blacklist by symbol (spam/claims/airdrop links)
+        # Αν major και price==0 → προσπάθησε live spot lookup
+        if sym in majors and (price is None or price <= 0):
+            try:
+                px_live = get_spot_usd(sym, token_address=addr)
+                price = _to_dec(px_live) or Decimal("0")
+            except Exception:
+                # αν αποτύχει, κρατάμε 0 αλλά δεν θα το κόψουμε λόγω dust
+                pass
+
+        # Υπολόγισε value (αν λείπει)
+        val = _to_dec(d.get("value_usd", 0))
+        if val is None or isinstance(val, (str, float, int)):
+            val = amt * (price or Decimal("0"))
+
+        # blacklist by symbol (spam/claims)
         if bl_re.search(sym):
             hidden += 1
             continue
-        # hide zero-price unless whitelisted majors
-        if hide_zero and price <= 0 and sym not in whitelist_zero_price:
-            hidden += 1
-            continue
-        # hide dust (πολύ μικρή αξία)
-        if val is None or val < dust_usd:
+
+        # zero-price φίλτρο: κόψε ΜΟΝΟ αν δεν είναι major
+        if hide_zero and (price is None or price <= 0) and sym not in majors:
             hidden += 1
             continue
 
+        # dust φίλτρο: κόψε ΜΟΝΟ αν δεν είναι major
+        if sym not in majors:
+            if val is None or val < dust_usd:
+                hidden += 1
+                continue
+
+        # πέρασε
         d["price_usd"] = price
         d["value_usd"] = val
         visible.append(d)
 
     # sort by USD value desc
-    visible.sort(key=lambda x: (x.get("value_usd") or Decimal("0")), reverse=True)
+    visible.sort(key=lambda x: (_to_dec(x.get("value_usd")) or Decimal("0")), reverse=True)
 
     # cap results
     if limit and len(visible) > limit:
