@@ -4,21 +4,26 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import logging
 from typing import Optional, List, Dict, Any
+from collections import OrderedDict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from telegram import api as tg_api
-from telegram.formatters import format_holdings
+# Προαιρετικά κρατάμε διαθέσιμο το external formatter (δεν το χρησιμοποιούμε εδώ)
+# from telegram.formatters import format_holdings as _unused_external_formatter
+
 from core.holdings import get_wallet_snapshot
 from core.augment import augment_with_discovered_tokens
 from core.discovery import discover_tokens_for_wallet
 from core.pricing import get_spot_usd
 
 from decimal import Decimal, InvalidOperation
-from collections import OrderedDict
 
 # --------------------------------------------------
 # Configuration
@@ -26,13 +31,15 @@ from collections import OrderedDict
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0")) or None
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-APP_URL = os.getenv("APP_URL")  # optional if needed for webhook set
+APP_URL = os.getenv("APP_URL")  # optional, αν το χρειαστείς για webhook set
 EOD_TIME = os.getenv("EOD_TIME", "23:59")
+TZ = os.getenv("TZ", "Europe/Athens")
+SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./data/snapshots")  # Railway: ephemeral ανά deploy, το ξέρουμε
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="1.0")
+app = FastAPI(title="Cronos DeFi Sentinel", version="1.1")
 
 # --------------------------------------------------
 # Helper: Safe Telegram message splitter
@@ -50,6 +57,7 @@ def _fallback_send_message(text: str, chat_id: Optional[int] = None):
         if hasattr(tg_api, "send_telegram"):
             return tg_api.send_telegram(text, chat_id)
     except TypeError:
+        # ορισμένα modules περιμένουν μόνο text
         try:
             if hasattr(tg_api, "send_telegram_message"):
                 return tg_api.send_telegram_message(text)
@@ -95,7 +103,7 @@ def send_message(text: str, chat_id: Optional[int] = None) -> None:
     _send_long_text(text, chat_id)
 
 # --------------------------------------------------
-# Snapshot normalization helpers (για formatters)
+# Snapshot normalization helpers (για φίλτρα/formatting)
 # --------------------------------------------------
 def _to_dec(x):
     if isinstance(x, Decimal):
@@ -173,12 +181,15 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
             amt = _to_dec(d.get("amount", 0)) or Decimal("0")
             val = amt * price
 
+        # blacklist by symbol (spam/claims/airdrop links)
         if bl_re.search(sym):
             hidden += 1
             continue
+        # hide zero-price unless whitelisted majors
         if hide_zero and price <= 0 and sym not in whitelist_zero_price:
             hidden += 1
             continue
+        # hide dust (πολύ μικρή αξία)
         if val is None or val < dust_usd:
             hidden += 1
             continue
@@ -187,8 +198,10 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         d["value_usd"] = val
         visible.append(d)
 
+    # sort by USD value desc
     visible.sort(key=lambda x: (x.get("value_usd") or Decimal("0")), reverse=True)
 
+    # cap results
     if limit and len(visible) > limit:
         hidden += (len(visible) - limit)
         visible = visible[:limit]
@@ -198,8 +211,7 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
 def _assets_list_to_mapping(assets: list) -> dict:
     """
     Μετατρέπει λίστα από assets (dicts) σε mapping {SYMBOL: data}.
-    Αν βρεθεί διπλό symbol, τα κάνει aggregate (amount) και
-    ανανεώνει price/value λογικά.
+    Αν βρεθεί διπλό symbol, κάνει aggregate (amount) και ενημερώνει price/value.
     """
     out: dict[str, dict] = OrderedDict()
     for item in assets:
@@ -214,11 +226,8 @@ def _assets_list_to_mapping(assets: list) -> dict:
         if sym in out:
             prev = out[sym]
             prev_amt = _to_dec(prev.get("amount", 0)) or Decimal("0")
-            # aggregate ποσότητα
             new_amt = prev_amt + amt
-            # κράτα πιο “πρόσφατη”/μη μηδενική τιμή
             new_px  = px if px > 0 else (_to_dec(prev.get("price_usd", 0)) or Decimal("0"))
-            # value συνεπές με amount*price, αλλιώς άθροισε values
             new_val = new_amt * new_px if new_px > 0 else \
                       ((_to_dec(prev.get("value_usd", 0)) or Decimal("0")) + (val or Decimal("0")))
             prev.update(d)
@@ -233,24 +242,215 @@ def _assets_list_to_mapping(assets: list) -> dict:
     return out
 
 # --------------------------------------------------
+# Snapshots storage (multi per day) + PnL helpers
+# --------------------------------------------------
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def _now_local() -> datetime:
+    return datetime.now(ZoneInfo(TZ))
+
+def _today_str() -> str:
+    return _now_local().date().isoformat()  # YYYY-MM-DD
+
+def _now_stamp() -> str:
+    # YYYY-MM-DD_HHMM (π.χ. 2025-10-11_0945)
+    dt = _now_local()
+    return f"{dt.date().isoformat()}_{dt.strftime('%H%M')}"
+
+def _snapshot_filename(stamp: str) -> str:
+    # stamp = 'YYYY-MM-DD_HHMM'
+    return f"{stamp}.json"
+
+def _snapshot_path(stamp: str) -> str:
+    return os.path.join(SNAPSHOT_DIR, _snapshot_filename(stamp))
+
+def _list_snapshot_files() -> list[str]:
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return []
+    return sorted([f for f in os.listdir(SNAPSHOT_DIR) if f.endswith(".json")])
+
+def _list_snapshots(limit: int = 20) -> list[str]:
+    files = _list_snapshot_files()
+    return files[-limit:] if limit and len(files) > limit else files
+
+def _latest_snapshot_for_date(date_str: str) -> Optional[str]:
+    """Επιστρέφει filename του πιο πρόσφατου snapshot για την ημέρα (YYYY-MM-DD), ή None."""
+    files = _list_snapshot_files()
+    candidates = [f for f in files if f.startswith(date_str + "_")]
+    return candidates[-1] if candidates else None
+
+def _parse_snapshot_selector(selector: Optional[str]) -> Optional[str]:
+    """
+    Μετατρέπει επιλογή χρήστη -> filename:
+    - None: πάρε το πιο πρόσφατο οποιασδήποτε μέρας
+    - 'YYYY-MM-DD': πάρε το πιο πρόσφατο εκείνης της μέρας
+    - 'YYYY-MM-DD_HHMM': πάρε αυτό ακριβώς
+    """
+    files = _list_snapshot_files()
+    if not files:
+        return None
+
+    if not selector:
+        return files[-1]  # latest
+
+    selector = selector.strip()
+    # ακριβές: YYYY-MM-DD_HHMM (16 chars, '_' at pos 10)
+    if len(selector) == 16 and selector[10] == "_":
+        candidate = _snapshot_filename(selector)
+        return candidate if candidate in files else None
+
+    # μόνο ημερομηνία
+    if len(selector) == 10:
+        latest_for_day = _latest_snapshot_for_date(selector)
+        return latest_for_day
+
+    return None
+
+def _load_snapshot(selector: Optional[str] = None) -> Optional[dict]:
+    """
+    Διαβάζει snapshot με βάση selector (δες _parse_snapshot_selector).
+    Επιστρέφει dict ή None.
+    """
+    fname = _parse_snapshot_selector(selector)
+    if not fname:
+        return None
+    path = os.path.join(SNAPSHOT_DIR, fname)
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+            data["_filename"] = fname
+            return data
+    except Exception:
+        logging.exception("Failed to read snapshot: %s", path)
+        return None
+
+def _save_snapshot(mapping: dict, totals_value: Decimal, stamp: Optional[str] = None) -> str:
+    _ensure_dir(SNAPSHOT_DIR)
+    st = stamp or _now_stamp()
+    payload = {
+        "stamp": st,  # YYYY-MM-DD_HHMM
+        "date": st[:10],
+        "assets": {k: {
+            "amount": str(v.get("amount", 0)),
+            "price_usd": str(v.get("price_usd", 0)),
+            "value_usd": str(v.get("value_usd", 0)),
+            "address": v.get("address"),
+        } for k, v in mapping.items()},
+        "totals": {"value_usd": str(totals_value)},
+        "tz": TZ,
+        "saved_at": _now_local().isoformat(),
+    }
+    path = _snapshot_path(st)
+    try:
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
+    except Exception:
+        logging.exception("Failed to write snapshot")
+    return st  # επιστρέφουμε το πλήρες stamp (YYYY-MM-DD_HHMM)
+
+def _totals_value_from_assets(assets: List[Dict[str, Any]]) -> Decimal:
+    total = Decimal("0")
+    for a in assets:
+        v = _to_dec(_asset_as_dict(a).get("value_usd", 0)) or Decimal("0")
+        total += v
+    return total
+
+def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> tuple[Decimal, Decimal, str]:
+    """επιστρέφει (delta_usd, delta_pct, label) όπου label=stamp ή date."""
+    try:
+        snap_total = _to_dec((snap.get("totals") or {}).get("value_usd", 0)) or Decimal("0")
+        label = str(snap.get("stamp") or snap.get("date") or "?")
+    except Exception:
+        snap_total, label = Decimal("0"), "?"
+    delta = curr_total - snap_total
+    pct = (delta / snap_total * Decimal("100")) if snap_total > 0 else Decimal("0")
+    return delta, pct, label
+
+# --------------------------------------------------
+# Pretty formatting (compact style)
+# --------------------------------------------------
+def _fmt_money(x: Decimal) -> str:
+    # 2 δεκαδικά και χιλιάδες με κόμμα (όπως στο δείγμα)
+    q = Decimal("0.01")
+    s = f"{x.quantize(q):,}"
+    return s
+
+def _fmt_price(x: Decimal) -> str:
+    # αν μεγάλο, 2 δεκαδικά, αλλιώς 6…8
+    try:
+        if x >= Decimal("1000"):
+            return f"{x:,.2f}"
+        if x >= Decimal("1"):
+            return f"{x:.2f}"
+        elif x >= Decimal("0.01"):
+            return f"{x:.6f}"
+        else:
+            return f"{x:.8f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(x)
+
+def _fmt_qty(x: Decimal) -> str:
+    # 4 δεκαδικά, με κόμματα για χιλιάδες
+    try:
+        return f"{x:,.4f}"
+    except Exception:
+        return str(x)
+
+def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) -> tuple[str, Decimal]:
+    # Γραμμές τύπου:
+    #  - ADA          213.5340 × $0.673332 = $143.78
+    lines = ["Holdings snapshot:"]
+    total = Decimal("0")
+    for a in assets:
+        d = _asset_as_dict(a)
+        sym = str(d.get("symbol","?")).upper()
+        qty = _to_dec(d.get("amount", 0)) or Decimal("0")
+        px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
+        val = _to_dec(d.get("value_usd", 0)) or (qty * px)
+        total += val
+        lines.append(
+            f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}"
+        )
+    lines.append(f"\nTotal ≈ ${_fmt_money(total)}")
+    if hidden_count:
+        lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
+    # Quantities snapshot (runtime)
+    lines.append("\nQuantities snapshot (runtime):")
+    for a in assets:
+        d = _asset_as_dict(a)
+        sym = str(d.get("symbol","?")).upper()
+        qty = _to_dec(d.get("amount", 0)) or Decimal("0")
+        lines.append(f"  – {sym}: {qty}")
+    return "\n".join(lines), total
+
+# --------------------------------------------------
 # Command Handlers
 # --------------------------------------------------
 def _handle_start() -> str:
     return (
         "👋 Γεια σου! Είμαι το Cronos DeFi Sentinel.\n\n"
         "Διαθέσιμες εντολές:\n"
-        "• /holdings — snapshot χαρτοφυλακίου (με φίλτρα & ταξινόμηση)\n"
+        "• /holdings — snapshot χαρτοφυλακίου (compact + φίλτρα & ταξινόμηση, με PnL αν υπάρχει snapshot)\n"
         "• /scan — ωμή λίστα tokens από ανακάλυψη (χωρίς φίλτρα)\n"
         "• /rescan — πλήρης επανεύρεση & εμφάνιση (με φίλτρα)\n"
+        "• /snapshot — αποθήκευση snapshot με timestamp (π.χ. 2025-10-11_0930)\n"
+        "• /snapshots — λίστα διαθέσιμων snapshots\n"
+        "• /pnl — δείξε PnL vs τελευταίο snapshot\n"
+        "• /pnl 2025-10-11 — PnL vs πιο πρόσφατο της ημέρας\n"
+        "• /pnl 2025-10-11_0930 — PnL vs συγκεκριμένο snapshot\n"
         "• /help — βοήθεια"
     )
 
 def _handle_help() -> str:
     return (
         "ℹ️ Βοήθεια\n"
-        "• /holdings — δείχνει τρέχον snapshot (MTM με τιμές, φιλτραρισμένο)\n"
+        "• /holdings — compact MTM (φιλτραρισμένο) + PnL αν υπάρχει snapshot\n"
         "• /scan — ωμή λίστα tokens που βρέθηκαν (amount + address)\n"
-        "• /rescan — ξανά σκανάρισμα & παρουσίαση όπως το /holdings\n"
+        "• /rescan — ξανά σκανάρισμα & παρουσίαση σαν το /holdings\n"
+        "• /snapshot — αποθήκευση snapshot με timestamp\n"
+        "• /snapshots — λίστα διαθέσιμων snapshots\n"
+        "• /pnl [ημέρα ή stamp] — PnL vs snapshot (π.χ. /pnl 2025-10-11 ή /pnl 2025-10-11_0930)\n"
         "• /start — βασικές οδηγίες"
     )
 
@@ -289,27 +489,15 @@ def _handle_rescan(wallet_address: str) -> str:
     if not toks:
         return "🔁 Rescan ολοκληρώθηκε — δεν βρέθηκαν ERC-20 με θετικό balance."
 
-    # Εμπλούτισε με τιμές για να λειτουργήσουν φίλτρα/ταξινομήσεις
     enriched = _enrich_with_prices(toks)
     cleaned, hidden_count = _filter_and_sort_assets(enriched)
 
     if not cleaned:
         return "🔁 Rescan ολοκληρώθηκε — δεν υπάρχει κάτι αξιοσημείωτο να εμφανιστεί (όλα φιλτραρίστηκαν ως spam/zero/dust)."
 
-    # Σύντομη λίστα για Telegram, με value
-    lines = ["🔁 Rescan (top, filtered):"]
-    for d in cleaned:
-        sym = d.get("symbol","?")
-        amt = d.get("amount","0")
-        px  = d.get("price_usd", Decimal("0"))
-        val = d.get("value_usd", Decimal("0"))
-        addr = d.get("address","")
-        lines.append(f"• {sym}: {amt} @ ${px} (= ${val})  ({addr})")
-
-    if hidden_count:
-        lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
-
-    return "\n".join(lines)
+    # compact output όπως ζήτησες
+    body, _ = _format_compact_holdings(cleaned, hidden_count)
+    return "🔁 Rescan (filtered):\n" + body
 
 def _handle_holdings(wallet_address: str) -> str:
     try:
@@ -320,20 +508,76 @@ def _handle_holdings(wallet_address: str) -> str:
         assets = snap.get("assets") or []
         assets = [_asset_as_dict(a) for a in assets]
 
-        # φίλτρα/ταξινόμηση για καθαρή προβολή
         cleaned, hidden_count = _filter_and_sort_assets(assets)
+        body, total_now = _format_compact_holdings(cleaned, hidden_count)
 
-        # format_holdings περιμένει dict: {symbol: data}
-        mapping = _assets_list_to_mapping(cleaned)
+        # PnL vs τελευταίο snapshot (αν υπάρχει)
+        last_snap = _load_snapshot()  # πιο πρόσφατο διαθέσιμο
+        if last_snap:
+            delta, pct, label = _compare_to_snapshot(total_now, last_snap)
+            sign = "+" if delta >= 0 else ""
+            body += f"\n\nUnrealized PnL vs snapshot {label}: ${_fmt_money(delta)} ({sign}{pct:.2f}%)"
 
-        body = format_holdings(mapping)
-        if hidden_count:
-            body += f"\n\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)"
         return body
 
     except Exception:
         logging.exception("Failed to build /holdings")
         return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
+
+def _handle_snapshot(wallet_address: str) -> str:
+    """Αποθήκευση snapshot με timestamp (YYYY-MM-DD_HHMM)."""
+    try:
+        snap = get_wallet_snapshot(wallet_address)
+        snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
+        snap = _normalize_snapshot_for_formatter(snap)
+        assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
+
+        cleaned, _ = _filter_and_sort_assets(assets)
+        mapping = _assets_list_to_mapping(cleaned)
+        total_now = _totals_value_from_assets(cleaned)
+
+        stamp = _save_snapshot(mapping, total_now)  # π.χ. '2025-10-11_1210'
+        return f"💾 Snapshot saved: {stamp}. Total ≈ ${_fmt_money(total_now)}"
+    except Exception:
+        logging.exception("Failed to save snapshot")
+        return "⚠️ Σφάλμα κατά την αποθήκευση snapshot."
+
+def _handle_snapshots() -> str:
+    files = _list_snapshots(limit=30)
+    if not files:
+        return "ℹ️ Δεν υπάρχουν αποθηκευμένα snapshots."
+    lines = ["🗂 Διαθέσιμα snapshots (νεότερα στο τέλος):"]
+    for f in files:
+        stamp = f.replace(".json", "")
+        lines.append(f"• {stamp}")
+    return "\n".join(lines)
+
+def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
+    """
+    /pnl
+    /pnl 2025-10-10
+    /pnl 2025-10-10_0930
+    """
+    try:
+        snap = get_wallet_snapshot(wallet_address)
+        snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
+        snap = _normalize_snapshot_for_formatter(snap)
+        assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
+        cleaned, _ = _filter_and_sort_assets(assets)
+        total_now = _totals_value_from_assets(cleaned)
+
+        base = _load_snapshot(arg)  # None => latest, 'YYYY-MM-DD' => latest of day, 'YYYY-MM-DD_HHMM' => exact
+        if not base:
+            if arg:
+                return f"ℹ️ Δεν βρέθηκε snapshot για «{arg}». Δες /snapshots."
+            return "ℹ️ Δεν βρέθηκε αποθηκευμένο snapshot. Στείλε /snapshot πρώτα."
+
+        delta, pct, label = _compare_to_snapshot(total_now, base)
+        sign = "+" if delta >= 0 else ""
+        return f"📈 PnL vs snapshot {label}: ${_fmt_money(delta)} ({sign}{pct:.2f}%) — Now ≈ ${_fmt_money(total_now)}"
+    except Exception:
+        logging.exception("Failed to compute PnL")
+        return "⚠️ Σφάλμα κατά τον υπολογισμό PnL."
 
 # --------------------------------------------------
 # Command dispatcher
@@ -341,7 +585,8 @@ def _handle_holdings(wallet_address: str) -> str:
 def _dispatch_command(text: str) -> str:
     if not text:
         return ""
-    cmd = text.strip().split()[0].lower()
+    parts = text.strip().split()
+    cmd = parts[0].lower()
     if cmd == "/start":
         return _handle_start()
     if cmd == "/help":
@@ -352,6 +597,13 @@ def _dispatch_command(text: str) -> str:
         return _handle_rescan(WALLET_ADDRESS)
     if cmd == "/holdings":
         return _handle_holdings(WALLET_ADDRESS)
+    if cmd == "/snapshot":
+        return _handle_snapshot(WALLET_ADDRESS)
+    if cmd == "/snapshots":
+        return _handle_snapshots()
+    if cmd == "/pnl":
+        arg = parts[1] if len(parts) > 1 else None
+        return _handle_pnl(WALLET_ADDRESS, arg)
     return "❓ Άγνωστη εντολή. Δοκίμασε /help."
 
 # --------------------------------------------------
@@ -369,7 +621,7 @@ async def telegram_webhook(request: Request):
         if text:
             reply = _dispatch_command(text)
             send_message(reply, chat_id)
-    except Exception as e:
+    except Exception:
         logging.exception("Error handling Telegram webhook")
     return JSONResponse(content={"ok": True})
 
