@@ -319,3 +319,54 @@ def ledger_entries(symbol: Optional[str] = None, limit: int = 10) -> str:
             f" - {date} {asset}: IN {in_usd} / OUT {out_usd} / NET {net_usd} / Realized {realized_usd}"
         )
     return "\n".join(lines)
+
+# --- APPEND: /trades & /pnl today commands ---
+from reports.trades import todays_trades, realized_pnl_today
+from telegram.formatters import format_trades_table, format_pnl_today
+
+def cmd_trades(args: str = "") -> str:
+    """
+    Usage:
+      /trades
+      /trades CRO  (optional: filter με ένα σύμβολο)
+    """
+    sym = (args or "").strip().upper() or None
+    trades = todays_trades([sym] if sym else None)
+    return format_trades_table(trades)
+
+def cmd_pnl(args: str = "") -> str:
+    """
+    Usage:
+      /pnl today
+      /pnl today CRO  (προαιρετικό φιλτράρισμα στην εμφάνιση)
+    """
+    # Σκοπίμως αγνοούμε non-today παραμέτρους, αυτή η φάση καλύπτει "today" μόνο.
+    summary = realized_pnl_today()
+    text = format_pnl_today(summary)
+    # optional filter display:
+    sym = (args or "").replace("today", "").strip().upper()
+    if sym:
+        # τυπική φιλτραρισμένη εμφάνιση (γρήγορη λύση πάνω στο ίδιο κείμενο)
+        lines = [line for line in text.splitlines() if (line.startswith("- ") and line[2:].upper().startswith(sym)) or not line.startswith("- ")]
+        if len(lines) > 1:
+            return "\n".join(lines)
+    return text
+
+# --- Wiring into your dispatcher ---
+# Αν έχεις dict τύπου COMMANDS = {"holdings": handler, ...}, πρόσθεσε:
+try:
+    COMMANDS  # noqa: F821
+    COMMANDS.update({
+        "trades": cmd_trades,
+        "pnl": cmd_pnl,
+    })
+except NameError:
+    # Αν χρησιμοποιείς register(pattern, func), κάλεσέ το εδώ:
+    try:
+        register  # noqa: F821
+        register("/trades", cmd_trades)
+        register("/pnl", cmd_pnl)
+    except NameError:
+        # Ως fallback, άφησέ το ως utility: θα κληθεί ρητά από τον dispatcher σου.
+        pass
+
