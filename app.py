@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import logging
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -14,6 +15,9 @@ from telegram.formatters import format_holdings
 from core.holdings import get_wallet_snapshot
 from core.augment import augment_with_discovered_tokens
 from core.discovery import discover_tokens_for_wallet
+from core.pricing import get_spot_usd
+
+from decimal import Decimal, InvalidOperation
 
 # --------------------------------------------------
 # Configuration
@@ -40,14 +44,11 @@ def _fallback_send_message(text: str, chat_id: Optional[int] = None):
     3) raw HTTP fallback στο Bot API (αν αποτύχουν τα παραπάνω)
     """
     try:
-        # 1) send_telegram_message(text, chat_id) (χωρίς keyword args)
         if hasattr(tg_api, "send_telegram_message"):
             return tg_api.send_telegram_message(text, chat_id)
-        # 2) send_telegram(text, chat_id)
         if hasattr(tg_api, "send_telegram"):
             return tg_api.send_telegram(text, chat_id)
     except TypeError:
-        # module δέχεται μόνο text (χωρίς chat_id)
         try:
             if hasattr(tg_api, "send_telegram_message"):
                 return tg_api.send_telegram_message(text)
@@ -58,7 +59,6 @@ def _fallback_send_message(text: str, chat_id: Optional[int] = None):
     except Exception as e:
         logging.exception(f"Telegram send via module failed: {e}")
 
-    # 3) Raw HTTP fallback
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token or not chat_id:
         logging.error("No BOT_TOKEN or chat_id available for HTTP fallback.")
@@ -96,8 +96,6 @@ def send_message(text: str, chat_id: Optional[int] = None) -> None:
 # --------------------------------------------------
 # Snapshot normalization helpers (για formatters)
 # --------------------------------------------------
-from decimal import Decimal, InvalidOperation
-
 def _to_dec(x):
     if isinstance(x, Decimal):
         return x
@@ -107,26 +105,21 @@ def _to_dec(x):
         return x
 
 def _asset_as_dict(a):
-    # Αν είναι ήδη dict, απλώς επέστρεψέ το
     if isinstance(a, dict):
         return a
-    # Αν είναι list/tuple, χαρτογράφησέ το σε κλασική μορφή
     if isinstance(a, (list, tuple)):
-        # Συνηθισμένη σειρά: symbol, amount, price_usd, value_usd
         fields = ["symbol", "amount", "price_usd", "value_usd"]
         d = {}
         for i, v in enumerate(a):
             key = fields[i] if i < len(fields) else f"extra_{i}"
             d[key] = v
         return d
-    # Οτιδήποτε άλλο: τουλάχιστον δώσε symbol
     return {"symbol": str(a)}
 
 def _normalize_snapshot_for_formatter(snap: dict) -> dict:
     out = dict(snap or {})
     assets = out.get("assets") or []
     out["assets"] = [_asset_as_dict(x) for x in assets]
-    # Τυποποίηση σε Decimal όπου είναι εφικτό
     for a in out["assets"]:
         if "amount" in a:
             a["amount"] = _to_dec(a["amount"])
@@ -137,20 +130,89 @@ def _normalize_snapshot_for_formatter(snap: dict) -> dict:
     return out
 
 # --------------------------------------------------
+# ENV-driven filters/sorting for holdings/rescan
+# --------------------------------------------------
+def _env_bool(name: str, default: bool) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if v in ("1","true","yes","y","on"): return True
+    if v in ("0","false","no","n","off"): return False
+    return default
+
+def _env_dec(name: str, default: str) -> Decimal:
+    try:
+        return Decimal(os.getenv(name, default))
+    except Exception:
+        return Decimal(default)
+
+def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
+    """
+    Εφαρμόζει φίλτρα/ταξινόμηση σύμφωνα με env:
+    - HOLDINGS_HIDE_ZERO_PRICE (default True)
+    - HOLDINGS_DUST_USD (default 0.05)
+    - HOLDINGS_BLACKLIST_REGEX (για spammy ονόματα)
+    - HOLDINGS_LIMIT (πόσες γραμμές να δείξουμε)
+    Επιστρέφει: (visible_assets, hidden_count)
+    """
+    hide_zero = _env_bool("HOLDINGS_HIDE_ZERO_PRICE", True)
+    dust_usd  = _env_dec("HOLDINGS_DUST_USD", "0.05")
+    limit     = int(os.getenv("HOLDINGS_LIMIT", "40"))
+    bl_re_pat = os.getenv("HOLDINGS_BLACKLIST_REGEX", r"(?i)(claim|airdrop|promo|mistery|crowithknife|classic|button|ryoshi|ethena\.promo)")
+    bl_re = re.compile(bl_re_pat)
+
+    visible = []
+    hidden  = 0
+    whitelist_zero_price = {"USDT","USDC","WCRO","CRO","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC"}
+
+    for a in assets:
+        d = _asset_as_dict(a)
+        sym = str(d.get("symbol","?")).upper().strip()
+        price = _to_dec(d.get("price_usd", 0)) or Decimal("0")
+        val   = _to_dec(d.get("value_usd", 0))
+        if val is None or isinstance(val, (str, float, int)):
+            amt = _to_dec(d.get("amount", 0)) or Decimal("0")
+            val = amt * price
+
+        if bl_re.search(sym):
+            hidden += 1
+            continue
+        if hide_zero and price <= 0 and sym not in whitelist_zero_price:
+            hidden += 1
+            continue
+        if val is None or val < dust_usd:
+            hidden += 1
+            continue
+
+        d["price_usd"] = price
+        d["value_usd"] = val
+        visible.append(d)
+
+    visible.sort(key=lambda x: (x.get("value_usd") or Decimal("0")), reverse=True)
+
+    if limit and len(visible) > limit:
+        hidden += (len(visible) - limit)
+        visible = visible[:limit]
+
+    return visible, hidden
+
+# --------------------------------------------------
 # Command Handlers
 # --------------------------------------------------
 def _handle_start() -> str:
     return (
         "👋 Γεια σου! Είμαι το Cronos DeFi Sentinel.\n\n"
         "Διαθέσιμες εντολές:\n"
-        "• /holdings — snapshot χαρτοφυλακίου\n"
+        "• /holdings — snapshot χαρτοφυλακίου (με φίλτρα & ταξινόμηση)\n"
+        "• /scan — ωμή λίστα tokens από ανακάλυψη (χωρίς φίλτρα)\n"
+        "• /rescan — πλήρης επανεύρεση & εμφάνιση (με φίλτρα)\n"
         "• /help — βοήθεια"
     )
 
 def _handle_help() -> str:
     return (
         "ℹ️ Βοήθεια\n"
-        "• /holdings — δείχνει τρέχον snapshot\n"
+        "• /holdings — δείχνει τρέχον snapshot (MTM με τιμές, φιλτραρισμένο)\n"
+        "• /scan — ωμή λίστα tokens που βρέθηκαν (amount + address)\n"
+        "• /rescan — ξανά σκανάρισμα & παρουσίαση όπως το /holdings\n"
         "• /start — βασικές οδηγίες"
     )
 
@@ -158,7 +220,7 @@ def _handle_scan(wallet_address: str) -> str:
     toks = discover_tokens_for_wallet(wallet_address)
     if not toks:
         return "🔍 Δεν βρέθηκαν ERC-20 tokens με θετικό balance (ή δεν βρέθηκαν μεταφορές στο lookback)."
-    lines = ["🔍 Εντοπίστηκαν tokens:"]
+    lines = ["🔍 Εντοπίστηκαν tokens (raw):"]
     for t in toks:
         sym = t.get("symbol", "?")
         amt = t.get("amount", "0")
@@ -166,59 +228,69 @@ def _handle_scan(wallet_address: str) -> str:
         lines.append(f"• {sym}: {amt} ({addr})")
     return "\n".join(lines)
 
+def _enrich_with_prices(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Γέμισε price/value για tokens ώστε να περάσουν φίλτρα/ταξινόμηση."""
+    out: List[Dict[str, Any]] = []
+    for t in tokens:
+        d = _asset_as_dict(t)
+        sym = str(d.get("symbol","?")).upper()
+        addr = d.get("address")
+        amt  = _to_dec(d.get("amount", 0)) or Decimal("0")
+        price = get_spot_usd(sym, token_address=addr)
+        price_dec = _to_dec(price) or Decimal("0")
+        value = amt * price_dec
+        d["price_usd"] = price_dec
+        d["value_usd"] = value
+        out.append(d)
+    return out
+
 def _handle_rescan(wallet_address: str) -> str:
     if not wallet_address:
         return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
     toks = discover_tokens_for_wallet(wallet_address)
     if not toks:
         return "🔁 Rescan ολοκληρώθηκε — δεν βρέθηκαν ERC-20 με θετικό balance."
-    lines = ["🔁 Rescan ολοκληρώθηκε — βρέθηκαν:"]
-    for t in toks:
-        lines.append(f"• {t.get('symbol','?')} ({t.get('address','?')}), amount={t.get('amount','0')}")
+
+    # Εμπλούτισε με τιμές για να λειτουργήσουν φίλτρα/ταξινομήσεις
+    enriched = _enrich_with_prices(toks)
+    cleaned, hidden_count = _filter_and_sort_assets(enriched)
+
+    if not cleaned:
+        return "🔁 Rescan ολοκληρώθηκε — δεν υπάρχει κάτι αξιοσημείωτο να εμφανιστεί (όλα φιλτραρίστηκαν ως spam/zero/dust)."
+
+    # Σύντομη λίστα για Telegram, με value
+    lines = ["🔁 Rescan (top, filtered):"]
+    for d in cleaned:
+        sym = d.get("symbol","?")
+        amt = d.get("amount","0")
+        px  = d.get("price_usd", Decimal("0"))
+        val = d.get("value_usd", Decimal("0"))
+        addr = d.get("address","")
+        lines.append(f"• {sym}: {amt} @ ${px} (= ${val})  ({addr})")
+
+    if hidden_count:
+        lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
+
     return "\n".join(lines)
 
 def _handle_holdings(wallet_address: str) -> str:
     try:
-        # 1) Πάρε το βασικό snapshot
         snap = get_wallet_snapshot(wallet_address)
-        # 2) Κάνε merge τα discovered tokens
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
-        # 3) Νοrmalize ώστε κάθε asset να είναι dict με ασφαλείς τύπους
         snap = _normalize_snapshot_for_formatter(snap)
 
-        # ---- ΚΡΙΣΙΜΟ ----
-        # Το format_holdings φαίνεται να περιμένει ΛΙΣΤΑ από assets (dicts).
         assets = snap.get("assets") or []
-        if not isinstance(assets, list):
-            assets = [assets]
-        # Εξασφάλισε ότι κάθε στοιχείο είναι dict (διπλή ασφάλεια)
         assets = [_asset_as_dict(a) for a in assets]
 
-        return format_holdings(assets)
+        cleaned, hidden_count = _filter_and_sort_assets(assets)
+        body = format_holdings(cleaned)
+        if hidden_count:
+            body += f"\n\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)"
+        return body
 
-    except Exception as e:
+    except Exception:
         logging.exception("Failed to build /holdings")
-
-        # Fallback: απλό MTM print για να μη μένεις χωρίς απάντηση
-        try:
-            # προσπάθησε να εμφανίσεις ό,τι έχει ήδη υπολογιστεί
-            lines = ["💼 Wallet Assets (MTM)"]
-            snap = snap if isinstance(snap, dict) else {}
-            assets = (snap.get("assets") or []) if isinstance(snap, dict) else []
-            # μάζεψε βασικές γραμμές
-            total = Decimal("0")
-            for a in assets:
-                d = _asset_as_dict(a)
-                sym = str(d.get("symbol", "?"))
-                amt = _to_dec(d.get("amount", 0)) or Decimal("0")
-                px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
-                val = _to_dec(d.get("value_usd", amt * px)) or Decimal("0")
-                total += val
-                lines.append(f"• {sym}: {amt} @ ${px} (= ${val})")
-            lines.append(f"\nΣύνολο: ${total}")
-            return "\n".join(lines) if assets else "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
-        except Exception:
-            return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
+        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
 
 # --------------------------------------------------
 # Command dispatcher
