@@ -2,7 +2,6 @@
 from __future__ import annotations
 import os
 import asyncio
-import json
 import logging
 from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal
@@ -12,21 +11,43 @@ from web3.types import LogReceipt
 
 # --- ENV / Defaults ---
 WALLET = (os.getenv("WALLET_ADDRESS") or "").strip()
-CRONOS_WSS = os.getenv("CRONOS_WSS_URL", "wss://cronos-evm-rpc.publicnode.com")  # public WS
-CONFIRMATIONS = int(os.getenv("RT_CONFIRMS", "2"))  # πόσα blocks περιμένουμε πριν ενημερώσουμε
-POLL_INTERVAL = float(os.getenv("RT_POLL_SEC", "1.2"))  # sec ανά νέο block polling
+CRONOS_WSS = os.getenv("CRONOS_WSS_URL", "wss://cronos-evm-rpc.publicnode.com")
+# 0 = push as soon as it lands in latest block; >=1 waits confirmations before pushing
+CONFIRMATIONS = int(os.getenv("RT_CONFIRMS", "0"))
+POLL_INTERVAL = float(os.getenv("RT_POLL_SEC", "1.0"))
 
-# Γνωστοί routers στο Cronos (μπορείς να προσθέσεις/αλλάξεις χωρίς restart αν τα περάσεις σε ENV)
-KNOWN_ROUTERS = {
-    # VVS Finance Router:
-    # Σύμφωνα με Cronos explorer labels (router address εμφανίζεται ως "VVS Finance: Router").
-    "0x145863Eb42Cf62847A6Ca784e6416C1682b1b2Ae".lower(): "VVS Router",
-    "0xe0137ee596c35bf7adedad1e2fd25da595d1e05b".lower(): "VVS Router (alt)",  # επιπλέον label που έχει εμφανιστεί
-    # MM.Finance (σύνηθες router main):
-    "0x22d710931f01c1681ca1570ff016ed42eb7b7c2a".lower(): "MMF Router",
+# --- Known routers on Cronos (expand easily) ---
+KNOWN_ROUTERS: Dict[str, str] = {
+    # VVS Finance
+    "0x145863eb42cf62847a6ca784e6416c1682b1b2ae": "VVS Router",
+    "0xe0137ee596c35bf7adedad1e2fd25da595d1e05b": "VVS Router (alt)",
+    # MM.Finance
+    "0x22d710931f01c1681ca1570ff016ed42eb7b7c2a": "MMF Router",
+    # Odos (aggregator)
+    "0x76c930c6a2c2d7ee1e2fcfef05b0bb2e6902a84a": "Odos Router",
+    # Crodex
+    "0x62e60a3f73d3f90a5a2f0a6a3e0f6c2a1e86c9b9": "Crodex Router",
+    # Veno / Ferro (stable swap routers commonly used)
+    "0xdef1abe32c034e558cdd535791643c58a13acc10": "Router (common agg)",  # generic agg fallback
+}
+# lowercase keys
+KNOWN_ROUTERS = {k.lower(): v for k, v in KNOWN_ROUTERS.items()}
+
+# --- Common router method selectors (first 4 bytes) to tag swaps even if logs are sparse ---
+# These are typical for UniV2-like and router-style swaps.
+SWAP_SELECTORS = {
+    "0x38ed1739",  # swapExactTokensForTokens(uint,uint,address[],address,uint)
+    "0x18cbafe5",  # swapExactTokensForETH(uint,uint,address[],address,uint)
+    "0x7ff36ab5",  # swapExactETHForTokens(uint,uint,address[],address,uint)
+    "0x8803dbee",  # swapExactTokensForTokensSupportingFeeOnTransferTokens(...)
+    "0x5c11d795",  # swapExactTokensForETHSupportingFeeOnTransferTokens(...)
+    "0xb6f9de95",  # swapExactETHForTokensSupportingFeeOnTransferTokens(...)
+    "0x472b43f3",  # swapTokensForExactTokens(uint,uint,address[],address,uint)
+    "0x4a25d94a",  # swapTokensForExactETH(uint,uint,address[],address,uint)
+    "0xfb3bdb41",  # swapETHForExactTokens(uint,uint,address[],address,uint)
 }
 
-# ERC20 ABI μίνιμαλ για symbol/decimals και Transfer event
+# --- ABIs / Topics ---
 ERC20_ABI = [
     {"anonymous": False, "inputs": [
         {"indexed": True, "name": "from", "type": "address"},
@@ -37,154 +58,104 @@ ERC20_ABI = [
     {"inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "stateMutability": "view", "type": "function"},
 ]
 
-# Pair Swap event (για pools τύπου UniswapV2)
-SWAP_TOPIC = Web3.keccak(text="Swap(address,uint256,uint256,uint256,uint256,address)").hex()
 TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+
+# Uniswap V2 Swap event:
+V2_SWAP_TOPIC = Web3.keccak(text="Swap(address,uint256,uint256,uint256,uint256,address)").hex()
+# Uniswap V3 Swap event:
+V3_SWAP_TOPIC = Web3.keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
 
 def _fmt_amt(amount: int, decimals: int) -> str:
     d = Decimal(amount) / (Decimal(10) ** decimals)
-    # 0.######## έως 4 δεκαδικά
     return f"{d:.6f}".rstrip("0").rstrip(".")
 
-async def _erc20_meta(w3: Web3, token: str) -> Tuple[str, int]:
+async def _erc20_meta(w3: Web3, token: str, cache: Dict[str, Tuple[str, int]]) -> Tuple[str, int]:
+    token = token.lower()
+    if token in cache:
+        return cache[token]
     try:
         c = w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
         sym = c.functions.symbol().call()
         dec = c.functions.decimals().call()
-        return sym, int(dec)
+        cache[token] = (sym, int(dec))
+        return cache[token]
     except Exception:
-        # fallback: κόβουμε το address
-        return token[:6].upper(), 18
+        cache[token] = (token[:6].upper(), 18)
+        return cache[token]
+
+def _hex_to_addr(topic_hex: Any) -> str:
+    # topic_hex may be HexBytes or hex-string; normalize to '0x....'
+    if hasattr(topic_hex, "hex"):
+        h = topic_hex.hex()
+    else:
+        h = str(topic_hex)
+    return "0x" + h[-40:]
 
 def _parse_transfers(logs: List[LogReceipt], wallet: str) -> List[Dict[str, Any]]:
-    """Επιστρέφει transfers (in/out) που εμπλέκουν το wallet."""
     outs = []
-    wallet_low = wallet.lower()
+    w = wallet.lower()
     for lg in logs:
-        if lg["topics"][0].hex() != TRANSFER_TOPIC:
+        try:
+            if (lg["topics"][0].hex() if hasattr(lg["topics"][0], "hex") else str(lg["topics"][0])) != TRANSFER_TOPIC:
+                continue
+            if len(lg["topics"]) < 3:
+                continue
+            from_addr = _hex_to_addr(lg["topics"][1])
+            to_addr   = _hex_to_addr(lg["topics"][2])
+            if w not in (from_addr.lower(), to_addr.lower()):
+                continue
+            outs.append({
+                "token": lg["address"],
+                "from": from_addr,
+                "to": to_addr,
+                "data": lg["data"],  # amount
+                "log": lg,
+            })
+        except Exception:
             continue
-        # topics[1]=from, topics[2]=to
-        if len(lg["topics"]) < 3:
-            continue
-        from_addr = "0x" + lg["topics"][1].hex()[-40:]
-        to_addr = "0x" + lg["topics"][2].hex()[-40:]
-        if wallet_low not in (from_addr.lower(), to_addr.lower()):
-            continue
-        outs.append({
-            "token": lg["address"],
-            "from": from_addr,
-            "to": to_addr,
-            "data": lg["data"],  # amount στο data
-            "log": lg,
-        })
     return outs
 
-def _is_probable_swap(tx_to: Optional[str], transfers_count: int, logs: List[LogReceipt]) -> bool:
-    """Εύρεση swap: είτε tx.to είναι γνωστό router, είτε έχουμε Swap event σε ζεύγος."""
+def _looks_like_swap(tx_to: Optional[str], tx_input: Optional[str], logs: List[LogReceipt]) -> bool:
     if tx_to and tx_to.lower() in KNOWN_ROUTERS:
         return True
-    if any((len(x["topics"]) > 0 and x["topics"][0].hex() == SWAP_TOPIC) for x in logs):
-        return True
-    # σήκωσε heuristic: >=2 transfers στο ίδιο tx (in+out) → πιθανός swap
-    return transfers_count >= 2
+    # any V2 or V3 Swap in logs
+    for lg in logs:
+        try:
+            topic0 = lg["topics"][0].hex() if hasattr(lg["topics"][0], "hex") else str(lg["topics"][0])
+            if topic0 in (V2_SWAP_TOPIC, V3_SWAP_TOPIC):
+                return True
+        except Exception:
+            continue
+    # method selector on router calls
+    if isinstance(tx_input, (bytes, bytearray)) and len(tx_input) >= 4:
+        selector = "0x" + tx_input[:4].hex()
+        if selector in SWAP_SELECTORS:
+            return True
+    if isinstance(tx_input, str) and tx_input.startswith("0x") and len(tx_input) >= 10:
+        selector = tx_input[:10]
+        if selector in SWAP_SELECTORS:
+            return True
+    return False
 
-async def _describe_transfers(w3: Web3, transfers: List[Dict[str, Any]]) -> List[str]:
+async def _describe_transfers(w3: Web3, transfers: List[Dict[str, Any]], meta_cache: Dict[str, Tuple[str, int]]) -> List[str]:
     lines = []
-    meta_cache: Dict[str, Tuple[str, int]] = {}
     for t in transfers:
         token = t["token"]
-        if token not in meta_cache:
-            meta_cache[token] = await _erc20_meta(w3, token)
-        sym, dec = meta_cache[token]
-        amount = int(t["data"], 16) if isinstance(t["data"], str) else int.from_bytes(t["data"], "big")
+        sym, dec = await _erc20_meta(w3, token, meta_cache)
+        data = t["data"]
+        try:
+            if isinstance(data, (bytes, bytearray)):
+                amount = int.from_bytes(data, "big")
+            else:
+                # '0x...' string
+                amount = int(str(data), 16)
+        except Exception:
+            amount = 0
         direction = "IN" if t["to"].lower() == WALLET.lower() else "OUT"
-        lines.append(f"{direction} { _fmt_amt(amount, dec) } {sym}")
+        lines.append(f"{direction} {_fmt_amt(amount, dec)} {sym}")
     return lines
 
-async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
-    """
-    send_fn: async | sync function(text: str) που στέλνει στο Telegram (θα δώσουμε wrapper από app.py)
-    """
-    if not WALLET:
-        logger.warning("No WALLET_ADDRESS set; realtime monitor disabled.")
-        return
-
-    w3 = Web3(Web3.WebsocketProvider(CRONOS_WSS, websocket_timeout=30))
-    if not w3.is_connected():
-        logger.error("Web3 not connected to %s", CRONOS_WSS)
-        return
-
-    logger.info("Realtime monitor connected to %s", CRONOS_WSS)
-    wallet = Web3.to_checksum_address(WALLET)
-
-    last_handled_block = None
-    pending_msgs: Dict[str, Dict[str, Any]] = {}  # txHash -> data
-
-    while True:
-        try:
-            # περίμενε νέο block
-            block = w3.eth.get_block("latest")
-            number = block.number
-            if last_handled_block is None:
-                last_handled_block = max(0, number - 1)
-            # προχώρα block-by-block για σταθερότητα
-            for b in range(last_handled_block + 1, number - CONFIRMATIONS + 1):
-                blk = w3.eth.get_block(b, full_transactions=True)
-                # 1) native CRO κινήσεις: απευθείας txs προς/από wallet
-                for tx in blk.transactions:
-                    frm = (tx["from"] or "").lower()
-                    to = (tx["to"] or "").lower() if tx["to"] else ""
-                    if wallet.lower() in (frm, to):
-                        val = Decimal(tx["value"]) / (Decimal(10) ** 18)
-                        native_dir = "OUT" if frm == wallet.lower() else "IN"
-                        maybe_router = KNOWN_ROUTERS.get(to, "") if to else ""
-                        note = f" ({maybe_router})" if maybe_router else ""
-                        text = f"💸 {native_dir} {val:.6f} CRO — tx {tx['hash'].hex()[:10]}…{tx['hash'].hex()[-8:]}{note}"
-                        await _safe_send(send_fn, text)
-
-                # 2) ERC20 Transfers + Swaps
-                # φέρε όλα τα logs του block που μας αφορούν
-                logs = w3.eth.get_logs({
-                    "fromBlock": b,
-                    "toBlock": b,
-                    "topics": [TRANSFER_TOPIC, None, None],  # φίλτρο στο event
-                })
-                # φιλτράρισμα μόνο όσων αφορούν το wallet
-                logs_for_wallet = [lg for lg in logs if (
-                    ("0x" + lg["topics"][1].hex()[-40:]).lower() == wallet.lower() or
-                    ("0x" + lg["topics"][2].hex()[-40:]).lower() == wallet.lower()
-                )]
-
-                # ομαδοποίηση ανά tx
-                by_tx: Dict[str, List[LogReceipt]] = {}
-                for lg in logs_for_wallet:
-                    h = lg["transactionHash"].hex()
-                    by_tx.setdefault(h, []).append(lg)
-
-                for txh, lgs in by_tx.items():
-                    # φέρε την tx & receipt για context (to-address, extra logs για Swap)
-                    tx = w3.eth.get_transaction(txh)
-                    rc = w3.eth.get_transaction_receipt(txh)
-                    transfers = _parse_transfers(lgs, wallet)
-                    is_swap = _is_probable_swap(tx["to"], len(transfers), rc["logs"])
-
-                    # format γραμμές
-                    lines = await _describe_transfers(w3, transfers)
-                    header = "🔄 Swap" if is_swap else "🔔 Transfer"
-                    router_note = ""
-                    if tx["to"] and tx["to"].lower() in KNOWN_ROUTERS:
-                        router_note = f" via {KNOWN_ROUTERS[tx['to'].lower()]}"
-                    msg = f"{header}{router_note}\n" + "\n".join(f"• {ln}" for ln in lines) + f"\nTx: {txh[:10]}…{txh[-8:]}"
-                    await _safe_send(send_fn, msg)
-
-                last_handled_block = b
-
-            await asyncio.sleep(POLL_INTERVAL)
-        except Exception as e:
-            logger.exception("monitor loop error: %s", e)
-            await asyncio.sleep(3.0)
-
-async def _safe_send(send_fn, text: str):
+async def _send(send_fn, text: str):
     try:
         if asyncio.iscoroutinefunction(send_fn):
             await send_fn(text)
@@ -192,3 +163,99 @@ async def _safe_send(send_fn, text: str):
             send_fn(text)
     except Exception:
         logging.exception("send_fn failed")
+
+async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
+    if not WALLET:
+        logger.warning("No WALLET_ADDRESS set; realtime monitor disabled.")
+        return
+
+    w3 = Web3(Web3.WebsocketProvider(CRONOS_WSS, websocket_timeout=45))
+    if not w3.is_connected():
+        logger.error("Web3 not connected to %s", CRONOS_WSS)
+        return
+
+    logger.info("Realtime monitor connected to %s", CRONOS_WSS)
+    wallet = Web3.to_checksum_address(WALLET)
+    meta_cache: Dict[str, Tuple[str, int]] = {}
+
+    last_handled = None
+
+    while True:
+        try:
+            latest = w3.eth.get_block("latest")
+            latest_num = latest.number
+
+            if last_handled is None:
+                # start from (latest - 1) so we don't miss just-mined block
+                last_handled = max(0, latest_num - 1)
+
+            # Process up to latest - CONFIRMATIONS
+            target = latest_num - CONFIRMATIONS
+            if target < last_handled + 1:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            for b in range(last_handled + 1, target + 1):
+                blk = w3.eth.get_block(b, full_transactions=True)
+
+                # 1) Native CRO movements involving wallet
+                for tx in blk.transactions:
+                    try:
+                        frm = (tx["from"] or "").lower()
+                        to  = (tx["to"] or "").lower() if tx["to"] else ""
+                        if wallet.lower() not in (frm, to):
+                            continue
+                        if int(tx["value"]) > 0:
+                            val = Decimal(tx["value"]) / (Decimal(10) ** 18)
+                            native_dir = "OUT" if frm == wallet.lower() else "IN"
+                            router_note = KNOWN_ROUTERS.get(to, "") if to else ""
+                            note = f" via {router_note}" if router_note else ""
+                            await _send(send_fn, f"💸 {native_dir} {val:.6f} CRO{note}\nTx: {tx['hash'].hex()[:10]}…{tx['hash'].hex()[-8:]}")
+                    except Exception:
+                        continue
+
+                # 2) ERC-20 Transfers (filter at node by topic, then post-filter by wallet)
+                logs = w3.eth.get_logs({
+                    "fromBlock": b,
+                    "toBlock": b,
+                    "topics": [TRANSFER_TOPIC, None, None],
+                })
+                logs_for_wallet = []
+                wl = wallet.lower()
+                for lg in logs:
+                    try:
+                        from_addr = _hex_to_addr(lg["topics"][1]).lower()
+                        to_addr   = _hex_to_addr(lg["topics"][2]).lower()
+                        if wl in (from_addr, to_addr):
+                            logs_for_wallet.append(lg)
+                    except Exception:
+                        continue
+
+                # group by tx
+                by_tx: Dict[str, List[LogReceipt]] = {}
+                for lg in logs_for_wallet:
+                    by_tx.setdefault(lg["transactionHash"].hex(), []).append(lg)
+
+                for txh, lgs in by_tx.items():
+                    try:
+                        tx = w3.eth.get_transaction(txh)
+                        rc = w3.eth.get_transaction_receipt(txh)
+                        transfers = _parse_transfers(lgs, wallet)
+                        is_swap = _looks_like_swap(tx["to"], tx.get("input"), rc["logs"])
+                        lines = await _describe_transfers(w3, transfers, meta_cache)
+
+                        header = "🔄 Swap" if is_swap else "🔔 Transfer"
+                        router_note = ""
+                        if tx["to"] and tx["to"].lower() in KNOWN_ROUTERS:
+                            router_note = f" via {KNOWN_ROUTERS[tx['to'].lower()]}"
+                        msg = f"{header}{router_note}\n" + "\n".join(f"• {ln}" for ln in lines) + f"\nTx: {txh[:10]}…{txh[-8:]}"
+                        await _send(send_fn, msg)
+                    except Exception:
+                        continue
+
+                last_handled = b
+
+            await asyncio.sleep(POLL_INTERVAL)
+        except Exception as e:
+            logger.exception("monitor loop error: %s", e)
+            await asyncio.sleep(3.0)
