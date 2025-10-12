@@ -11,27 +11,24 @@ from typing import Optional, List, Dict, Any
 from collections import OrderedDict
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from decimal import Decimal, InvalidOperation
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from telegram import api as tg_api
-# Προαιρετικά κρατάμε διαθέσιμο το external formatter (δεν το χρησιμοποιούμε εδώ)
-# from telegram.formatters import format_holdings as _unused_external_formatter
 
 from core.holdings import get_wallet_snapshot
 from core.augment import augment_with_discovered_tokens
 from core.discovery import discover_tokens_for_wallet
 from core.pricing import get_spot_usd
 
-# --- Phase 2: intraday trades & realized PnL (today) ---
+# Phase 2: intraday trades & realized PnL (today)
 from reports.trades import todays_trades, realized_pnl_today
 from telegram.formatters import format_trades_table, format_pnl_today
 
-# --- Realtime monitor ---
+# Realtime monitor (separate file you added: realtime/monitor.py)
 from realtime.monitor import monitor_wallet
-
-from decimal import Decimal, InvalidOperation
 
 # --------------------------------------------------
 # Configuration
@@ -39,33 +36,26 @@ from decimal import Decimal, InvalidOperation
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0")) or None
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-APP_URL = os.getenv("APP_URL")  # optional, αν το χρειαστείς για webhook set
+APP_URL = os.getenv("APP_URL")  # optional
 EOD_TIME = os.getenv("EOD_TIME", "23:59")
 TZ = os.getenv("TZ", "Europe/Athens")
-SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./data/snapshots")  # Railway: ephemeral ανά deploy, το ξέρουμε
+SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./data/snapshots")  # Railway FS is ephemeral per deploy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="1.2")
+app = FastAPI(title="Cronos DeFi Sentinel", version="1.3")
 
 # --------------------------------------------------
-# Helper: Safe Telegram message splitter
+# Telegram send (with safe splitting)
 # --------------------------------------------------
 def _fallback_send_message(text: str, chat_id: Optional[int] = None):
-    """
-    Στείλε μήνυμα στο Telegram χρησιμοποιώντας:
-    1) telegram.api.send_telegram_message(text, chat_id)  (αν υπάρχει)
-    2) telegram.api.send_telegram(text, chat_id)          (εναλλακτικό όνομα)
-    3) raw HTTP fallback στο Bot API (αν αποτύχουν τα παραπάνω)
-    """
     try:
         if hasattr(tg_api, "send_telegram_message"):
             return tg_api.send_telegram_message(text, chat_id)
         if hasattr(tg_api, "send_telegram"):
             return tg_api.send_telegram(text, chat_id)
     except TypeError:
-        # ορισμένα modules περιμένουν μόνο text
         try:
             if hasattr(tg_api, "send_telegram_message"):
                 return tg_api.send_telegram_message(text)
@@ -93,7 +83,6 @@ def _fallback_send_message(text: str, chat_id: Optional[int] = None):
         logging.exception(f"Telegram HTTP fallback exception: {e}")
 
 def _send_long_text(text: str, chat_id: Optional[int], chunk: int = 3500) -> None:
-    """Split μεγάλα μηνύματα (~>4096 chars) σε κομμάτια και τα στέλνει διαδοχικά."""
     if not text:
         return
     t = text
@@ -107,11 +96,10 @@ def _send_long_text(text: str, chat_id: Optional[int], chunk: int = 3500) -> Non
     _fallback_send_message(t, chat_id)
 
 def send_message(text: str, chat_id: Optional[int] = None) -> None:
-    """Main send wrapper: ασφαλές split μεγάλων μηνυμάτων"""
     _send_long_text(text, chat_id)
 
 # --------------------------------------------------
-# Snapshot normalization helpers (για φίλτρα/formatting)
+# Snapshot normalization helpers
 # --------------------------------------------------
 def _to_dec(x):
     if isinstance(x, Decimal):
@@ -147,7 +135,7 @@ def _normalize_snapshot_for_formatter(snap: dict) -> dict:
     return out
 
 # --------------------------------------------------
-# ENV-driven filters/sorting for holdings/rescan
+# ENV-driven filters/sorting
 # --------------------------------------------------
 def _env_bool(name: str, default: bool) -> bool:
     v = (os.getenv(name) or "").strip().lower()
@@ -163,15 +151,13 @@ def _env_dec(name: str, default: str) -> Decimal:
 
 def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
     """
-    Εφαρμόζει φίλτρα/ταξινόμηση σύμφωνα με env:
+    Filters/sorts with env:
     - HOLDINGS_HIDE_ZERO_PRICE (default True)
     - HOLDINGS_DUST_USD (default 0.05)
-    - HOLDINGS_BLACKLIST_REGEX (για spammy ονόματα)
-    - HOLDINGS_LIMIT (πόσες γραμμές να δείξουμε)
+    - HOLDINGS_BLACKLIST_REGEX
+    - HOLDINGS_LIMIT (default 40)
 
-    Κανόνες για majors (CRO, WCRO, κ.λπ.):
-    - Αν price==0, δοκίμασε live get_spot_usd πριν φιλτράρεις
-    - ΜΗΝ εφαρμόζεις dust filter στα majors
+    Majors rules: no dust filter; if price==0, try live get_spot_usd.
     """
     hide_zero = _env_bool("HOLDINGS_HIDE_ZERO_PRICE", True)
     dust_usd  = _env_dec("HOLDINGS_DUST_USD", "0.05")
@@ -179,12 +165,9 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
     bl_re_pat = os.getenv("HOLDINGS_BLACKLIST_REGEX", r"(?i)(claim|airdrop|promo|mistery|crowithknife|classic|button|ryoshi|ethena\.promo)")
     bl_re = re.compile(bl_re_pat)
 
-    # Majors = δεν κόβονται από dust· αν λείπει τιμή, κάνε live lookup
     majors = {"USDT","USDC","WCRO","CRO","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC","HBAR"}
 
-    visible = []
-    hidden  = 0
-
+    visible, hidden = [], 0
     for a in assets:
         d = _asset_as_dict(a)
         sym = str(d.get("symbol","?")).upper().strip()
@@ -192,7 +175,6 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         price = _to_dec(d.get("price_usd", 0)) or Decimal("0")
         amt   = _to_dec(d.get("amount", 0)) or Decimal("0")
 
-        # Αν major και price==0 → προσπάθησε live spot lookup
         if sym in majors and (price is None or price <= 0):
             try:
                 px_live = get_spot_usd(sym, token_address=addr)
@@ -200,22 +182,16 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
             except Exception:
                 pass
 
-        # Υπολόγισε value (αν λείπει)
         val = _to_dec(d.get("value_usd", 0))
         if val is None or isinstance(val, (str, float, int)):
             val = amt * (price or Decimal("0"))
 
-        # blacklist by symbol (spam/claims)
         if bl_re.search(sym):
             hidden += 1
             continue
-
-        # zero-price φίλτρο: κόψε ΜΟΝΟ αν δεν είναι major
         if hide_zero and (price is None or price <= 0) and sym not in majors:
             hidden += 1
             continue
-
-        # dust φίλτρο: κόψε ΜΟΝΟ αν δεν είναι major
         if sym not in majors:
             if val is None or val < dust_usd:
                 hidden += 1
@@ -225,10 +201,8 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         d["value_usd"] = val
         visible.append(d)
 
-    # sort by USD value desc
     visible.sort(key=lambda x: (_to_dec(x.get("value_usd")) or Decimal("0")), reverse=True)
 
-    # cap results
     if limit and len(visible) > limit:
         hidden += (len(visible) - limit)
         visible = visible[:limit]
@@ -236,10 +210,6 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
     return visible, hidden
 
 def _assets_list_to_mapping(assets: list) -> dict:
-    """
-    Μετατρέπει λίστα από assets (dicts) σε mapping {SYMBOL: data}.
-    Αν βρεθεί διπλό symbol, κάνει aggregate (amount) και ενημερώνει price/value.
-    """
     out: dict[str, dict] = OrderedDict()
     for item in assets:
         d = _asset_as_dict(item)
@@ -249,7 +219,6 @@ def _assets_list_to_mapping(assets: list) -> dict:
         val = _to_dec(d.get("value_usd", 0))
         if val is None:
             val = amt * px
-
         if sym in out:
             prev = out[sym]
             prev_amt = _to_dec(prev.get("amount", 0)) or Decimal("0")
@@ -269,7 +238,7 @@ def _assets_list_to_mapping(assets: list) -> dict:
     return out
 
 # --------------------------------------------------
-# Snapshots storage (multi per day) + PnL helpers
+# Snapshots storage + PnL helpers
 # --------------------------------------------------
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -278,15 +247,13 @@ def _now_local() -> datetime:
     return datetime.now(ZoneInfo(TZ))
 
 def _today_str() -> str:
-    return _now_local().date().isoformat()  # YYYY-MM-DD
+    return _now_local().date().isoformat()
 
 def _now_stamp() -> str:
-    # YYYY-MM-DD_HHMM (π.χ. 2025-10-11_0945)
     dt = _now_local()
     return f"{dt.date().isoformat()}_{dt.strftime('%H%M')}"
 
 def _snapshot_filename(stamp: str) -> str:
-    # stamp = 'YYYY-MM-DD_HHMM'
     return f"{stamp}.json"
 
 def _snapshot_path(stamp: str) -> str:
@@ -302,43 +269,26 @@ def _list_snapshots(limit: int = 20) -> list[str]:
     return files[-limit:] if limit and len(files) > limit else files
 
 def _latest_snapshot_for_date(date_str: str) -> Optional[str]:
-    """Επιστρέφει filename του πιο πρόσφατου snapshot για την ημέρα (YYYY-MM-DD), ή None."""
     files = _list_snapshot_files()
     candidates = [f for f in files if f.startswith(date_str + "_")]
     return candidates[-1] if candidates else None
 
 def _parse_snapshot_selector(selector: Optional[str]) -> Optional[str]:
-    """
-    Μετατρέπει επιλογή χρήστη -> filename:
-    - None: πάρε το πιο πρόσφατο οποιασδήποτε μέρας
-    - 'YYYY-MM-DD': πάρε το πιο πρόσφατο εκείνης της μέρας
-    - 'YYYY-MM-DD_HHMM': πάρε αυτό ακριβώς
-    """
     files = _list_snapshot_files()
     if not files:
         return None
-
     if not selector:
-        return files[-1]  # latest
-
+        return files[-1]
     selector = selector.strip()
-    # ακριβές: YYYY-MM-DD_HHMM (16 chars, '_' at pos 10)
     if len(selector) == 16 and selector[10] == "_":
         candidate = _snapshot_filename(selector)
         return candidate if candidate in files else None
-
-    # μόνο ημερομηνία
     if len(selector) == 10:
         latest_for_day = _latest_snapshot_for_date(selector)
         return latest_for_day
-
     return None
 
 def _load_snapshot(selector: Optional[str] = None) -> Optional[dict]:
-    """
-    Διαβάζει snapshot με βάση selector (δες _parse_snapshot_selector).
-    Επιστρέφει dict ή None.
-    """
     fname = _parse_snapshot_selector(selector)
     if not fname:
         return None
@@ -356,7 +306,7 @@ def _save_snapshot(mapping: dict, totals_value: Decimal, stamp: Optional[str] = 
     _ensure_dir(SNAPSHOT_DIR)
     st = stamp or _now_stamp()
     payload = {
-        "stamp": st,  # YYYY-MM-DD_HHMM
+        "stamp": st,
         "date": st[:10],
         "assets": {k: {
             "amount": str(v.get("amount", 0)),
@@ -374,7 +324,7 @@ def _save_snapshot(mapping: dict, totals_value: Decimal, stamp: Optional[str] = 
             json.dump(payload, fp, ensure_ascii=False, indent=2)
     except Exception:
         logging.exception("Failed to write snapshot")
-    return st  # επιστρέφουμε το πλήρες stamp (YYYY-MM-DD_HHMM)
+    return st
 
 def _totals_value_from_assets(assets: List[Dict[str, Any]]) -> Decimal:
     total = Decimal("0")
@@ -384,7 +334,6 @@ def _totals_value_from_assets(assets: List[Dict[str, Any]]) -> Decimal:
     return total
 
 def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> tuple[Decimal, Decimal, str]:
-    """επιστρέφει (delta_usd, delta_pct, label) όπου label=stamp ή date."""
     try:
         snap_total = _to_dec((snap.get("totals") or {}).get("value_usd", 0)) or Decimal("0")
         label = str(snap.get("stamp") or snap.get("date") or "?")
@@ -395,12 +344,11 @@ def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> tuple[Decimal, Deci
     return delta, pct, label
 
 # --------------------------------------------------
-# Pretty formatting (compact style)
+# Pretty formatting
 # --------------------------------------------------
 def _fmt_money(x: Decimal) -> str:
     q = Decimal("0.01")
-    s = f"{x.quantize(q):,}"
-    return s
+    return f"{x.quantize(q):,}"
 
 def _fmt_price(x: Decimal) -> str:
     try:
@@ -422,8 +370,7 @@ def _fmt_qty(x: Decimal) -> str:
         return str(x)
 
 def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) -> tuple[str, Decimal]:
-    lines = ["Holdings snapshot:"]
-    total = Decimal("0")
+    lines, total = ["Holdings snapshot:"], Decimal("0")
     for a in assets:
         d = _asset_as_dict(a)
         sym = str(d.get("symbol","?")).upper()
@@ -431,9 +378,7 @@ def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) ->
         px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
         val = _to_dec(d.get("value_usd", 0)) or (qty * px)
         total += val
-        lines.append(
-            f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}"
-        )
+        lines.append(f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}")
     lines.append(f"\nTotal ≈ ${_fmt_money(total)}")
     if hidden_count:
         lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
@@ -446,7 +391,7 @@ def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) ->
     return "\n".join(lines), total
 
 # --------------------------------------------------
-# Helpers για /rescan: πρόσθεσε majors από snapshot ώστε να μη χαθεί το CRO
+# Helpers for /rescan & /holdings corrections
 # --------------------------------------------------
 def _inject_snapshot_majors(tokens: List[Dict[str, Any]], wallet_address: str) -> List[Dict[str, Any]]:
     majors = {"CRO","WCRO","USDT","USDC","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC","HBAR"}
@@ -473,12 +418,8 @@ def _inject_snapshot_majors(tokens: List[Dict[str, Any]], wallet_address: str) -
             out.append({"symbol": sym, "amount": d.get("amount", 0), "address": d.get("address")})
             have_syms.add(sym)
     return out
-    
+
 def _dedupe_by_symbol_take_max(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Όταν υπάρχουν πολλαπλές εγγραφές για ίδιο symbol (π.χ. από augment),
-    κράτα ΜΟΝΟ εκείνη με το ΜΕΓΙΣΤΟ amount (αποφεύγει overcount).
-    """
     best: Dict[str, Dict[str, Any]] = {}
     for a in assets or []:
         d = _asset_as_dict(a)
@@ -489,6 +430,35 @@ def _dedupe_by_symbol_take_max(assets: List[Dict[str, Any]]) -> List[Dict[str, A
             best[sym] = d
     return list(best.values())
 
+def _mk_symbol_amount_map(tokens: List[Dict[str, Any]]) -> Dict[str, Decimal]:
+    mp: Dict[str, Decimal] = {}
+    for t in tokens or []:
+        d = _asset_as_dict(t)
+        sym = str(d.get("symbol","?")).upper().strip()
+        amt = _to_dec(d.get("amount", 0)) or Decimal("0")
+        mp[sym] = amt
+    return mp
+
+def _overlay_discovery_amounts(assets: List[Dict[str, Any]], wallet_address: str) -> List[Dict[str, Any]]:
+    """Replace amounts with live discovery (on-chain) so recent buys/sells reflect immediately."""
+    try:
+        disc = discover_tokens_for_wallet(wallet_address) or []
+    except Exception:
+        disc = []
+    live = _mk_symbol_amount_map(disc)
+    out: List[Dict[str, Any]] = []
+    for a in assets or []:
+        d = dict(_asset_as_dict(a))
+        sym = str(d.get("symbol","?")).upper().strip()
+        if sym in live:
+            d["amount"] = live[sym]
+        out.append(d)
+    have = {str(_asset_as_dict(x).get("symbol","")).upper().strip() for x in assets or []}
+    for sym, amt in live.items():
+        if sym not in have:
+            out.append({"symbol": sym, "amount": amt})
+    return out
+
 # --------------------------------------------------
 # Command Handlers
 # --------------------------------------------------
@@ -496,14 +466,12 @@ def _handle_start() -> str:
     return (
         "👋 Γεια σου! Είμαι το Cronos DeFi Sentinel.\n\n"
         "Διαθέσιμες εντολές:\n"
-        "• /holdings — snapshot χαρτοφυλακίου (compact + φίλτρα & ταξινόμηση, με PnL αν υπάρχει snapshot)\n"
+        "• /holdings — snapshot χαρτοφυλακίου (compact + φίλτρα, με PnL vs τελευταίο)\n"
         "• /scan — ωμή λίστα tokens από ανακάλυψη (χωρίς φίλτρα)\n"
         "• /rescan — πλήρης επανεύρεση & εμφάνιση (με φίλτρα)\n"
         "• /snapshot — αποθήκευση snapshot με timestamp (π.χ. 2025-10-11_0930)\n"
         "• /snapshots — λίστα διαθέσιμων snapshots\n"
-        "• /pnl — δείξε PnL vs τελευταίο snapshot\n"
-        "• /pnl — PnL vs πιο πρόσφατο της ημέρας\n"
-        "• /pnl — PnL vs συγκεκριμένο snapshot\n"
+        "• /pnl — PnL vs snapshot [ημέρα ή stamp]\n"
         "• /trades [SYM] — σημερινές συναλλαγές (τοπική TZ)\n"
         "• /pnl today [SYM] — realized PnL (σήμερα, FIFO)\n"
         "• /help — βοήθεια"
@@ -554,16 +522,11 @@ def _handle_rescan(wallet_address: str) -> str:
     if not wallet_address:
         return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
     toks = discover_tokens_for_wallet(wallet_address) or []
-
-    # ΝΕΟ: συγχώνευση majors από snapshot (για να μη χαθεί π.χ. CRO)
-    toks = _inject_snapshot_majors(toks, wallet_address)
-
+    toks = _inject_snapshot_majors(toks, wallet_address)  # ensure majors like CRO
     enriched = _enrich_with_prices(toks)
     cleaned, hidden_count = _filter_and_sort_assets(enriched)
-
     if not cleaned:
         return "🔁 Rescan ολοκληρώθηκε — δεν υπάρχει κάτι αξιοσημείωτο να εμφανιστεί (όλα φιλτραρίστηκαν ως spam/zero/dust)."
-
     body, _ = _format_compact_holdings(cleaned, hidden_count)
     return "🔁 Rescan (filtered):\n" + body
 
@@ -575,31 +538,31 @@ def _handle_holdings(wallet_address: str) -> str:
 
         assets = snap.get("assets") or []
         assets = [_asset_as_dict(a) for a in assets]
-        assets = _dedupe_by_symbol_take_max(assets)  # ← NEW: avoid double count (e.g., ADA)
+        assets = _dedupe_by_symbol_take_max(assets)  # avoid double counting
+        assets = _overlay_discovery_amounts(assets, wallet_address)  # live on-chain amounts
 
         cleaned, hidden_count = _filter_and_sort_assets(assets)
         body, total_now = _format_compact_holdings(cleaned, hidden_count)
 
-        # PnL vs τελευταίο snapshot (αν υπάρχει)
-        last_snap = _load_snapshot()  # πιο πρόσφατο διαθέσιμο
+        last_snap = _load_snapshot()
         if last_snap:
             delta, pct, label = _compare_to_snapshot(total_now, last_snap)
             sign = "+" if delta >= 0 else ""
             body += f"\n\nUnrealized PnL vs snapshot {label}: ${_fmt_money(delta)} ({sign}{pct:.2f}%)"
 
         return body
-
     except Exception:
         logging.exception("Failed to build /holdings")
         return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
 
 def _handle_snapshot(wallet_address: str) -> str:
-    """Αποθήκευση snapshot με timestamp (YYYY-MM-DD_HHMM)."""
     try:
         snap = get_wallet_snapshot(wallet_address)
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
         snap = _normalize_snapshot_for_formatter(snap)
         assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
+        assets = _dedupe_by_symbol_take_max(assets)
+        assets = _overlay_discovery_amounts(assets, wallet_address)
 
         cleaned, _ = _filter_and_sort_assets(assets)
         mapping = _assets_list_to_mapping(cleaned)
@@ -622,16 +585,14 @@ def _handle_snapshots() -> str:
     return "\n".join(lines)
 
 def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
-    """
-    /pnl
-    /pnl 2025-10-10
-    /pnl 2025-10-10_0930
-    """
     try:
         snap = get_wallet_snapshot(wallet_address)
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
         snap = _normalize_snapshot_for_formatter(snap)
         assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
+        assets = _dedupe_by_symbol_take_max(assets)
+        assets = _overlay_discovery_amounts(assets, wallet_address)
+
         cleaned, _ = _filter_and_sort_assets(assets)
         total_now = _totals_value_from_assets(cleaned)
 
@@ -648,7 +609,7 @@ def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
         logging.exception("Failed to compute PnL")
         return "⚠️ Σφάλμα κατά τον υπολογισμό PnL."
 
-# --- Phase 2 intraday: /trades & /pnl today ------------------------
+# Phase 2 intraday
 def _handle_trades(symbol: Optional[str] = None) -> str:
     try:
         syms = [symbol.upper()] if symbol else None
@@ -695,7 +656,7 @@ def _dispatch_command(text: str) -> str:
         sym = parts[2] if len(parts) > 2 else None
         return _handle_pnl_today(sym)
 
-    # Existing set
+    # Core
     if cmd == "/start":
         return _handle_start()
     if cmd == "/help":
@@ -742,7 +703,7 @@ async def healthz():
     return JSONResponse(content={"ok": True, "service": "wallet_monitor_Dex", "status": "running"})
 
 # --------------------------------------------------
-# Startup
+# Startup (kick off realtime monitor)
 # --------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
@@ -752,7 +713,7 @@ async def on_startup():
     except Exception:
         pass
 
-    # 🔴 Start realtime wallet monitor as background task
     async def _sender(text: str):
         send_message(text, CHAT_ID)
+
     asyncio.create_task(monitor_wallet(_sender, logger=logging.getLogger("realtime")))
