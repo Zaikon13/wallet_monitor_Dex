@@ -473,6 +473,21 @@ def _inject_snapshot_majors(tokens: List[Dict[str, Any]], wallet_address: str) -
             out.append({"symbol": sym, "amount": d.get("amount", 0), "address": d.get("address")})
             have_syms.add(sym)
     return out
+    
+def _dedupe_by_symbol_take_max(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Όταν υπάρχουν πολλαπλές εγγραφές για ίδιο symbol (π.χ. από augment),
+    κράτα ΜΟΝΟ εκείνη με το ΜΕΓΙΣΤΟ amount (αποφεύγει overcount).
+    """
+    best: Dict[str, Dict[str, Any]] = {}
+    for a in assets or []:
+        d = _asset_as_dict(a)
+        sym = str(d.get("symbol","?")).upper().strip()
+        amt = _to_dec(d.get("amount", 0)) or Decimal("0")
+        prev = best.get(sym)
+        if not prev or amt > (_to_dec(prev.get("amount", 0)) or Decimal("0")):
+            best[sym] = d
+    return list(best.values())
 
 # --------------------------------------------------
 # Command Handlers
@@ -487,8 +502,8 @@ def _handle_start() -> str:
         "• /snapshot — αποθήκευση snapshot με timestamp (π.χ. 2025-10-11_0930)\n"
         "• /snapshots — λίστα διαθέσιμων snapshots\n"
         "• /pnl — δείξε PnL vs τελευταίο snapshot\n"
-        "• /pnl 2025-10-11 — PnL vs πιο πρόσφατο της ημέρας\n"
-        "• /pnl 2025-10-11_0930 — PnL vs συγκεκριμένο snapshot\n"
+        "• /pnl — PnL vs πιο πρόσφατο της ημέρας\n"
+        "• /pnl — PnL vs συγκεκριμένο snapshot\n"
         "• /trades [SYM] — σημερινές συναλλαγές (τοπική TZ)\n"
         "• /pnl today [SYM] — realized PnL (σήμερα, FIFO)\n"
         "• /help — βοήθεια"
@@ -560,6 +575,7 @@ def _handle_holdings(wallet_address: str) -> str:
 
         assets = snap.get("assets") or []
         assets = [_asset_as_dict(a) for a in assets]
+        assets = _dedupe_by_symbol_take_max(assets)  # ← NEW: avoid double count (e.g., ADA)
 
         cleaned, hidden_count = _filter_and_sort_assets(assets)
         body, total_now = _format_compact_holdings(cleaned, hidden_count)
