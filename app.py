@@ -716,4 +716,17 @@ async def on_startup():
     async def _sender(text: str):
         send_message(text, CHAT_ID)
 
-    asyncio.create_task(monitor_wallet(_sender, logger=logging.getLogger("realtime")))
+    async def _supervisor():
+        # Κρατάει τον watcher ζωντανό, κάνει retry με backoff αν σκάσει (π.χ. 429)
+        delay = 1.0
+        while True:
+            try:
+                await monitor_wallet(_sender, logger=logging.getLogger("realtime"))
+                delay = 1.0  # αν βγει "καθαρά", μηδένισε το backoff
+            except Exception as e:
+                logging.exception("monitor_wallet crashed: %s", e)
+                await asyncio.sleep(min(20.0, delay))
+                delay = min(20.0, delay * 1.8 + 0.5)
+
+    asyncio.create_task(_supervisor())
+
