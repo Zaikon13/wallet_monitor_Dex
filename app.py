@@ -1,3 +1,4 @@
+# ==== START app.py (Part 1/3) ================================================
 # app.py
 # Cronos DeFi Sentinel — FastAPI + Telegram webhook + commands + live monitor bootstrap
 from __future__ import annotations
@@ -29,7 +30,7 @@ from core.discovery import discover_tokens_for_wallet
 from core.pricing import get_spot_usd                  # pricing spot USD
 # live monitor loop (separate module, already uploaded)
 # monitor writes ./data/ledger.csv and sends alerts on swaps/in/out
-import monitor as rt_monitor  # uses CRONOS_EXPLORER_API_BASE + KEY internally  ()
+import monitor as rt_monitor  # uses CRONOS_EXPLORER_API_BASE + KEY internally
 
 getcontext().prec = 36
 
@@ -189,7 +190,8 @@ def _explorer_balance_native(wallet: str) -> Decimal:
         return _to_dec(val) / Decimal(10**18)
     except Exception:
         return Decimal("0")
-
+# ==== END app.py (Part 1/3) ==================================================
+# ==== START app.py (Part 2/3) ================================================
 # ============ Holdings (RPC primary, explorer fallback) ============
 def _asset_line(sym: str, qty: Decimal, px: Decimal, val: Decimal) -> str:
     def _fmt_price(x: Decimal) -> str:
@@ -254,8 +256,8 @@ def _holdings_explorer(wallet: str) -> List[Dict[str, Any]]:
 def _holdings_auto(wallet: str) -> Tuple[List[Dict[str, Any]], str]:
     if HOLDINGS_BACKEND in ("rpc", "auto"):
         try:
-            snap = get_wallet_snapshot(wallet)                                   # primary RPC snapshot  :contentReference[oaicite:5]{index=5}
-            snap = augment_with_discovered_tokens(snap, wallet_address=wallet)   # add discovered       :contentReference[oaicite:6]{index=6}
+            snap = get_wallet_snapshot(wallet)                                   # primary RPC snapshot
+            snap = augment_with_discovered_tokens(snap, wallet_address=wallet)   # add discovered
             assets = []
             for a in (snap.get("assets") or []):
                 sym = str(a.get("symbol") or "").upper() or "TOKEN"
@@ -477,7 +479,8 @@ def _explorer_backfill_today(wallet: str) -> int:
         except Exception:
             continue
     return wrote
-
+# ==== END app.py (Part 2/3) ==================================================
+# ==== START app.py (Part 3/3) ================================================
 # ============ Command handlers ============
 def _handle_start() -> str:
     return (
@@ -498,7 +501,7 @@ def _handle_help() -> str:
 
 def _handle_scan(wallet: str) -> str:
     try:
-        tokens = discover_tokens_for_wallet(wallet)  # core.discovery   :contentReference[oaicite:7]{index=7}
+        tokens = discover_tokens_for_wallet(wallet)
         if not tokens:
             return "🔍 Δεν βρέθηκαν ERC-20 tokens με θετικό balance (ή δεν βρέθηκαν μεταφορές στο lookback)."
         lines = ["🔍 Scan (raw):"]
@@ -684,7 +687,7 @@ async def on_startup():
     # Boot live wallet monitor (separate loop implemented in monitor.py)
     if MONITOR_ENABLE and WALLET_ADDRESS:
         async def _runner():
-            # monitor.py κάνει explorer polling & γράφει στο ledger  ()
+            # monitor.py κάνει explorer polling & γράφει στο ledger
             await rt_monitor.run_once_forever(poll_seconds=RT_POLL_SEC)
 
         async def _supervisor():
@@ -696,3 +699,4 @@ async def on_startup():
                     await asyncio.sleep(3)
 
         asyncio.create_task(_supervisor())
+# ==== END app.py (Part 3/3) ==================================================
