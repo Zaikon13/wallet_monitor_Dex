@@ -14,14 +14,12 @@ WSS_URLS = [u.strip() for u in (os.getenv("CRONOS_WSS_URL", "").split(",")) if u
 _https_env = os.getenv("CRONOS_HTTPS_URL") or os.getenv("CRONOS_RPC_URL") or "https://cronos-evm-rpc.publicnode.com"
 HTTPS_URLS = [u.strip() for u in _https_env.split(",") if u.strip()]
 
-CONFIRMATIONS     = int(os.getenv("RT_CONFIRMS", "0"))
-POLL_INTERVAL     = float(os.getenv("RT_POLL_SEC", "1.0"))
-LEDGER_PATH       = os.getenv("LEDGER_CSV", "data/ledger.csv")
-
-# Backfill: Κράτα το μικρό με public RPC
-BACKFILL_BLOCKS   = int(os.getenv("RT_BACKFILL_BLOCKS", "800"))
-BACKFILL_NOTIFY   = (os.getenv("RT_BACKFILL_NOTIFY", "0").strip() in ("1","true","yes"))
-BACKOFF_MAX_SEC   = float(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
+CONFIRMATIONS   = int(os.getenv("RT_CONFIRMS", "0"))
+POLL_INTERVAL   = float(os.getenv("RT_POLL_SEC", "1.0"))
+LEDGER_PATH     = os.getenv("LEDGER_CSV", "data/ledger.csv")
+BACKFILL_BLOCKS = int(os.getenv("RT_BACKFILL_BLOCKS", "800"))
+BACKFILL_NOTIFY = (os.getenv("RT_BACKFILL_NOTIFY", "0").strip() in ("1","true","yes"))
+BACKOFF_MAX_SEC = float(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
 
 # Routers στο Cronos
 KNOWN_ROUTERS: Dict[str, str] = {
@@ -59,8 +57,8 @@ def _ensure_dir(path: str):
 
 def _append_ledger(ts_iso: str, symbol: str, side: str, qty: str, price: str, fee: str, txh: str):
     _ensure_dir(LEDGER_PATH)
-    header = not os.path.exists(LEDGER_PATH)
-    with open(LEDGER_PATH, "a", encoding="utf-8") as f:
+    header = not os.path.exists(LEDGER_CSV := LEDGER_PATH)
+    with open(LEDGER_CSV, "a", encoding="utf-8") as f:
         if header:
             f.write("ts,symbol,side,qty,price,fee,tx,chain\n")
         f.write(f"{ts_iso},{symbol},{side},{qty},{price},{fee},{txh},cronos\n")
@@ -87,7 +85,8 @@ async def _send(send_fn, text: str, notify=True):
     except Exception:
         logging.exception("send_fn failed")
 
-async def _erc20_meta(w3: Web3, token: str, cache: Dict[str, Tuple[str,int]]) -> Tuple[str,int]:
+# --- ΣΥΓΧΡΟΝΙΚΟ token meta (χωρίς run_until_complete) ---
+def _erc20_meta(w3: Web3, token: str, cache: Dict[str, Tuple[str,int]]) -> Tuple[str,int]:
     token = token.lower()
     if token in cache: return cache[token]
     try:
@@ -103,17 +102,26 @@ async def _erc20_meta(w3: Web3, token: str, cache: Dict[str, Tuple[str,int]]) ->
         cache[token]=(token[:6].upper(),18)
     return cache[token]
 
-def _tx_touches_wallet_or_router(tx, wl: str) -> bool:
+# ΠΟΤΕ ξανά run_until_complete. Επιλέγουμε **ποιο** receipt θα τραβήξουμε:
+# - ΟΤΙΔΗΠΟΤΕ με from==wallet ή to==wallet
+# - Επίσης ό,τι πάει από wallet -> contract (router ή άλλο), αν έχει input (δηλ. contract call)
+def _tx_is_candidate(tx, wl: str, w3: Web3) -> bool:
     to_l = (tx["to"] or "").lower() if tx.get("to") else ""
     frm  = (tx["from"] or "").lower()
-    if frm == wl or to_l == wl:                     # direct in/out
+    if frm == wl or to_l == wl:
         return True
-    if frm == wl and to_l in KNOWN_ROUTERS:         # swap send to router
-        return True
+    if frm == wl:
+        # αν είναι contract call (input μη κενό) τότε τράβα receipt (πιθανό swap)
+        try:
+            inp = tx.get("input")
+            if (isinstance(inp, (bytes, bytearray)) and len(inp)>0) or (isinstance(inp, str) and inp.startswith("0x") and len(inp)>2):
+                return True
+        except Exception:
+            return True
     return False
 
 def _parse_receipt_for_wallet(w3: Web3, rc, wl: str, ts_iso: str, txh: str, meta_cache, lines_out: List[str]):
-    # ERC-20 Transfers που ακουμπάνε το wallet
+    # ERC-20 Transfers + WCRO wrap/unwrap που ακουμπάνε το wallet
     for lg in rc["logs"]:
         try:
             topic0 = lg["topics"][0].hex() if hasattr(lg["topics"][0],"hex") else str(lg["topics"][0])
@@ -123,7 +131,7 @@ def _parse_receipt_for_wallet(w3: Web3, rc, wl: str, ts_iso: str, txh: str, meta
                 if wl not in (from_addr, to_addr): 
                     continue
                 token = lg["address"]
-                sym, dec = asyncio.get_event_loop().run_until_complete(_erc20_meta(w3, token, meta_cache))  # safe: small sync call
+                sym, dec = _erc20_meta(w3, token, meta_cache)
                 data = lg["data"]
                 amount = int(str(data),16) if isinstance(data,str) else int.from_bytes(data,"big")
                 side = "OUT" if from_addr == wl else "IN"
@@ -174,7 +182,7 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
             ts_iso = _ts(blk.timestamp)
             for tx in blk.transactions:
                 try:
-                    if not _tx_touches_wallet_or_router(tx, wl):
+                    if not _tx_is_candidate(tx, wl, w3):
                         continue
                     rc = w3.eth.get_transaction_receipt(tx["hash"])
                     txh = tx["hash"].hex()
@@ -214,7 +222,7 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
                 ts_iso = _ts(blk.timestamp)
                 for tx in blk.transactions:
                     try:
-                        if not _tx_touches_wallet_or_router(tx, wl):
+                        if not _tx_is_candidate(tx, wl, w3):
                             continue
                         rc = w3.eth.get_transaction_receipt(tx["hash"])
                         txh = tx["hash"].hex()
