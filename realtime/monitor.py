@@ -4,7 +4,7 @@ import os
 import asyncio
 import logging
 import random
-from typing import Optional, Dict, Any, List, Tuple, Iterable
+from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -13,9 +13,11 @@ from web3.types import LogReceipt
 
 # ===================== ENV / Defaults =====================
 WALLET = (os.getenv("WALLET_ADDRESS") or "").strip()
-# Δώσε πολλά endpoints χωρισμένα με κόμμα για pool/εναλλαγή
-WSS_URLS = [u.strip() for u in (os.getenv("CRONOS_WSS_URL", "wss://cronos-evm-rpc.publicnode.com").split(",") ) if u.strip()]
-HTTPS_URLS = [u.strip() for u in (os.getenv("CRONOS_HTTPS_URL", "https://cronos-evm-rpc.publicnode.com").split(",") ) if u.strip()]
+
+# Endpoints pool (WSS + HTTPS). HTTPS τιμά και το CRONOS_RPC_URL ως alias.
+WSS_URLS = [u.strip() for u in (os.getenv("CRONOS_WSS_URL", "").split(",")) if u.strip()]
+_https_env = os.getenv("CRONOS_HTTPS_URL") or os.getenv("CRONOS_RPC_URL") or "https://cronos-evm-rpc.publicnode.com"
+HTTPS_URLS = [u.strip() for u in _https_env.split(",") if u.strip()]
 
 CONFIRMATIONS = int(os.getenv("RT_CONFIRMS", "0"))                # 0 = instant
 POLL_INTERVAL = float(os.getenv("RT_POLL_SEC", "0.8"))            # base poll
@@ -24,10 +26,10 @@ LEDGER_PATH = os.getenv("LEDGER_CSV", "data/ledger.csv")
 # Backfill
 BACKFILL_BLOCKS   = int(os.getenv("RT_BACKFILL_BLOCKS", "5000"))
 BACKFILL_NOTIFY   = (os.getenv("RT_BACKFILL_NOTIFY", "0").strip() in ("1","true","yes"))
-BACKFILL_CHUNK    = int(os.getenv("RT_BACKFILL_CHUNK", "500"))    # πόσοι blocks ανά getLogs
-BACKOFF_MAX_SEC   = float(os.getenv("RT_BACKOFF_MAX_SEC", "20"))  # αν φάμε 429, μέχρι πόσο να περιμένουμε
+BACKFILL_CHUNK    = int(os.getenv("RT_BACKFILL_CHUNK", "500"))    # blocks per getLogs
+BACKOFF_MAX_SEC   = float(os.getenv("RT_BACKOFF_MAX_SEC", "20"))  # cap backoff time
 
-# Routers (μπορείς να επεκτείνεις)
+# Routers (extend as needed)
 KNOWN_ROUTERS: Dict[str, str] = {
     "0x145863eb42cf62847a6ca784e6416c1682b1b2ae": "VVS Router",
     "0xe0137ee596c35bf7adedad1e2fd25da595d1e05b": "VVS Router (alt)",
@@ -123,7 +125,6 @@ def _looks_like_swap(tx_to: Optional[str], tx_input: Optional[str|bytes], logs: 
     return False
 
 def _wallet_topic(wallet: str) -> str:
-    # 32-byte padded topic for indexed address
     return "0x" + wallet.lower().replace("0x","").rjust(64, "0")
 
 # ===================== Provider factory with backoff & fallback =====================
@@ -143,14 +144,14 @@ async def _make_web3(logger) -> Web3:
             logger.warning("Provider failed %s: %s", url, e)
     raise RuntimeError("No RPC provider available")
 
-async def _with_backoff(coro_fn, *args, logger=None, what="rpc"):
+async def _with_backoff(func, *args, logger=None, what="rpc"):
     delay = 1.0
     while True:
         try:
-            return await coro_fn(*args)
+            return func(*args)
         except Exception as e:
             msg = str(e)
-            # αν φαίνεται για 429 ή rate-limit, backoff περισσότερο
+            # smarter wait for 429/rate limits
             if "429" in msg or "rate" in msg.lower() or "Too Many Requests" in msg:
                 wait = min(BACKOFF_MAX_SEC, delay + random.random()*delay)
             else:
@@ -161,52 +162,58 @@ async def _with_backoff(coro_fn, *args, logger=None, what="rpc"):
             delay = min(BACKOFF_MAX_SEC, delay * 1.8 + 0.5)
 
 # ===================== Core scanners =====================
+def _collect_logs_for_wallet(w3: Web3, wallet_lc: str, start_block: int, end_block: int) -> List[LogReceipt]:
+    wl_topic = _wallet_topic(wallet_lc)
+    logs: List[LogReceipt] = []
+
+    # wallet as sender
+    q1 = {"fromBlock": start_block, "toBlock": end_block, "topics": [TRANSFER_TOPIC, wl_topic, None]}
+    try:
+        logs.extend(w3.eth.get_logs(q1))
+    except Exception:
+        # minimal retry (upper layer has backoff)
+        logs.extend(w3.eth.get_logs(q1))
+
+    # wallet as recipient
+    q2 = {"fromBlock": start_block, "toBlock": end_block, "topics": [TRANSFER_TOPIC, None, wl_topic]}
+    try:
+        logs.extend(w3.eth.get_logs(q2))
+    except Exception:
+        logs.extend(w3.eth.get_logs(q2))
+
+    return logs
+
 async def _scan_logs_range(w3: Web3, wallet_lc: str, start_block: int, end_block: int, logger, meta_cache, notify, send_fn):
     """
-    1) getLogs για Transfer με wallet ως sender ΚΑΙ ως recipient (σε blocks [start,end]).
-    2) Από τα logs, συγκεντρώνουμε unique tx hashes.
-    3) Παίρνουμε receipts ΜΟΝΟ για αυτά τα tx (πολύ λιγότερο φόρτο).
-    4) Στέλνουμε alerts + γράφουμε ledger.
+    1) getLogs για Transfer με wallet ως from/to στο [start,end]
+    2) Unique tx hashes από logs
+    3) Παίρνουμε receipts μόνο για αυτά τα tx
+    4) Alerts + ledger
     """
-    wl_topic = _wallet_topic(wallet_lc)
-    # δύο queries: wallet ως from, και ως to
-    queries = [
-        {"fromBlock": start_block, "toBlock": end_block, "topics": [TRANSFER_TOPIC, wl_topic, None]},
-        {"fromBlock": start_block, "toBlock": end_block, "topics": [TRANSFER_TOPIC, None, wl_topic]},
-    ]
-
+    logs = await _with_backoff(_collect_logs_for_wallet, w3, wallet_lc, start_block, end_block, logger=logger, what="getLogs")
     txhashes: set[str] = set()
-    for q in queries:
+    for lg in logs:
         try:
-            logs = w3.eth.get_logs(q)
-        except Exception as e:
-            # Αν ο κόμβος αρνηθεί, ρίξε backoff και ξανά
-            await asyncio.sleep(1.0)
-            logs = w3.eth.get_logs(q)
-        for lg in logs:
-            try:
-                txhashes.add(lg["transactionHash"].hex())
-            except Exception:
-                continue
+            txhashes.add(lg["transactionHash"].hex())
+        except Exception:
+            continue
 
-    # Για κάθε tx που μας ακουμπάει, φτιάξε μήνυμα
     for txh in txhashes:
         try:
-            tx = w3.eth.get_transaction(txh)
-            rc = w3.eth.get_transaction_receipt(txh)
+            tx = await _with_backoff(w3.eth.get_transaction, txh, logger=logger, what="getTransaction")
+            rc = await _with_backoff(w3.eth.get_transaction_receipt, txh, logger=logger, what="getReceipt")
         except Exception:
-            # backoff ελαφρύ και skip
             await asyncio.sleep(0.2)
             continue
 
-        # Block timestamp
+        # Block ts
         try:
-            blk = w3.eth.get_block(rc["blockNumber"], full_transactions=False)
+            blk = await _with_backoff(w3.eth.get_block, rc["blockNumber"], logger=logger, what="getBlock")
             ts_iso = _ts_from_block(blk.timestamp)
         except Exception:
             ts_iso = datetime.now(timezone.utc).isoformat()
 
-        # Native (top-level) CRO
+        # Native CRO
         try:
             if int(tx["value"]) > 0 and (tx["from"].lower() == wallet_lc or (tx["to"] and tx["to"].lower() == wallet_lc)):
                 val = _to_decimal_wei(int(tx["value"]))
@@ -254,8 +261,8 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
         logger.warning("No WALLET_ADDRESS set; realtime monitor disabled.")
         return
 
-    # provider with fallback
-    w3 = await _with_backoff(_make_web3, logger, logger=logger, what="provider.connect")
+    # provider with fallback (WSS → HTTPS → next)
+    w3 = await _with_backoff(lambda: asyncio.get_event_loop().run_until_complete(_make_web3(logger)), logger=logger, what="provider.connect")
 
     wallet = Web3.to_checksum_address(WALLET)
     wl = wallet.lower()
@@ -269,7 +276,7 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
         for rng_start in range(start, latest + 1, BACKFILL_CHUNK):
             rng_end = min(latest, rng_start + BACKFILL_CHUNK - 1)
             try:
-                await _with_backoff(_scan_logs_range, w3, wl, rng_start, rng_end, logger, meta_cache, BACKFILL_NOTIFY, send_fn, logger=logger, what="getLogs-range")
+                await _scan_logs_range(w3, wl, rng_start, rng_end, logger, meta_cache, BACKFILL_NOTIFY, send_fn)
             except Exception as e:
                 logger.warning("Backfill chunk %s-%s failed: %s", rng_start, rng_end, e)
                 await asyncio.sleep(min(BACKOFF_MAX_SEC, 3.0))
@@ -278,7 +285,7 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
         logger.exception("Backfill failed: %s", e)
         last_handled = w3.eth.get_block("latest").number
 
-    # -------- Live loop (per block; uses tiny getLogs on 1 block) --------
+    # -------- Live loop (per block; tiny getLogs on 1 block) --------
     while True:
         try:
             latest = w3.eth.get_block("latest").number
@@ -289,9 +296,9 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
 
             for b in range(last_handled + 1, target + 1):
                 try:
-                    await _with_backoff(_scan_logs_range, w3, wl, b, b, logger, meta_cache, True, send_fn, logger=logger, what="getLogs-1block")
+                    await _scan_logs_range(w3, wl, b, b, logger, meta_cache, True, send_fn)
                 except Exception as e:
-                    # πιθανό 429: δώσε χρόνο και συνέχισε
+                    logger.warning("Block %s scan failed: %s", b, e)
                     await asyncio.sleep(min(BACKOFF_MAX_SEC, 3.0))
                 last_handled = b
 
@@ -300,7 +307,7 @@ async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
             logger.warning("Live loop error: %s — reconnecting provider…", e)
             # reconnect provider with backoff
             try:
-                w3 = await _with_backoff(_make_web3, logger, logger=logger, what="provider.reconnect")
+                w3 = await _with_backoff(lambda: asyncio.get_event_loop().run_until_complete(_make_web3(logger)), logger=logger, what="provider.reconnect")
             except Exception as e2:
                 logger.error("Provider reconnect failed: %s", e2)
                 await asyncio.sleep(min(BACKOFF_MAX_SEC, 5.0))
