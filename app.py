@@ -7,23 +7,23 @@ import re
 import io
 import csv
 import json
-import math
 import time
 import asyncio
 import logging
 import requests
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from collections import OrderedDict, deque
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, getcontext
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+# Telegram module (υπάρχει στο repo σου)
 from telegram import api as tg_api
 
-# core modules (RPC-based)
+# core modules (RPC-based holdings)
 from core.holdings import get_wallet_snapshot
 from core.augment import augment_with_discovered_tokens
 from core.discovery import discover_tokens_for_wallet
@@ -38,26 +38,34 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0")) or None
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 APP_URL = os.getenv("APP_URL")  # optional
-EOD_TIME = os.getenv("EOD_TIME", "23:59")
 TZ = os.getenv("TZ", "Europe/Athens")
+
 SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./data/snapshots")
-LEDGER_CSV = os.getenv("LEDGER_CSV", "./data/ledger.csv")  # default local path
+LEDGER_CSV   = os.getenv("LEDGER_CSV", "./data/ledger.csv")
+
+# Holdings: προτιμά RPC, αν σκάσει -> explorer
 HOLDINGS_BACKEND = (os.getenv("HOLDINGS_BACKEND", "auto") or "auto").lower()
 
-# Explorer (etherscan-like) fallback
-EXPLORER_BASE = (os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api").rstrip("/"))
-EXPLORER_KEY = os.getenv("CRONOS_EXPLORER_API_KEY", "").strip()
+# Explorer settings (ΠΡΟΣΟΧΗ: ΧΩΡΙΣ το 'S' όπως ζήτησες)
+# Παραδείγματα:
+#  - https://explorer-api.cronos.org/mainnet/api/v1
+#  - https://cronos.org/explorer/api
+CRONOS_EXPLORER_API_BASE = (os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api").rstrip("/"))
+CRONOS_EXPLORER_API_KEY  = os.getenv("CRONOS_EXPLORER_API_KEY", "").strip()
 
-# Optional live monitor task (realtime/monitor.py)
-MONITOR_ENABLE = (os.getenv("MONITOR_ENABLE", "0").strip().lower() in ("1","true","yes","on"))
+# Realtime explorer poller (μέσα στο app.py)
+MONITOR_ENABLE  = (os.getenv("MONITOR_ENABLE", "0").strip().lower() in ("1","true","yes","on"))
+RT_POLL_SEC     = float(os.getenv("RT_POLL_SEC", "1.2"))
+RT_DEDUP_SEC    = int(os.getenv("TG_DEDUP_WINDOW_SEC", "60"))  # αντιχρησιμοποιείται και εδώ
+RT_BACKOFF_MAX  = int(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="2.2")
+app = FastAPI(title="Cronos DeFi Sentinel", version="3.0")
 
 # --------------------------------------------------
-# Telegram helpers (safe long split)
+# Telegram send helpers (with safe split)
 # --------------------------------------------------
 def _fallback_send_message(text: str, chat_id: Optional[int] = None):
     try:
@@ -130,27 +138,17 @@ def _asset_as_dict(a):
         return d
     return {"symbol": str(a)}
 
-def _normalize_snapshot_for_formatter(snap: dict) -> dict:
-    out = dict(snap or {})
-    assets = out.get("assets") or []
-    nassets = []
-    for x in assets:
-        d = _asset_as_dict(x)
-        for k in ("amount","price_usd","value_usd"):
-            if k in d:
-                d[k] = _to_dec(d.get(k, 0))
-        nassets.append(d)
-    out["assets"] = nassets
-    return out
-
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 def _now_local() -> datetime:
     return datetime.now(ZoneInfo(TZ))
 
-def _today_str() -> str:
-    return _now_local().date().isoformat()
+def _today_range() -> Tuple[datetime, datetime]:
+    now = _now_local()
+    start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=ZoneInfo(TZ))
+    end   = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=ZoneInfo(TZ))
+    return start, end
 
 def _now_stamp() -> str:
     dt = _now_local()
@@ -229,26 +227,6 @@ def _save_snapshot(mapping: dict, totals_value: Decimal, stamp: Optional[str] = 
         logging.exception("Failed to write snapshot")
     return st
 
-def _totals_value_from_assets(assets: List[Dict[str, Any]]) -> Decimal:
-    total = Decimal("0")
-    for a in assets:
-        v = _to_dec(_asset_as_dict(a).get("value_usd", 0)) or Decimal("0")
-        total += v
-    return total
-
-def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> tuple[Decimal, Decimal, str]:
-    try:
-        snap_total = _to_dec((snap.get("totals") or {}).get("value_usd", 0)) or Decimal("0")
-        label = str(snap.get("stamp") or snap.get("date") or "?")
-    except Exception:
-        snap_total, label = Decimal("0"), "?"
-    delta = curr_total - snap_total
-    pct = (delta / snap_total * Decimal("100")) if snap_total > 0 else Decimal("0")
-    return delta, pct, label
-
-# --------------------------------------------------
-# Formatting
-# --------------------------------------------------
 def _fmt_money(x: Decimal) -> str:
     q = Decimal("0.01")
     try:
@@ -275,30 +253,146 @@ def _fmt_qty(x: Decimal) -> str:
     except Exception:
         return str(x)
 
-def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) -> tuple[str, Decimal]:
-    lines = ["Holdings snapshot:"]
-    total = Decimal("0")
-    for a in assets:
-        d = _asset_as_dict(a)
-        sym = str(d.get("symbol","?")).upper()
-        qty = _to_dec(d.get("amount", 0)) or Decimal("0")
-        px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
-        val = _to_dec(d.get("value_usd", 0)) or (qty * px)
-        total += val
-        lines.append(f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}")
-    lines.append(f"\nTotal ≈ ${_fmt_money(total)}")
-    if hidden_count:
-        lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
-    lines.append("\nQuantities snapshot (runtime):")
-    for a in assets:
-        d = _asset_as_dict(a)
-        sym = str(d.get("symbol","?")).upper()
-        qty = _to_dec(d.get("amount", 0)) or Decimal("0")
-        lines.append(f"  – {sym}: {qty}")
-    return "\n".join(lines), total
+# --------------------------------------------------
+# Explorer API (δυο formats)
+# --------------------------------------------------
+def _explorer_is_v1_style(base: str) -> bool:
+    # π.χ. https://explorer-api.cronos.org/mainnet/api/v1
+    return "/api/v1" in base
+
+def _explorer_call(module: str, action: str, params: Dict[str, Any]) -> Any:
+    """
+    Υποστηρίζει:
+      1) v1 style: https://explorer-api.cronos.org/mainnet/api/v1/{module}/{action}?apikey=...
+      2) etherscan style: https://cronos.org/explorer/api/?module=account&action=tokentx&address=...
+    Επιστρέφει το .json() είτε ολόκληρο, είτε 'result' αν υπάρχει.
+    """
+    base = CRONOS_EXPLORER_API_BASE
+    headers = {"Accept": "application/json"}
+    p = dict(params or {})
+    if CRONOS_EXPLORER_API_KEY:
+        # και στα δύο στυλ το ονομάζουμε apikey για συμβατότητα
+        p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
+
+    try:
+        if _explorer_is_v1_style(base):
+            # v1: /{module}/{action}
+            url = f"{base}/{module}/{action}"
+            r = requests.get(url, params=p, headers=headers, timeout=15)
+        else:
+            # etherscan-like: /?module=...&action=...
+            url = f"{base}/"
+            qp = {"module": module, "action": action}
+            qp.update(p)
+            r = requests.get(url, params=qp, headers=headers, timeout=15)
+
+        r.raise_for_status()
+        data = r.json()
+        # άλλες εκδόσεις δίνουν 'result', v1 συχνά γυρνά το payload σκέτο
+        if isinstance(data, dict) and "result" in data:
+            return data["result"]
+        return data
+    except Exception as e:
+        logger.warning(f"Explorer call fail [{module}.{action}]: {e}")
+        return None
+
+def _explorer_tokentx(address: str) -> List[dict]:
+    res = _explorer_call("account", "tokentx", {"address": address, "sort": "asc"})
+    return res or []
+
+def _explorer_txlist(address: str) -> List[dict]:
+    res = _explorer_call("account", "txlist", {"address": address, "sort": "asc"})
+    return res or []
+
+def _explorer_balance_native(address: str) -> Decimal:
+    res = _explorer_call("account", "balance", {"address": address})
+    val = None
+    if isinstance(res, dict):
+        val = res.get("result")
+    elif isinstance(res, str):
+        val = res
+    elif isinstance(res, (int, float)):
+        val = res
+    try:
+        return _to_dec(val) / Decimal(10**18)
+    except Exception:
+        return Decimal("0")
+# --------------------------------------------------
+# Holdings via RPC (core.*) with Explorer fallback
+# --------------------------------------------------
+def _normalize_snapshot_for_formatter(snap: dict) -> dict:
+    out = dict(snap or {})
+    assets = out.get("assets") or []
+    nassets = []
+    for x in assets:
+        d = _asset_as_dict(x)
+        for k in ("amount","price_usd","value_usd"):
+            if k in d:
+                d[k] = _to_dec(d.get(k, 0))
+        nassets.append(d)
+    out["assets"] = nassets
+    return out
+
+def _holdings_auto(wallet: str) -> Tuple[List[Dict[str, Any]], str]:
+    if HOLDINGS_BACKEND in ("rpc", "auto"):
+        try:
+            snap = get_wallet_snapshot(wallet)
+            snap = augment_with_discovered_tokens(snap, wallet_address=wallet)
+            snap = _normalize_snapshot_for_formatter(snap)
+
+            assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
+            for a in assets:
+                if _to_dec(a.get("price_usd", 0)) <= 0:
+                    a["price_usd"] = _to_dec(get_spot_usd(str(a.get("symbol","")), token_address=a.get("address")))
+                amt = _to_dec(a.get("amount", 0))
+                px  = _to_dec(a.get("price_usd", 0))
+                a["value_usd"] = _to_dec(a.get("value_usd", amt * px)) or (amt * px)
+            return assets, "rpc"
+        except Exception:
+            logger.warning("RPC holdings failed, switching to Explorer")
+
+    # Explorer fallback
+    # φτιάχνουμε λίστα assets από tokentx aggregation + native CRO balance
+    toks = _explorer_tokentx(wallet)
+    agg: Dict[Tuple[str, str, int], Decimal] = OrderedDict()
+    wl = wallet.lower()
+
+    for r in toks:
+        try:
+            sym = (r.get("tokenSymbol") or "").upper() or "TOKEN"
+            dec = int(r.get("tokenDecimal") or 18)
+            qty = _to_dec(r.get("value")) / (Decimal(10) ** dec)
+            frm = (r.get("from") or "").lower()
+            to  = (r.get("to") or "").lower()
+            side = 1 if to == wl else (-1 if frm == wl else 0)
+            if side == 0:
+                continue
+            key = ((r.get("contractAddress") or "").lower(), sym, dec)
+            agg[key] = agg.get(key, Decimal("0")) + side * qty
+        except Exception:
+            continue
+
+    assets: List[Dict[str, Any]] = []
+    cro_bal = _explorer_balance_native(wallet)
+    if cro_bal > 0:
+        px = _to_dec(get_spot_usd("CRO", token_address=None)) or Decimal("0")
+        assets.append({"symbol": "CRO", "amount": cro_bal, "price_usd": px, "value_usd": cro_bal * px})
+
+    for (contract, sym, _dec), qty in agg.items():
+        if qty <= 0:
+            continue
+        px = _to_dec(get_spot_usd(sym, token_address=contract)) or Decimal("0")
+        assets.append({
+            "symbol": sym,
+            "amount": qty,
+            "price_usd": px,
+            "value_usd": qty * px,
+            "address": contract,
+        })
+    return assets, "explorer"
 
 # --------------------------------------------------
-# ENV filters for holdings
+# Holdings format & filters
 # --------------------------------------------------
 def _env_bool(name: str, default: bool) -> bool:
     v = (os.getenv(name) or "").strip().lower()
@@ -354,7 +448,7 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
     return visible, hidden
 
 def _assets_list_to_mapping(assets: list) -> dict:
-    out: dict[str, dict] = OrderedDict()
+    out: Dict[str, Dict[str, Any]] = OrderedDict()
     for item in assets:
         d = _asset_as_dict(item)
         sym = str(d.get("symbol", "?")).upper().strip() or d.get("address", "")[:6].upper()
@@ -381,101 +475,47 @@ def _assets_list_to_mapping(assets: list) -> dict:
             out[sym] = d
     return out
 
-# --------------------------------------------------
-# Explorer fallback (tx + balances)
-# --------------------------------------------------
-def _explorer_call(params: Dict[str, Any]) -> list | dict | str | None:
-    url = f"{EXPLORER_BASE}/"
-    p = dict(params)
-    if EXPLORER_KEY:
-        p["apikey"] = EXPLORER_KEY
+def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) -> Tuple[str, Decimal]:
+    lines = ["Holdings snapshot:"]
+    total = Decimal("0")
+    for a in assets:
+        d = _asset_as_dict(a)
+        sym = str(d.get("symbol","?")).upper()
+        qty = _to_dec(d.get("amount", 0)) or Decimal("0")
+        px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
+        val = _to_dec(d.get("value_usd", 0)) or (qty * px)
+        total += val
+        lines.append(f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}")
+    lines.append(f"\nTotal ≈ ${_fmt_money(total)}")
+    if hidden_count:
+        lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
+    lines.append("\nQuantities snapshot (runtime):")
+    for a in assets:
+        d = _asset_as_dict(a)
+        sym = str(d.get("symbol","?")).upper()
+        qty = _to_dec(d.get("amount", 0)) or Decimal("0")
+        lines.append(f"  – {sym}: {qty}")
+    return "\n".join(lines), total
+
+def _totals_value_from_assets(assets: List[Dict[str, Any]]) -> Decimal:
+    total = Decimal("0")
+    for a in assets:
+        v = _to_dec(_asset_as_dict(a).get("value_usd", 0)) or Decimal("0")
+        total += v
+    return total
+
+def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> Tuple[Decimal, Decimal, str]:
     try:
-        r = requests.get(url, params=p, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        return (j or {}).get("result")
-    except Exception as e:
-        logger.warning(f"Explorer call failed ({params.get('action')}): {e}")
-        return None
-
-def _explorer_tokentx(wallet: str) -> list[dict]:
-    res = _explorer_call({"module": "account", "action": "tokentx", "address": wallet, "sort":"asc"})
-    return res or []
-
-def _explorer_txlist(wallet: str) -> list[dict]:
-    res = _explorer_call({"module":"account","action":"txlist","address":wallet,"sort":"asc"})
-    return res or []
-
-def _explorer_balance_native(wallet: str) -> Decimal:
-    rows = _explorer_call({"module":"account","action":"balance","address":wallet})
-    val = None
-    if isinstance(rows, dict):
-        val = rows.get("result")
-    elif isinstance(rows, str):
-        val = rows
-    try:
-        return Decimal(str(val)) / Decimal(10**18)
+        snap_total = _to_dec((snap.get("totals") or {}).get("value_usd", 0)) or Decimal("0")
+        label = str(snap.get("stamp") or snap.get("date") or "?")
     except Exception:
-        return Decimal("0")
-
-def _explorer_holdings(wallet: str) -> List[Dict[str, Any]]:
-    txs = _explorer_tokentx(wallet)
-    agg: Dict[Tuple[str,str,int], Decimal] = OrderedDict()
-    wl = wallet.lower()
-    for r in txs:
-        try:
-            sym = (r.get("tokenSymbol") or "").upper() or "TOKEN"
-            dec = int(r.get("tokenDecimal") or 18)
-            qty = _to_dec(r.get("value")) / (Decimal(10) ** dec)
-            frm = (r.get("from") or "").lower()
-            to  = (r.get("to") or "").lower()
-            side = 1 if to == wl else (-1 if frm == wl else 0)
-            if side == 0:
-                continue
-            key = ( (r.get("contractAddress") or "").lower(), sym, dec )
-            agg[key] = agg.get(key, Decimal("0")) + side * qty
-        except Exception:
-            continue
-
-    assets: List[Dict[str, Any]] = []
-    cro_bal = _explorer_balance_native(wallet)
-    if cro_bal > 0:
-        px = _to_dec(get_spot_usd("CRO", token_address=None)) or Decimal("0")
-        assets.append({"symbol":"CRO","amount":cro_bal,"price_usd":px,"value_usd":cro_bal*px})
-
-    for (contract, sym, _decimals), qty in agg.items():
-        if qty <= 0:
-            continue
-        px = _to_dec(get_spot_usd(sym, token_address=contract)) or Decimal("0")
-        assets.append({
-            "symbol": sym,
-            "amount": qty,
-            "price_usd": px,
-            "value_usd": qty * px,
-            "address": contract,
-        })
-    return assets
-
-def _holdings_auto(wallet: str) -> Tuple[List[Dict[str, Any]], str]:
-    if HOLDINGS_BACKEND in ("rpc","auto"):
-        try:
-            snap = get_wallet_snapshot(wallet)
-            snap = augment_with_discovered_tokens(snap, wallet_address=wallet)
-            snap = _normalize_snapshot_for_formatter(snap)
-            assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
-            for a in assets:
-                if _to_dec(a.get("price_usd",0)) <= 0:
-                    a["price_usd"] = _to_dec(get_spot_usd(str(a.get("symbol","")), token_address=a.get("address")))
-                amt = _to_dec(a.get("amount",0))
-                px  = _to_dec(a.get("price_usd",0))
-                a["value_usd"] = _to_dec(a.get("value_usd", amt*px)) or (amt*px)
-            return assets, "rpc"
-        except Exception:
-            logger.warning("RPC holdings failed, switching to Explorer")
-    return _explorer_holdings(wallet), "explorer"
+        snap_total, label = Decimal("0"), "?"
+    delta = curr_total - snap_total
+    pct = (delta / snap_total * Decimal("100")) if snap_total > 0 else Decimal("0")
+    return delta, pct, label
 
 # --------------------------------------------------
-# Ledger (for /trades and /pnl today)
+# Ledger helpers (CSV)
 # --------------------------------------------------
 def _ensure_ledger():
     base = os.path.dirname(LEDGER_CSV)
@@ -495,13 +535,8 @@ def _read_ledger_rows(start_dt: datetime, end_dt: datetime, symbol: Optional[str
             for row in r:
                 try:
                     ts = datetime.fromisoformat(row["ts"])
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=ZoneInfo(TZ))
                 except Exception:
-                    try:
-                        ts = datetime.strptime(row["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(TZ))
-                    except Exception:
-                        continue
+                    continue
                 if not (start_dt <= ts <= end_dt):
                     continue
                 sym = (row.get("symbol") or "").upper()
@@ -512,18 +547,10 @@ def _read_ledger_rows(start_dt: datetime, end_dt: datetime, symbol: Optional[str
                 px = _to_dec(row.get("price_usd", "0"))
                 tx = row.get("tx") or ""
                 out.append({"ts": ts, "symbol": sym, "qty": qty, "side": side, "price_usd": px, "tx": tx})
-    except FileNotFoundError:
-        out = []
     except Exception:
         logging.exception("Failed reading ledger")
     out.sort(key=lambda x: x["ts"])
     return out
-
-def _today_range() -> Tuple[datetime, datetime]:
-    now = _now_local()
-    start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=ZoneInfo(TZ))
-    end   = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=ZoneInfo(TZ))
-    return start, end
 
 def _fifo_realized_pnl(rows: List[dict]) -> Tuple[Decimal, Dict[str, Decimal]]:
     per_sym_lots: Dict[str, deque] = {}
@@ -569,13 +596,16 @@ def _format_trades_output(rows: List[dict], title: str) -> str:
     lines.append(f"\nNet USD flow today: ${_fmt_money(net_flow)}")
     return "\n".join(lines)
 
+# --------------------------------------------------
+# Explorer backfill (ΣΗΜΕΡΑ) -> ledger, με spot price
+# --------------------------------------------------
 def _explorer_backfill_today_to_ledger(wallet: str) -> int:
     _ensure_ledger()
     start, end = _today_range()
     wl = wallet.lower()
     wrote = 0
 
-    # 1) CRC20 transfers
+    # CRC20
     tok = _explorer_tokentx(wallet)
     with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
@@ -610,7 +640,7 @@ def _explorer_backfill_today_to_ledger(wallet: str) -> int:
             except Exception:
                 continue
 
-    # 2) Native CRO transfers
+    # Native CRO
     txs = _explorer_txlist(wallet)
     with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
@@ -647,7 +677,109 @@ def _explorer_backfill_today_to_ledger(wallet: str) -> int:
     return wrote
 
 # --------------------------------------------------
-# Command Handlers
+# Realtime monitor (Explorer polling, CRC20 + CRO)
+# --------------------------------------------------
+class _Dedup:
+    def __init__(self, window_sec: int = 60):
+        self.window = window_sec
+        self.last: Dict[str, float] = {}
+
+    def seen(self, key: str) -> bool:
+        now = time.time()
+        # καθάρισε παλιά
+        for k, t0 in list(self.last.items()):
+            if now - t0 > self.window:
+                del self.last[k]
+        if key in self.last:
+            return True
+        self.last[key] = now
+        return False
+
+async def _monitor_task(wallet: str, chat_id: Optional[int]):
+    logger.info("Realtime: explorer poller enabled (%.2fs)", RT_POLL_SEC)
+    _ensure_ledger()
+    dedup = _Dedup(RT_DEDUP_SEC)
+    wl = wallet.lower()
+
+    # κρατάμε τελευταία timeStamp που στείλαμε για tokentx/txlist
+    last_token_ts = 0
+    last_native_ts = 0
+
+    backoff = 1.0
+    while True:
+        try:
+            # CRC20
+            tok = _explorer_tokentx(wallet) or []
+            for r in tok:
+                try:
+                    ts = int(r.get("timeStamp", "0"))
+                    if ts <= last_token_ts:
+                        continue
+                    frm = (r.get("from") or "").lower()
+                    to  = (r.get("to") or "").lower()
+                    if wl not in (frm, to):
+                        continue
+                    sym = (r.get("tokenSymbol") or "").upper() or "TOKEN"
+                    dec = int(r.get("tokenDecimal") or 18)
+                    qty = _to_dec(r.get("value")) / (Decimal(10) ** dec)
+                    side = "IN" if to == wl else "OUT"
+                    px = _to_dec(get_spot_usd(sym, token_address=(r.get("contractAddress") or "").lower()))
+                    ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
+                    txh = r.get("hash") or ""
+                    # dedup on txhash+side+qty
+                    key = f"TOK:{txh}:{side}:{sym}:{qty}"
+                    if not dedup.seen(key):
+                        # write ledger
+                        with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
+                            w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
+                            w.writerow({"ts": ts_iso, "symbol": sym, "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
+                        # alert
+                        flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
+                        send_message(f"🟡 Trade\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} {sym} {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}", chat_id)
+                except Exception:
+                    continue
+            if tok:
+                last_token_ts = max(last_token_ts, max(int(x.get("timeStamp", "0")) for x in tok if x.get("timeStamp")))
+
+            # Native CRO
+            txs = _explorer_txlist(wallet) or []
+            for r in txs:
+                try:
+                    ts = int(r.get("timeStamp", "0"))
+                    if ts <= last_native_ts:
+                        continue
+                    frm = (r.get("from") or "").lower()
+                    to  = (r.get("to") or "").lower()
+                    if wl not in (frm, to):
+                        continue
+                    value_wei = _to_dec(r.get("value"))
+                    if value_wei <= 0:
+                        continue
+                    qty = value_wei / Decimal(10**18)
+                    side = "IN" if to == wl else "OUT"
+                    px = _to_dec(get_spot_usd("CRO", token_address=None))
+                    ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
+                    txh = r.get("hash") or ""
+                    key = f"NAT:{txh}:{side}:{qty}"
+                    if not dedup.seen(key):
+                        with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
+                            w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
+                            w.writerow({"ts": ts_iso, "symbol": "CRO", "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
+                        flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
+                        send_message(f"🟡 Transfer\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} CRO {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}", chat_id)
+                except Exception:
+                    continue
+            if txs:
+                last_native_ts = max(last_native_ts, max(int(x.get("timeStamp", "0")) for x in txs if x.get("timeStamp")))
+
+            backoff = 1.0
+            await asyncio.sleep(RT_POLL_SEC)
+        except Exception as e:
+            logger.warning(f"monitor loop error: {e}")
+            backoff = min(RT_BACKOFF_MAX, backoff * 2)
+            await asyncio.sleep(backoff)
+# --------------------------------------------------
+# Commands
 # --------------------------------------------------
 def _handle_start() -> str:
     return (
@@ -665,7 +797,18 @@ def _handle_start() -> str:
     )
 
 def _handle_help() -> str:
-    return _handle_start().replace("👋 Γεια σου! Είμαι το Cronos DeFi Sentinel.\n\n", "ℹ️ Βοήθεια\n")
+    return (
+        "ℹ️ Βοήθεια\n"
+        "• /holdings — compact MTM (φιλτραρισμένο) + PnL αν υπάρχει snapshot\n"
+        "• /scan — ωμή λίστα tokens που βρέθηκαν (amount + address)\n"
+        "• /rescan — ξανά σκανάρισμα & παρουσίαση σαν το /holdings\n"
+        "• /snapshot — αποθήκευση snapshot με timestamp\n"
+        "• /snapshots — λίστα διαθέσιμων snapshots\n"
+        "• /pnl [ημέρα ή stamp] — PnL vs snapshot (π.χ. /pnl 2025-10-11 ή /pnl 2025-10-11_0930)\n"
+        "• /trades [SYM] — σημερινές συναλλαγές\n"
+        "• /pnl today [SYM] — realized PnL (σήμερα, FIFO)\n"
+        "• /start — βασικές οδηγίες"
+    )
 
 def _handle_scan(wallet_address: str) -> str:
     try:
@@ -705,54 +848,50 @@ def _handle_rescan(wallet_address: str) -> str:
     except Exception:
         toks = []
     if not toks:
-        # fallback: holdings auto (rpc or explorer) για να δείξουμε κάτι
-        assets, src = _holdings_auto(wallet_address)
-        cleaned, hidden_count = _filter_and_sort_assets(assets)
-        if not cleaned:
-            return "🔁 Rescan ολοκληρώθηκε — δεν υπάρχει κάτι αξιοσημείωτο (ενδέχεται rate-limit)."
-        body, _ = _format_compact_holdings(cleaned, hidden_count)
-        return "🔁 Rescan (fallback from holdings):\n" + body
+        return "🔁 Rescan ολοκληρώθηκε — δεν βρέθηκαν ERC-20 με θετικό balance."
 
     enriched = _enrich_with_prices(toks)
     cleaned, hidden_count = _filter_and_sort_assets(enriched)
+
     if not cleaned:
         return "🔁 Rescan ολοκληρώθηκε — δεν υπάρχει κάτι αξιοσημείωτο να εμφανιστεί (όλα φιλτραρίστηκαν ως spam/zero/dust)."
+
     body, _ = _format_compact_holdings(cleaned, hidden_count)
     return "🔁 Rescan (filtered):\n" + body
 
 def _handle_holdings(wallet_address: str) -> str:
     try:
-        assets, src = _holdings_auto(wallet_address)
+        assets, backend = _holdings_auto(wallet_address)
         cleaned, hidden_count = _filter_and_sort_assets(assets)
         if not cleaned:
             return "⚠️ Δεν μπόρεσα να εμφανίσω holdings (πιθανό rate-limit στο RPC/Explorer). Δοκίμασε ξανά."
         body, total_now = _format_compact_holdings(cleaned, hidden_count)
 
-        # PnL vs τελευταίο snapshot (αν υπάρχει)
         last_snap = _load_snapshot()  # πιο πρόσφατο διαθέσιμο
         if last_snap:
             delta, pct, label = _compare_to_snapshot(total_now, last_snap)
             sign = "+" if delta >= 0 else ""
             body += f"\n\nUnrealized PnL vs snapshot {label}: ${_fmt_money(delta)} ({sign}{pct:.2f}%)"
+
         return body
     except Exception:
         logging.exception("Failed to build /holdings")
-        return "⚠️ Σφάλμα κατά τη δημιουργία των holdings."
+        return "⚠️ Δεν μπόρεσα να εμφανίσω holdings (πιθανό rate-limit στο RPC/Explorer). Δοκίμασε ξανά."
 
 def _handle_snapshot(wallet_address: str) -> str:
     try:
-        assets, _ = _holdings_auto(wallet_address)
+        assets, backend = _holdings_auto(wallet_address)
         cleaned, _ = _filter_and_sort_assets(assets)
         mapping = _assets_list_to_mapping(cleaned)
         total_now = _totals_value_from_assets(cleaned)
-        stamp = _save_snapshot(mapping, total_now)
+        stamp = _save_snapshot(mapping, total_now)  # π.χ. '2025-10-11_1210'
         return f"💾 Snapshot saved: {stamp}. Total ≈ ${_fmt_money(total_now)}"
     except Exception:
         logging.exception("Failed to save snapshot")
         return "⚠️ Σφάλμα κατά την αποθήκευση snapshot."
 
 def _handle_snapshots() -> str:
-    files = _list_snapshots(limit=50)
+    files = _list_snapshots(limit=30)
     if not files:
         return "ℹ️ Δεν υπάρχουν αποθηκευμένα snapshots."
     lines = ["🗂 Διαθέσιμα snapshots (νεότερα στο τέλος):"]
@@ -767,7 +906,7 @@ def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
         cleaned, _ = _filter_and_sort_assets(assets)
         total_now = _totals_value_from_assets(cleaned)
 
-        base = _load_snapshot(arg)  # None => latest, 'YYYY-MM-DD' => latest of day, 'YYYY-MM-DD_HHMM' => exact
+        base = _load_snapshot(arg)
         if not base:
             if arg:
                 return f"ℹ️ Δεν βρέθηκε snapshot για «{arg}». Δες /snapshots."
@@ -782,58 +921,27 @@ def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
 
 def _handle_trades(symbol: Optional[str] = None) -> str:
     start, end = _today_range()
-    rows = _read_ledger_rows(start, end, symbol)
-    if not rows:
-        # κάνε backfill από explorer για ΣΗΜΕΡΑ και ξαναδοκίμασε
-        try:
-            wrote = _explorer_backfill_today_to_ledger(WALLET_ADDRESS)
-            if wrote > 0:
-                rows = _read_ledger_rows(start, end, symbol)
-        except Exception:
-            pass
-    title = f"🟡 Intraday Update\n📒 Daily Report ({_today_str()})"
+    rows = _read_ledger_rows(start, end, symbol=symbol)
+    title = f"🟡 Intraday Update\n📒 Daily Report ({start.date().isoformat()})"
     return _format_trades_output(rows, title)
 
 def _handle_pnl_today(symbol: Optional[str] = None) -> str:
     start, end = _today_range()
-    rows = _read_ledger_rows(start, end, symbol)
+    rows = _read_ledger_rows(start, end, symbol=symbol)
     if not rows:
-        # backfill σημερινών κινήσεων αν δεν υπάρχουν
-        try:
-            wrote = _explorer_backfill_today_to_ledger(WALLET_ADDRESS)
-            if wrote > 0:
-                rows = _read_ledger_rows(start, end, symbol)
-        except Exception:
-            pass
-
+        return "Σήμερα δεν βρέθηκαν συναλλαγές."
     realized_total, realized_by_sym = _fifo_realized_pnl(rows)
-    lines = [f"📊 Realized PnL (today {_today_str()}, FIFO):"]
-    if symbol:
-        sym = symbol.upper()
-        val = realized_by_sym.get(sym, Decimal("0"))
-        sign = "+" if val >= 0 else ""
-        lines.append(f"• {sym}: {sign}${_fmt_money(val)}")
-    else:
-        for sym, val in sorted(realized_by_sym.items()):
-            sign = "+" if val >= 0 else ""
-            lines.append(f"• {sym}: {sign}${_fmt_money(val)}")
-        sign = "+" if realized_total >= 0 else ""
-        lines.append(f"\nTotal realized today: {sign}${_fmt_money(realized_total)}")
-    return "\n".join(lines)
+    bysym = " ".join([f"{k}:{_fmt_money(v)}" for k,v in realized_by_sym.items()])
+    return f"💰 Realized PnL today: ${_fmt_money(realized_total)}" + (f"  — per symbol: {bysym}" if bysym else "")
 
 # --------------------------------------------------
-# Command dispatcher
+# Dispatcher
 # --------------------------------------------------
 def _dispatch_command(text: str) -> str:
     if not text:
         return ""
     parts = text.strip().split()
     cmd = parts[0].lower()
-
-    # /pnl today [SYM]
-    if cmd == "/pnl" and len(parts) >= 2 and parts[1].lower() == "today":
-        sym = parts[2] if len(parts) >= 3 else None
-        return _handle_pnl_today(sym)
 
     if cmd == "/start":
         return _handle_start()
@@ -850,11 +958,16 @@ def _dispatch_command(text: str) -> str:
     if cmd == "/snapshots":
         return _handle_snapshots()
     if cmd == "/pnl":
+        # υποστηρίζει: /pnl <date/stamp>  ΚΑΙ /pnl today [SYM]
+        if len(parts) >= 2 and parts[1].lower() == "today":
+            sym = parts[2].upper() if len(parts) >= 3 else None
+            return _handle_pnl_today(sym)
         arg = parts[1] if len(parts) > 1 else None
         return _handle_pnl(WALLET_ADDRESS, arg)
     if cmd == "/trades":
-        sym = parts[1] if len(parts) > 1 else None
+        sym = parts[1].upper() if len(parts) >= 2 else None
         return _handle_trades(sym)
+
     return "❓ Άγνωστη εντολή. Δοκίμασε /help."
 
 # --------------------------------------------------
@@ -871,7 +984,8 @@ async def telegram_webhook(request: Request):
 
         if text:
             reply = _dispatch_command(text)
-            send_message(reply, chat_id)
+            if reply:
+                send_message(reply, chat_id)
     except Exception:
         logging.exception("Error handling Telegram webhook")
     return JSONResponse(content={"ok": True})
@@ -884,44 +998,29 @@ async def healthz():
     return JSONResponse(content={"ok": True, "service": "wallet_monitor_Dex", "status": "running"})
 
 # --------------------------------------------------
-# Optional: live monitor supervisor (won't crash API)
-# --------------------------------------------------
-async def _supervisor():
-    if not MONITOR_ENABLE:
-        return
-    try:
-        from realtime.monitor import monitor_wallet
-    except Exception as e:
-        logger.error("Monitor disabled (import error): %s", e)
-        return
-
-    async def _sender(msg: str):
-        try:
-            send_message(msg, CHAT_ID)
-        except Exception:
-            pass
-
-    while True:
-        try:
-            await monitor_wallet(_sender, logger=logging.getLogger("realtime"))
-        except Exception as e:
-            logging.error("monitor_wallet crashed: %s", e)
-        await asyncio.sleep(3.0)  # small backoff, keep API alive
-
-# --------------------------------------------------
-# Startup
+# Startup (start monitor if enabled)
 # --------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
     logging.info("✅ Cronos DeFi Sentinel started and is online.")
-    try:
-        _ensure_dir(os.path.dirname(LEDGER_CSV) or ".")
-        _ensure_dir(SNAPSHOT_DIR)
-    except Exception:
-        pass
+    _ensure_dir("./data")
+    _ensure_dir(SNAPSHOT_DIR)
+    _ensure_ledger()
     try:
         send_message("✅ Cronos DeFi Sentinel started and is online.", CHAT_ID)
     except Exception:
         pass
-    # fire-and-forget supervisor (does nothing unless MONITOR_ENABLE=1)
-    asyncio.create_task(_supervisor())
+
+    if MONITOR_ENABLE and WALLET_ADDRESS and CHAT_ID:
+        async def _runner():
+            await _monitor_task(WALLET_ADDRESS, CHAT_ID)
+
+        async def _supervisor():
+            while True:
+                try:
+                    await _runner()
+                except Exception as e:
+                    logging.exception(f"monitor crashed: {e}")
+                    await asyncio.sleep(3)
+
+        asyncio.create_task(_supervisor())
