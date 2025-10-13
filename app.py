@@ -1,12 +1,12 @@
 # app.py
-# FastAPI entrypoint για το Cronos DeFi Sentinel bot (Telegram webhook + commands)
+# FastAPI entrypoint για το Cronos DeFi Sentinel bot (Telegram webhook + commands + realtime monitor)
 from __future__ import annotations
 
 import os
 import re
+import csv
 import json
 import logging
-import asyncio
 from typing import Optional, List, Dict, Any
 from collections import OrderedDict
 from datetime import datetime
@@ -17,21 +17,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from telegram import api as tg_api
+# from telegram.formatters import format_holdings as _unused_external_formatter
 
 from core.holdings import get_wallet_snapshot
 from core.augment import augment_with_discovered_tokens
 from core.discovery import discover_tokens_for_wallet
 from core.pricing import get_spot_usd
-
-# Phase 2: intraday trades & realized PnL (today)
-from reports.trades import todays_trades, realized_pnl_today
-from telegram.formatters import format_trades_table, format_pnl_today
-
-# Realtime monitor (separate file you added: realtime/monitor.py)
-from realtime.monitor import monitor_wallet
-
-# Intraday report helpers (ledger.csv -> nice report)
-from csv import DictReader
 
 # --------------------------------------------------
 # Configuration
@@ -42,15 +33,19 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 APP_URL = os.getenv("APP_URL")  # optional
 EOD_TIME = os.getenv("EOD_TIME", "23:59")
 TZ = os.getenv("TZ", "Europe/Athens")
-SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./data/snapshots")  # Railway FS is ephemeral per deploy
+SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./data/snapshots")
+LEDGER_CSV = os.getenv("LEDGER_CSV", "data/ledger.csv")
+
+# Realtime monitor toggles (supervisor ξεκινάει monitor αν υπάρχει)
+MONITOR_ENABLE = os.getenv("MONITOR_ENABLE", "1").lower() in ("1","true","yes","on")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="1.3")
+app = FastAPI(title="Cronos DeFi Sentinel", version="1.2")
 
 # --------------------------------------------------
-# Telegram send (with safe splitting)
+# Telegram helpers
 # --------------------------------------------------
 def _fallback_send_message(text: str, chat_id: Optional[int] = None):
     try:
@@ -153,58 +148,40 @@ def _env_dec(name: str, default: str) -> Decimal:
         return Decimal(default)
 
 def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
-    """
-    Filters/sorts with env:
-    - HOLDINGS_HIDE_ZERO_PRICE (default True)
-    - HOLDINGS_DUST_USD (default 0.05)
-    - HOLDINGS_BLACKLIST_REGEX
-    - HOLDINGS_LIMIT (default 40)
-
-    Majors rules: no dust filter; if price==0, try live get_spot_usd.
-    """
     hide_zero = _env_bool("HOLDINGS_HIDE_ZERO_PRICE", True)
     dust_usd  = _env_dec("HOLDINGS_DUST_USD", "0.05")
     limit     = int(os.getenv("HOLDINGS_LIMIT", "40"))
     bl_re_pat = os.getenv("HOLDINGS_BLACKLIST_REGEX", r"(?i)(claim|airdrop|promo|mistery|crowithknife|classic|button|ryoshi|ethena\.promo)")
     bl_re = re.compile(bl_re_pat)
 
-    majors = {"USDT","USDC","WCRO","CRO","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC","HBAR"}
+    visible = []
+    hidden  = 0
+    whitelist_zero_price = {"USDT","USDC","WCRO","CRO","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC"}
 
-    visible, hidden = [], 0
     for a in assets:
         d = _asset_as_dict(a)
         sym = str(d.get("symbol","?")).upper().strip()
-        addr = d.get("address")
         price = _to_dec(d.get("price_usd", 0)) or Decimal("0")
-        amt   = _to_dec(d.get("amount", 0)) or Decimal("0")
-
-        if sym in majors and (price is None or price <= 0):
-            try:
-                px_live = get_spot_usd(sym, token_address=addr)
-                price = _to_dec(px_live) or Decimal("0")
-            except Exception:
-                pass
-
-        val = _to_dec(d.get("value_usd", 0))
+        val   = _to_dec(d.get("value_usd", 0))
         if val is None or isinstance(val, (str, float, int)):
-            val = amt * (price or Decimal("0"))
+            amt = _to_dec(d.get("amount", 0)) or Decimal("0")
+            val = amt * price
 
         if bl_re.search(sym):
             hidden += 1
             continue
-        if hide_zero and (price is None or price <= 0) and sym not in majors:
+        if hide_zero and price <= 0 and sym not in whitelist_zero_price:
             hidden += 1
             continue
-        if sym not in majors:
-            if val is None or val < dust_usd:
-                hidden += 1
-                continue
+        if val is None or val < dust_usd:
+            hidden += 1
+            continue
 
         d["price_usd"] = price
         d["value_usd"] = val
         visible.append(d)
 
-    visible.sort(key=lambda x: (_to_dec(x.get("value_usd")) or Decimal("0")), reverse=True)
+    visible.sort(key=lambda x: (x.get("value_usd") or Decimal("0")), reverse=True)
 
     if limit and len(visible) > limit:
         hidden += (len(visible) - limit)
@@ -222,6 +199,7 @@ def _assets_list_to_mapping(assets: list) -> dict:
         val = _to_dec(d.get("value_usd", 0))
         if val is None:
             val = amt * px
+
         if sym in out:
             prev = out[sym]
             prev_amt = _to_dec(prev.get("amount", 0)) or Decimal("0")
@@ -241,7 +219,7 @@ def _assets_list_to_mapping(assets: list) -> dict:
     return out
 
 # --------------------------------------------------
-# Snapshots storage + PnL helpers
+# Snapshots + PnL helpers
 # --------------------------------------------------
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -351,7 +329,8 @@ def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> tuple[Decimal, Deci
 # --------------------------------------------------
 def _fmt_money(x: Decimal) -> str:
     q = Decimal("0.01")
-    return f"{x.quantize(q):,}"
+    s = f"{x.quantize(q):,}"
+    return s
 
 def _fmt_price(x: Decimal) -> str:
     try:
@@ -373,7 +352,8 @@ def _fmt_qty(x: Decimal) -> str:
         return str(x)
 
 def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) -> tuple[str, Decimal]:
-    lines, total = ["Holdings snapshot:"], Decimal("0")
+    lines = ["Holdings snapshot:"]
+    total = Decimal("0")
     for a in assets:
         d = _asset_as_dict(a)
         sym = str(d.get("symbol","?")).upper()
@@ -381,7 +361,9 @@ def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) ->
         px  = _to_dec(d.get("price_usd", 0)) or Decimal("0")
         val = _to_dec(d.get("value_usd", 0)) or (qty * px)
         total += val
-        lines.append(f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}")
+        lines.append(
+            f" - {sym:<12} {_fmt_qty(qty):>12} × ${_fmt_price(px):<12} = ${_fmt_money(val)}"
+        )
     lines.append(f"\nTotal ≈ ${_fmt_money(total)}")
     if hidden_count:
         lines.append(f"\n(…και άλλα {hidden_count} κρυμμένα: spam/zero-price/dust)")
@@ -394,242 +376,79 @@ def _format_compact_holdings(assets: List[Dict[str, Any]], hidden_count: int) ->
     return "\n".join(lines), total
 
 # --------------------------------------------------
-# Helpers for /rescan & /holdings corrections
+# Ledger readers (for /trades & /pnl today)
 # --------------------------------------------------
-def _inject_snapshot_majors(tokens: List[Dict[str, Any]], wallet_address: str) -> List[Dict[str, Any]]:
-    majors = {"CRO","WCRO","USDT","USDC","WETH","WBTC","ADA","SOL","XRP","SUI","MATIC","HBAR"}
-    try:
-        snap = get_wallet_snapshot(wallet_address)
-        snap = _normalize_snapshot_for_formatter(snap or {})
-        snap_assets = snap.get("assets") or []
-    except Exception:
-        logging.exception("inject_snapshot_majors: failed to load snapshot; returning original tokens")
-        return tokens
+_LOCAL_TZ = ZoneInfo(TZ)
 
-    out: List[Dict[str, Any]] = []
-    have_syms = set()
-    for t in tokens or []:
-        d = _asset_as_dict(t)
-        d["symbol"] = str(d.get("symbol","")).upper()
-        out.append(d)
-        have_syms.add(d["symbol"])
-
-    for a in snap_assets:
-        d = _asset_as_dict(a)
-        sym = str(d.get("symbol","")).upper()
-        if sym in majors and sym not in have_syms:
-            out.append({"symbol": sym, "amount": d.get("amount", 0), "address": d.get("address")})
-            have_syms.add(sym)
-    return out
-
-def _dedupe_by_symbol_take_max(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    best: Dict[str, Dict[str, Any]] = {}
-    for a in assets or []:
-        d = _asset_as_dict(a)
-        sym = str(d.get("symbol","?")).upper().strip()
-        amt = _to_dec(d.get("amount", 0)) or Decimal("0")
-        prev = best.get(sym)
-        if not prev or amt > (_to_dec(prev.get("amount", 0)) or Decimal("0")):
-            best[sym] = d
-    return list(best.values())
-
-def _mk_symbol_amount_map(tokens: List[Dict[str, Any]]) -> Dict[str, Decimal]:
-    mp: Dict[str, Decimal] = {}
-    for t in tokens or []:
-        d = _asset_as_dict(t)
-        sym = str(d.get("symbol","?")).upper().strip()
-        amt = _to_dec(d.get("amount", 0)) or Decimal("0")
-        mp[sym] = amt
-    return mp
-
-def _overlay_discovery_amounts(assets: List[Dict[str, Any]], wallet_address: str) -> List[Dict[str, Any]]:
-    """Replace amounts with live discovery (on-chain) so recent buys/sells reflect immediately."""
-    try:
-        disc = discover_tokens_for_wallet(wallet_address) or []
-    except Exception:
-        disc = []
-    live = _mk_symbol_amount_map(disc)
-    out: List[Dict[str, Any]] = []
-    for a in assets or []:
-        d = dict(_asset_as_dict(a))
-        sym = str(d.get("symbol","?")).upper().strip()
-        if sym in live:
-            d["amount"] = live[sym]
-        out.append(d)
-    have = {str(_asset_as_dict(x).get("symbol","")).upper().strip() for x in assets or []}
-    for sym, amt in live.items():
-        if sym not in have:
-            out.append({"symbol": sym, "amount": amt})
-    return out
-# --------------------------------------------------
-# Intraday report helpers (ledger.csv -> nice report)
-# --------------------------------------------------
-
-LEDGER_CSV = os.getenv("LEDGER_CSV", "data/ledger.csv")
-
-def _today_bounds_tz():
-    now = _now_local()
-    start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=now.tzinfo)
-    end   = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=now.tzinfo)
-    return start, end
-
-def _parse_iso_ts(s: str) -> Optional[datetime]:
-    try:
-        # ledger uses ISO in UTC or local; parse both
-        return datetime.fromisoformat(s.replace("Z","+00:00"))
-    except Exception:
-        return None
-
-def _read_today_ledger_rows() -> list[dict]:
-    rows: list[dict] = []
+def _read_ledger_today(sym_filter: Optional[str]=None) -> list[dict]:
+    out = []
     if not os.path.exists(LEDGER_CSV):
-        return rows
-    tz = ZoneInfo(TZ)
-    start, end = _today_bounds_tz()
-    try:
-        with open(LEDGER_CSV, "r", encoding="utf-8") as f:
-            rdr = DictReader(f)
-            for r in rdr:
-                ts = _parse_iso_ts(r.get("ts",""))
-                if not ts:
-                    continue
-                # normalize to same tz for compare
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=ZoneInfo("UTC"))
-                ts_local = ts.astimezone(tz)
-                if start <= ts_local <= end:
-                    rows.append({
-                        "ts": ts_local,
-                        "symbol": (r.get("symbol") or "").upper(),
-                        "side": (r.get("side") or "").upper(),  # BUY/SELL
-                        "qty": _to_dec(r.get("qty") or "0") or Decimal("0"),
-                        "price": _to_dec(r.get("price") or "0") or Decimal("0"),
-                        "fee": _to_dec(r.get("fee") or "0") or Decimal("0"),
-                        "tx": r.get("tx") or "",
-                    })
-    except Exception:
-        logging.exception("Failed reading LEDGER_CSV")
-    # sort by time
-    rows.sort(key=lambda x: x["ts"])
-    return rows
+        return out
+    today = datetime.now(_LOCAL_TZ).date()
+    with open(LEDGER_CSV, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            ts_raw = row.get("ts") or ""
+            try:
+                # support "2025-10-12T12:03:00+00:00" or Z
+                ts = datetime.fromisoformat(ts_raw.replace("Z","+00:00"))
+            except Exception:
+                continue
+            ts_local = ts.astimezone(_LOCAL_TZ)
+            if ts_local.date() != today:
+                continue
+            sym = (row.get("symbol") or "").upper()
+            if sym_filter and sym != sym_filter.upper():
+                continue
+            try:
+                qty = Decimal(str(row.get("qty") or "0"))
+                price = Decimal(str(row.get("price") or "0"))
+                fee = Decimal(str(row.get("fee") or "0"))
+            except Exception:
+                qty = Decimal("0"); price = Decimal("0"); fee = Decimal("0")
+            out.append({
+                "ts": ts_local,
+                "symbol": sym,
+                "side": (row.get("side") or "").upper(),  # BUY/SELL
+                "qty": qty,
+                "price": price,
+                "fee": fee,
+                "tx": row.get("tx") or "",
+            })
+    out.sort(key=lambda x: x["ts"])
+    return out
 
-def _price_now(sym: str, addr: Optional[str] = None) -> Decimal:
-    try:
-        px = get_spot_usd(sym, token_address=addr)
-        return _to_dec(px) or Decimal("0")
-    except Exception:
-        return Decimal("0")
-
-def _fifo_realized_today(trades: list[dict]) -> tuple[Decimal, dict]:
-    """
-    FIFO only on today's trades (intraday). Returns (realized_usd, per_symbol_state)
-    state: {sym: {"buys":[(qty,cost)], "avg_cost": Decimal, "realized": Decimal, "net_qty": Decimal, "buy_qty": Decimal, "sell_qty": Decimal}}
-    """
-    state: dict[str, dict] = {}
-    realized = Decimal("0")
-    for t in trades:
-        sym = t["symbol"]
-        side = t["side"]
-        qty  = t["qty"]
-        # use current price (we don't have trade-time px in ledger)
-        px   = _price_now(sym)
-        usd  = qty * px
-        st = state.setdefault(sym, {"buys": [], "realized": Decimal("0"), "net_qty": Decimal("0"),
-                                    "buy_qty": Decimal("0"), "sell_qty": Decimal("0")})
-        if side == "BUY":
-            st["buys"].append([qty, usd])  # store cost basis in USD
-            st["net_qty"] += qty
-            st["buy_qty"] += qty
-        else:  # SELL
-            sell_qty = qty
-            proceeds = qty * px
-            cost_used = Decimal("0")
-            # consume from buys
-            while sell_qty > 0 and st["buys"]:
-                lot_qty, lot_cost = st["buys"][0]
-                if lot_qty <= sell_qty:
-                    sell_qty -= lot_qty
-                    cost_used += lot_cost
-                    st["buys"].pop(0)
-                else:
-                    # partial
-                    part_cost = lot_cost * (sell_qty / lot_qty)
-                    cost_used += part_cost
-                    st["buys"][0][0] = lot_qty - sell_qty
-                    st["buys"][0][1] = lot_cost - part_cost
-                    sell_qty = Decimal("0")
-            pnl = proceeds - cost_used
-            st["realized"] += pnl
-            realized += pnl
-            st["net_qty"] -= qty
-            st["sell_qty"] += qty
-    # compute avg cost for remaining lots
-    for sym, st in state.items():
-        total_qty = sum(q for q, _ in st["buys"]) if st["buys"] else Decimal("0")
-        total_cost = sum(c for _, c in st["buys"]) if st["buys"] else Decimal("0")
-        st["avg_cost"] = (total_cost / total_qty) if total_qty > 0 else Decimal("0")
-    return realized, state
-
-def _format_intraday_report(wallet_address: str, sym_filter: Optional[str] = None) -> str:
-    # 1) load today's trades
-    trades = _read_today_ledger_rows()
-    if sym_filter:
-        sym_filter = sym_filter.upper().strip()
-        trades = [t for t in trades if t["symbol"] == sym_filter]
-    # 2) format transactions list (with current prices)
-    lines_tx: list[str] = []
-    net_usd_flow = Decimal("0")
-    for t in trades:
-        ts_local = t["ts"].strftime("%H:%M:%S")
-        sym = t["symbol"]
-        side = t["side"]
-        qty = t["qty"]
-        px  = _price_now(sym)
-        usd = qty * px * (Decimal("1") if side == "IN" or side == "BUY" else Decimal("-1"))
-        net_usd_flow += usd
-        # display direction similar to old style (IN/OUT)
-        dirn = "IN" if side == "BUY" else "OUT"
-        lines_tx.append(f"• {ts_local} — {dirn} {sym} {qty:.4f}  @ ${px:.6f}  (${usd:.6f})")
-    # 3) realized PnL today (intraday FIFO)
-    # remap BUY/SELL from ledger to trades list
-    # (we wrote BUY/SELL in monitor; keep as-is)
-    realized_today, per_sym = _fifo_realized_today(trades)
-    # 4) holdings now (use existing snapshot pipeline)
-    body_holdings = _handle_holdings(wallet_address)
-    # Extract current assets to compute MTM total (already at end of body)
-    # 5) Per-Asset detail
-    lines_detail: list[str] = []
-    for sym, st in sorted(per_sym.items()):
-        if sym_filter and sym != sym_filter:
+def _fifo_realized_pnl_today(rows: list[dict]) -> tuple[Decimal, dict]:
+    realized_total = Decimal("0")
+    realized_by_sym: dict[str, Decimal] = {}
+    inv: dict[str, list[tuple[Decimal, Decimal]]] = {}  # sym -> [(qty, price)]
+    for r in rows:
+        s = r["symbol"]
+        side = r["side"]
+        qty = r["qty"]
+        px  = r["price"]
+        if px <= 0 or qty <= 0:
             continue
-        # rebuild the actions for this sym (time-ordered)
-        sym_trades = [t for t in trades if t["symbol"] == sym]
-        for t in sym_trades:
-            ts_local = t["ts"].strftime("%H:%M:%S")
-            side = "IN" if t["side"] == "BUY" else "OUT"
-            px = _price_now(sym)
-            usd = t["qty"] * px * (Decimal("1") if side=="IN" else Decimal("-1"))
-            lines_detail.append(f"    – {ts_local} — {side} {t['qty']:.4f} @ ${px:.6f}  (${usd:.4f})")
-        px_now = _price_now(sym)
-        buy_qty  = st["buy_qty"]
-        sell_qty = st["sell_qty"]
-        net_qty  = st["net_qty"]
-        flow_usd = (buy_qty * px_now) - (sell_qty * px_now)  # display flow at current px for consistency
-        unreal = net_qty * (px_now - st.get("avg_cost", Decimal("0")))
-        lines_detail.append(f"    ↳ buys {buy_qty:.4f} | sells {sell_qty:.4f} | net qty {net_qty:.4f} | flow ${flow_usd:.4f}")
-        lines_detail.append(f"    ↳ realized today ${st['realized']:.8f} | price ${px_now:.6f} | unreal now ${unreal:.4f}")
-        lines_detail.append("")  # spacer
-
-    header = (
-        f"🟡 Intraday Update\n"
-        f"📒 Daily Report ({_now_local().date().isoformat()})\n"
-        f"Transactions:\n" + ("\n".join(lines_tx) if lines_tx else "• (no trades yet)\n") +
-        f"\nNet USD flow today: ${net_usd_flow:.6f}\n"
-        f"Realized PnL today: ${realized_today:.8f}\n"
-        f"{body_holdings}\n"
-        f"\nPer-Asset Detail (Today):\n" + ("\n".join(lines_detail) if lines_detail else "  • (no per-asset activity today)")
-    )
-    return header
+        if s not in inv:
+            inv[s] = []
+        if side == "BUY":
+            inv[s].append((qty, px))
+        elif side == "SELL":
+            remain = qty
+            pnl = Decimal("0")
+            while remain > 0 and inv[s]:
+                lot_qty, lot_px = inv[s][0]
+                take = min(remain, lot_qty)
+                pnl += (px - lot_px) * take
+                lot_qty -= take
+                remain -= take
+                if lot_qty <= 0:
+                    inv[s].pop(0)
+                else:
+                    inv[s][0] = (lot_qty, lot_px)
+            realized_by_sym[s] = realized_by_sym.get(s, Decimal("0")) + pnl
+            realized_total += pnl
+    return realized_total, realized_by_sym
 
 # --------------------------------------------------
 # Command Handlers
@@ -658,8 +477,8 @@ def _handle_help() -> str:
         "• /snapshot — αποθήκευση snapshot με timestamp\n"
         "• /snapshots — λίστα διαθέσιμων snapshots\n"
         "• /pnl [ημέρα ή stamp] — PnL vs snapshot (π.χ. /pnl 2025-10-11 ή /pnl 2025-10-11_0930)\n"
-        "• /trades [SYM] — σημερινές συναλλαγές (τοπική TZ)\n"
-        "• /pnl today [SYM] — realized PnL μόνο για ΣΗΜΕΡΑ (FIFO ανά σύμβολο)\n"
+        "• /trades [SYM] — σημερινές συναλλαγές\n"
+        "• /pnl today [SYM] — realized PnL για σήμερα (FIFO)\n"
         "• /start — βασικές οδηγίες"
     )
 
@@ -693,8 +512,9 @@ def _enrich_with_prices(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _handle_rescan(wallet_address: str) -> str:
     if not wallet_address:
         return "⚠️ Δεν έχει οριστεί WALLET_ADDRESS στο περιβάλλον."
-    toks = discover_tokens_for_wallet(wallet_address) or []
-    toks = _inject_snapshot_majors(toks, wallet_address)  # ensure majors like CRO
+    toks = discover_tokens_for_wallet(wallet_address)
+    if not toks:
+        return "🔁 Rescan ολοκληρώθηκε — δεν βρέθηκαν ERC-20 με θετικό balance."
     enriched = _enrich_with_prices(toks)
     cleaned, hidden_count = _filter_and_sort_assets(enriched)
     if not cleaned:
@@ -707,21 +527,15 @@ def _handle_holdings(wallet_address: str) -> str:
         snap = get_wallet_snapshot(wallet_address)
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
         snap = _normalize_snapshot_for_formatter(snap)
-
         assets = snap.get("assets") or []
         assets = [_asset_as_dict(a) for a in assets]
-        assets = _dedupe_by_symbol_take_max(assets)  # avoid double counting
-        assets = _overlay_discovery_amounts(assets, wallet_address)  # live on-chain amounts
-
         cleaned, hidden_count = _filter_and_sort_assets(assets)
         body, total_now = _format_compact_holdings(cleaned, hidden_count)
-
         last_snap = _load_snapshot()
         if last_snap:
             delta, pct, label = _compare_to_snapshot(total_now, last_snap)
             sign = "+" if delta >= 0 else ""
             body += f"\n\nUnrealized PnL vs snapshot {label}: ${_fmt_money(delta)} ({sign}{pct:.2f}%)"
-
         return body
     except Exception:
         logging.exception("Failed to build /holdings")
@@ -733,13 +547,9 @@ def _handle_snapshot(wallet_address: str) -> str:
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
         snap = _normalize_snapshot_for_formatter(snap)
         assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
-        assets = _dedupe_by_symbol_take_max(assets)
-        assets = _overlay_discovery_amounts(assets, wallet_address)
-
         cleaned, _ = _filter_and_sort_assets(assets)
         mapping = _assets_list_to_mapping(cleaned)
         total_now = _totals_value_from_assets(cleaned)
-
         stamp = _save_snapshot(mapping, total_now)
         return f"💾 Snapshot saved: {stamp}. Total ≈ ${_fmt_money(total_now)}"
     except Exception:
@@ -762,9 +572,6 @@ def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
         snap = augment_with_discovered_tokens(snap, wallet_address=wallet_address)
         snap = _normalize_snapshot_for_formatter(snap)
         assets = [_asset_as_dict(a) for a in (snap.get("assets") or [])]
-        assets = _dedupe_by_symbol_take_max(assets)
-        assets = _overlay_discovery_amounts(assets, wallet_address)
-
         cleaned, _ = _filter_and_sort_assets(assets)
         total_now = _totals_value_from_assets(cleaned)
 
@@ -781,44 +588,38 @@ def _handle_pnl(wallet_address: str, arg: Optional[str] = None) -> str:
         logging.exception("Failed to compute PnL")
         return "⚠️ Σφάλμα κατά τον υπολογισμό PnL."
 
-# Phase 2 intraday
-def _handle_trades(symbol: Optional[str] = None) -> str:
-    try:
-        syms = [symbol.upper()] if symbol else None
-        trades = todays_trades(syms)
-        return format_trades_table(trades)
-    except Exception:
-        logging.exception("Failed to build /trades")
-        return "⚠️ Σφάλμα κατά τη δημιουργία λίστας σημερινών συναλλαγών."
+# -------- NEW: /trades (today) --------
+def _handle_trades_cmd(sym: Optional[str]=None) -> str:
+    rows = _read_ledger_today(sym_filter=sym)
+    if not rows:
+        return "Σήμερα δεν βρέθηκαν συναλλαγές."
+    lines = ["🟡 Intraday Trades (today):"]
+    for r in rows:
+        t = r["ts"].strftime("%H:%M:%S")
+        s = r["symbol"]
+        side = "IN " if r["side"]=="BUY" else "OUT"
+        qty = f"{r['qty']:,.6f}".rstrip("0").rstrip(".")
+        px  = f"{r['price']:,.6f}".rstrip("0").rstrip(".")
+        txs = r['tx']
+        tx_short = f"{txs[:10]}…{txs[-8:]}" if txs else "-"
+        lines.append(f"• {t} — {side} {s} {qty} @ ${px} (tx {tx_short})")
+    return "\n".join(lines)
 
-def _handle_pnl_today(symbol: Optional[str] = None) -> str:
-    try:
-        summary = realized_pnl_today()
-        text = format_pnl_today(summary)
-        if symbol:
-            sym = symbol.upper().strip()
-            lines = []
-            for line in text.splitlines():
-                if line.startswith("- "):
-                    if line[2:].upper().startswith(sym):
-                        lines.append(line)
-                else:
-                    lines.append(line)
-            if len(lines) > 1:
-                return "\n".join(lines)
-        return text
-    except Exception:
-        logging.exception("Failed to compute realized PnL (today)")
-        return "⚠️ Σφάλμα κατά τον υπολογισμό του realized PnL για σήμερα."
-        
-def _handle_intraday(wallet_address: str, arg: Optional[str] = None) -> str:
-    # /intraday           -> full report
-    # /intraday ADA       -> only ADA
-    try:
-        return _format_intraday_report(wallet_address, arg)
-    except Exception:
-        logging.exception("Failed to build intraday report")
-        return "⚠️ Σφάλμα κατά την παραγωγή του Intraday report."
+# -------- NEW: /pnl today (FIFO) --------
+def _handle_pnl_today(sym: Optional[str]=None) -> str:
+    rows = _read_ledger_today(sym_filter=sym)
+    if not rows:
+        return "Σήμερα δεν βρέθηκαν συναλλαγές."
+    realized, by_sym = _fifo_realized_pnl_today(rows)
+    lines = [f"📊 Realized PnL (today) — FIFO"]
+    if sym:
+        v = by_sym.get(sym.upper(), Decimal("0"))
+        lines.append(f"• {sym.upper()}: ${_fmt_money(v)}")
+    else:
+        for s, v in sorted(by_sym.items()):
+            lines.append(f"• {s}: ${_fmt_money(v)}")
+        lines.append(f"\nTotal realized today: ${_fmt_money(realized)}")
+    return "\n".join(lines)
 
 # --------------------------------------------------
 # Command dispatcher
@@ -828,16 +629,6 @@ def _dispatch_command(text: str) -> str:
         return ""
     parts = text.strip().split()
     cmd = parts[0].lower()
-
-    # Phase 2
-    if cmd == "/trades":
-        sym = parts[1] if len(parts) > 1 else None
-        return _handle_trades(sym)
-    if cmd == "/pnl" and len(parts) > 1 and parts[1].lower() == "today":
-        sym = parts[2] if len(parts) > 2 else None
-        return _handle_pnl_today(sym)
-
-    # Core
     if cmd == "/start":
         return _handle_start()
     if cmd == "/help":
@@ -853,13 +644,15 @@ def _dispatch_command(text: str) -> str:
     if cmd == "/snapshots":
         return _handle_snapshots()
     if cmd == "/pnl":
+        # support "/pnl today [SYM]" and "/pnl [date|stamp]"
+        if len(parts) > 1 and parts[1].lower() == "today":
+            sym = parts[2] if len(parts) > 2 else None
+            return _handle_pnl_today(sym)
         arg = parts[1] if len(parts) > 1 else None
         return _handle_pnl(WALLET_ADDRESS, arg)
-    if cmd == "/intraday":
-        return _handle_intraday(WALLET_ADDRESS, arg)
     if cmd == "/trades":
-        # keep old command but show the new Intraday report formatting
-        return _handle_intraday(WALLET_ADDRESS, arg)
+        sym = parts[1] if len(parts) > 1 else None
+        return _handle_trades_cmd(sym)
     return "❓ Άγνωστη εντολή. Δοκίμασε /help."
 
 # --------------------------------------------------
@@ -873,7 +666,6 @@ async def telegram_webhook(request: Request):
         text = message.get("text", "")
         chat = message.get("chat", {})
         chat_id = chat.get("id", CHAT_ID)
-
         if text:
             reply = _dispatch_command(text)
             send_message(reply, chat_id)
@@ -889,7 +681,7 @@ async def healthz():
     return JSONResponse(content={"ok": True, "service": "wallet_monitor_Dex", "status": "running"})
 
 # --------------------------------------------------
-# Startup (kick off realtime monitor)
+# Startup: boot notice + realtime supervisor
 # --------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
@@ -899,20 +691,27 @@ async def on_startup():
     except Exception:
         pass
 
-    async def _sender(text: str):
-        send_message(text, CHAT_ID)
+    if MONITOR_ENABLE:
+        # try import realtime monitor and start a supervised background task
+        try:
+            import asyncio
+            from realtime.monitor import monitor_wallet
 
-    async def _supervisor():
-        # Κρατάει τον watcher ζωντανό, κάνει retry με backoff αν σκάσει (π.χ. 429)
-        delay = 1.0
-        while True:
-            try:
-                await monitor_wallet(_sender, logger=logging.getLogger("realtime"))
-                delay = 1.0  # αν βγει "καθαρά", μηδένισε το backoff
-            except Exception as e:
-                logging.exception("monitor_wallet crashed: %s", e)
-                await asyncio.sleep(min(20.0, delay))
-                delay = min(20.0, delay * 1.8 + 0.5)
+            async def _sender(msg: str):
+                try:
+                    send_message(msg, CHAT_ID)
+                except Exception:
+                    pass
 
-    asyncio.create_task(_supervisor())
+            async def _supervisor():
+                while True:
+                    try:
+                        await monitor_wallet(_sender, logger=logging.getLogger("realtime"))
+                    except Exception as e:
+                        logging.error("monitor_wallet crashed: %s", e)
+                        await asyncio.sleep(3)
 
+            loop = asyncio.get_event_loop()
+            loop.create_task(_supervisor())
+        except Exception as e:
+            logging.error("Realtime monitor not started: %s", e)
