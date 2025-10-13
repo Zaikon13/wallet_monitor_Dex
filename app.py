@@ -30,6 +30,9 @@ from telegram.formatters import format_trades_table, format_pnl_today
 # Realtime monitor (separate file you added: realtime/monitor.py)
 from realtime.monitor import monitor_wallet
 
+# Intraday report helpers (ledger.csv -> nice report)
+from csv import DictReader
+
 # --------------------------------------------------
 # Configuration
 # --------------------------------------------------
@@ -458,6 +461,175 @@ def _overlay_discovery_amounts(assets: List[Dict[str, Any]], wallet_address: str
         if sym not in have:
             out.append({"symbol": sym, "amount": amt})
     return out
+# --------------------------------------------------
+# Intraday report helpers (ledger.csv -> nice report)
+# --------------------------------------------------
+
+LEDGER_CSV = os.getenv("LEDGER_CSV", "data/ledger.csv")
+
+def _today_bounds_tz():
+    now = _now_local()
+    start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=now.tzinfo)
+    end   = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=now.tzinfo)
+    return start, end
+
+def _parse_iso_ts(s: str) -> Optional[datetime]:
+    try:
+        # ledger uses ISO in UTC or local; parse both
+        return datetime.fromisoformat(s.replace("Z","+00:00"))
+    except Exception:
+        return None
+
+def _read_today_ledger_rows() -> list[dict]:
+    rows: list[dict] = []
+    if not os.path.exists(LEDGER_CSV):
+        return rows
+    tz = ZoneInfo(TZ)
+    start, end = _today_bounds_tz()
+    try:
+        with open(LEDGER_CSV, "r", encoding="utf-8") as f:
+            rdr = DictReader(f)
+            for r in rdr:
+                ts = _parse_iso_ts(r.get("ts",""))
+                if not ts:
+                    continue
+                # normalize to same tz for compare
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=ZoneInfo("UTC"))
+                ts_local = ts.astimezone(tz)
+                if start <= ts_local <= end:
+                    rows.append({
+                        "ts": ts_local,
+                        "symbol": (r.get("symbol") or "").upper(),
+                        "side": (r.get("side") or "").upper(),  # BUY/SELL
+                        "qty": _to_dec(r.get("qty") or "0") or Decimal("0"),
+                        "price": _to_dec(r.get("price") or "0") or Decimal("0"),
+                        "fee": _to_dec(r.get("fee") or "0") or Decimal("0"),
+                        "tx": r.get("tx") or "",
+                    })
+    except Exception:
+        logging.exception("Failed reading LEDGER_CSV")
+    # sort by time
+    rows.sort(key=lambda x: x["ts"])
+    return rows
+
+def _price_now(sym: str, addr: Optional[str] = None) -> Decimal:
+    try:
+        px = get_spot_usd(sym, token_address=addr)
+        return _to_dec(px) or Decimal("0")
+    except Exception:
+        return Decimal("0")
+
+def _fifo_realized_today(trades: list[dict]) -> tuple[Decimal, dict]:
+    """
+    FIFO only on today's trades (intraday). Returns (realized_usd, per_symbol_state)
+    state: {sym: {"buys":[(qty,cost)], "avg_cost": Decimal, "realized": Decimal, "net_qty": Decimal, "buy_qty": Decimal, "sell_qty": Decimal}}
+    """
+    state: dict[str, dict] = {}
+    realized = Decimal("0")
+    for t in trades:
+        sym = t["symbol"]
+        side = t["side"]
+        qty  = t["qty"]
+        # use current price (we don't have trade-time px in ledger)
+        px   = _price_now(sym)
+        usd  = qty * px
+        st = state.setdefault(sym, {"buys": [], "realized": Decimal("0"), "net_qty": Decimal("0"),
+                                    "buy_qty": Decimal("0"), "sell_qty": Decimal("0")})
+        if side == "BUY":
+            st["buys"].append([qty, usd])  # store cost basis in USD
+            st["net_qty"] += qty
+            st["buy_qty"] += qty
+        else:  # SELL
+            sell_qty = qty
+            proceeds = qty * px
+            cost_used = Decimal("0")
+            # consume from buys
+            while sell_qty > 0 and st["buys"]:
+                lot_qty, lot_cost = st["buys"][0]
+                if lot_qty <= sell_qty:
+                    sell_qty -= lot_qty
+                    cost_used += lot_cost
+                    st["buys"].pop(0)
+                else:
+                    # partial
+                    part_cost = lot_cost * (sell_qty / lot_qty)
+                    cost_used += part_cost
+                    st["buys"][0][0] = lot_qty - sell_qty
+                    st["buys"][0][1] = lot_cost - part_cost
+                    sell_qty = Decimal("0")
+            pnl = proceeds - cost_used
+            st["realized"] += pnl
+            realized += pnl
+            st["net_qty"] -= qty
+            st["sell_qty"] += qty
+    # compute avg cost for remaining lots
+    for sym, st in state.items():
+        total_qty = sum(q for q, _ in st["buys"]) if st["buys"] else Decimal("0")
+        total_cost = sum(c for _, c in st["buys"]) if st["buys"] else Decimal("0")
+        st["avg_cost"] = (total_cost / total_qty) if total_qty > 0 else Decimal("0")
+    return realized, state
+
+def _format_intraday_report(wallet_address: str, sym_filter: Optional[str] = None) -> str:
+    # 1) load today's trades
+    trades = _read_today_ledger_rows()
+    if sym_filter:
+        sym_filter = sym_filter.upper().strip()
+        trades = [t for t in trades if t["symbol"] == sym_filter]
+    # 2) format transactions list (with current prices)
+    lines_tx: list[str] = []
+    net_usd_flow = Decimal("0")
+    for t in trades:
+        ts_local = t["ts"].strftime("%H:%M:%S")
+        sym = t["symbol"]
+        side = t["side"]
+        qty = t["qty"]
+        px  = _price_now(sym)
+        usd = qty * px * (Decimal("1") if side == "IN" or side == "BUY" else Decimal("-1"))
+        net_usd_flow += usd
+        # display direction similar to old style (IN/OUT)
+        dirn = "IN" if side == "BUY" else "OUT"
+        lines_tx.append(f"• {ts_local} — {dirn} {sym} {qty:.4f}  @ ${px:.6f}  (${usd:.6f})")
+    # 3) realized PnL today (intraday FIFO)
+    # remap BUY/SELL from ledger to trades list
+    # (we wrote BUY/SELL in monitor; keep as-is)
+    realized_today, per_sym = _fifo_realized_today(trades)
+    # 4) holdings now (use existing snapshot pipeline)
+    body_holdings = _handle_holdings(wallet_address)
+    # Extract current assets to compute MTM total (already at end of body)
+    # 5) Per-Asset detail
+    lines_detail: list[str] = []
+    for sym, st in sorted(per_sym.items()):
+        if sym_filter and sym != sym_filter:
+            continue
+        # rebuild the actions for this sym (time-ordered)
+        sym_trades = [t for t in trades if t["symbol"] == sym]
+        for t in sym_trades:
+            ts_local = t["ts"].strftime("%H:%M:%S")
+            side = "IN" if t["side"] == "BUY" else "OUT"
+            px = _price_now(sym)
+            usd = t["qty"] * px * (Decimal("1") if side=="IN" else Decimal("-1"))
+            lines_detail.append(f"    – {ts_local} — {side} {t['qty']:.4f} @ ${px:.6f}  (${usd:.4f})")
+        px_now = _price_now(sym)
+        buy_qty  = st["buy_qty"]
+        sell_qty = st["sell_qty"]
+        net_qty  = st["net_qty"]
+        flow_usd = (buy_qty * px_now) - (sell_qty * px_now)  # display flow at current px for consistency
+        unreal = net_qty * (px_now - st.get("avg_cost", Decimal("0")))
+        lines_detail.append(f"    ↳ buys {buy_qty:.4f} | sells {sell_qty:.4f} | net qty {net_qty:.4f} | flow ${flow_usd:.4f}")
+        lines_detail.append(f"    ↳ realized today ${st['realized']:.8f} | price ${px_now:.6f} | unreal now ${unreal:.4f}")
+        lines_detail.append("")  # spacer
+
+    header = (
+        f"🟡 Intraday Update\n"
+        f"📒 Daily Report ({_now_local().date().isoformat()})\n"
+        f"Transactions:\n" + ("\n".join(lines_tx) if lines_tx else "• (no trades yet)\n") +
+        f"\nNet USD flow today: ${net_usd_flow:.6f}\n"
+        f"Realized PnL today: ${realized_today:.8f}\n"
+        f"{body_holdings}\n"
+        f"\nPer-Asset Detail (Today):\n" + ("\n".join(lines_detail) if lines_detail else "  • (no per-asset activity today)")
+    )
+    return header
 
 # --------------------------------------------------
 # Command Handlers
@@ -638,6 +810,15 @@ def _handle_pnl_today(symbol: Optional[str] = None) -> str:
     except Exception:
         logging.exception("Failed to compute realized PnL (today)")
         return "⚠️ Σφάλμα κατά τον υπολογισμό του realized PnL για σήμερα."
+        
+def _handle_intraday(wallet_address: str, arg: Optional[str] = None) -> str:
+    # /intraday           -> full report
+    # /intraday ADA       -> only ADA
+    try:
+        return _format_intraday_report(wallet_address, arg)
+    except Exception:
+        logging.exception("Failed to build intraday report")
+        return "⚠️ Σφάλμα κατά την παραγωγή του Intraday report."
 
 # --------------------------------------------------
 # Command dispatcher
@@ -674,6 +855,11 @@ def _dispatch_command(text: str) -> str:
     if cmd == "/pnl":
         arg = parts[1] if len(parts) > 1 else None
         return _handle_pnl(WALLET_ADDRESS, arg)
+    if cmd == "/intraday":
+        return _handle_intraday(WALLET_ADDRESS, arg)
+    if cmd == "/trades":
+        # keep old command but show the new Intraday report formatting
+        return _handle_intraday(WALLET_ADDRESS, arg)
     return "❓ Άγνωστη εντολή. Δοκίμασε /help."
 
 # --------------------------------------------------
