@@ -1,54 +1,55 @@
 # realtime/monitor.py
 from __future__ import annotations
-import os, asyncio, logging, random
-from typing import Dict, List, Tuple, Optional, Any
+import os, asyncio, logging
+from typing import Dict, List, Tuple, Optional
 from decimal import Decimal
 from datetime import datetime, timezone
 from web3 import Web3
-from web3.types import LogReceipt
 
-WALLET = (os.getenv("WALLET_ADDRESS") or "").strip()
+WALLET = (os.getenv("WALLET_ADDRESS") or "").strip().lower()
+# Use HTTP RPC; avoid WSS rate limits on public nodes
+HTTPS_URLS = [u.strip() for u in (
+    os.getenv("CRONOS_HTTPS_URL")
+    or os.getenv("CRONOS_RPC_URL")
+    or "https://evm.cronos.org"
+).split(",") if u.strip()]
 
-# Endpoints (WSS optional, HTTPS τιμά και CRONOS_RPC_URL)
-WSS_URLS = [u.strip() for u in (os.getenv("CRONOS_WSS_URL", "").split(",")) if u.strip()]
-_https_env = os.getenv("CRONOS_HTTPS_URL") or os.getenv("CRONOS_RPC_URL") or "https://cronos-evm-rpc.publicnode.com"
-HTTPS_URLS = [u.strip() for u in _https_env.split(",") if u.strip()]
+# Comma-separated token contracts to monitor (MUST include the tokens you trade)
+# e.g. ADA, USDT, USDC, WCRO, WETH, WBTC, XRP, SOL, SUI, HBAR, XYO, TRUMP...
+MONITOR_TOKEN_ADDRESSES = [
+    a.strip().lower() for a in (os.getenv("MONITOR_TOKEN_ADDRESSES","").split(",")) if a.strip()
+]
+
+# Known WCRO contract(s) for wrap/unwrap (Deposit/Withdrawal). Add if different on Cronos:
+WCRO_ADDRESSES = [a.strip().lower() for a in (os.getenv("WCRO_ADDRESSES","0x5c7f8a570d578ed84e63fdfa7b1ee72deae1ae23").split(",")) if a.strip()]
 
 CONFIRMATIONS   = int(os.getenv("RT_CONFIRMS", "0"))
-POLL_INTERVAL   = float(os.getenv("RT_POLL_SEC", "1.0"))
+POLL_INTERVAL   = float(os.getenv("RT_POLL_SEC", "1.2"))
 LEDGER_PATH     = os.getenv("LEDGER_CSV", "data/ledger.csv")
-BACKFILL_BLOCKS = int(os.getenv("RT_BACKFILL_BLOCKS", "800"))
-BACKFILL_NOTIFY = (os.getenv("RT_BACKFILL_NOTIFY", "0").strip() in ("1","true","yes"))
-BACKOFF_MAX_SEC = float(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
+# Backfill is dangerous on public RPC -> keep 0 or tiny
+BACKFILL_BLOCKS = int(os.getenv("RT_BACKFILL_BLOCKS", "0"))
+BACKFILL_NOTIFY = (os.getenv("RT_BACKFILL_NOTIFY", "0").lower() in ("1","true","yes"))
 
-# Routers στο Cronos
-KNOWN_ROUTERS: Dict[str, str] = {
-    "0x145863eb42cf62847a6ca784e6416c1682b1b2ae": "VVS Router",
-    "0xe0137ee596c35bf7adedad1e2fd25da595d1e05b": "VVS Router (alt)",
-    "0x22d710931f01c1681ca1570ff016ed42eb7b7c2a": "MMF Router",
-    "0x76c930c6a2c2d7ee1e2fcfef05b0bb2e6902a84a": "Odos Router",
-    "0xdef1abe32c034e558cdd535791643c58a13acc10": "Router (agg)",
-}
-KNOWN_ROUTERS = {k.lower(): v for k, v in KNOWN_ROUTERS.items()}
-
-# Topics για parsing logs
+# Topics
 TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
-DEPOSIT_TOPIC  = Web3.keccak(text="Deposit(address,uint256)").hex()     # WCRO/WETH9 wrap
-WITHDRAW_TOPIC = Web3.keccak(text="Withdrawal(address,uint256)").hex()  # WCRO/WETH9 unwrap
+DEPOSIT_TOPIC  = Web3.keccak(text="Deposit(address,uint256)").hex()
+WITHDRAW_TOPIC = Web3.keccak(text="Withdrawal(address,uint256)").hex()
 
-def _fmt_amt(amount: int, decimals: int) -> str:
-    d = Decimal(amount) / (Decimal(10) ** decimals)
-    return f"{d:.6f}".rstrip("0").rstrip(".")
+def _make_web3(logger) -> Web3:
+    last_ex = None
+    for url in HTTPS_URLS:
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+            if w3.is_connected():
+                logger.info("Connected RPC: %s", url)
+                return w3
+        except Exception as e:
+            last_ex = e
+            logger.warning("RPC failed %s: %s", url, e)
+    raise RuntimeError(f"No RPC available. Last: {last_ex}")
 
-def _to_dec18(wei: int) -> Decimal:
-    return Decimal(wei) / (Decimal(10) ** 18)
-
-def _hex_addr(x) -> str:
-    h = x.hex() if hasattr(x, "hex") else str(x)
-    return "0x" + h[-40:]
-
-def _ts(block_ts: int) -> str:
-    return datetime.fromtimestamp(block_ts, tz=timezone.utc).isoformat()
+def _wallet_topic(addr_lower: str) -> str:
+    return "0x" + addr_lower.replace("0x","").rjust(64, "0")
 
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
@@ -57,25 +58,35 @@ def _ensure_dir(path: str):
 
 def _append_ledger(ts_iso: str, symbol: str, side: str, qty: str, price: str, fee: str, txh: str):
     _ensure_dir(LEDGER_PATH)
-    header = not os.path.exists(LEDGER_CSV := LEDGER_PATH)
-    with open(LEDGER_CSV, "a", encoding="utf-8") as f:
+    header = not os.path.exists(LEDGER_PATH)
+    with open(LEDGER_PATH, "a", encoding="utf-8") as f:
         if header:
             f.write("ts,symbol,side,qty,price,fee,tx,chain\n")
         f.write(f"{ts_iso},{symbol},{side},{qty},{price},{fee},{txh},cronos\n")
 
-def _make_web3(logger) -> Web3:
-    urls: List[Tuple[str,str]] = [("wss", u) for u in WSS_URLS] + [("https", u) for u in HTTPS_URLS]
-    random.shuffle(urls)
-    for kind, url in urls:
-        try:
-            w3 = Web3(Web3.WebsocketProvider(url, websocket_timeout=45)) if kind=="wss" \
-                 else Web3(Web3.HTTPProvider(url, request_kwargs={"timeout":45}))
-            if w3.is_connected():
-                logger.info("Connected RPC: %s", url)
-                return w3
-        except Exception as e:
-            logger.warning("RPC failed %s: %s", url, e)
-    raise RuntimeError("No RPC provider available")
+from decimal import Decimal as D
+def _fmt_amt(raw: int, decimals: int) -> str:
+    return f"{(D(raw)/(D(10)**decimals)):.6f}".rstrip("0").rstrip(".")
+
+def _ts(block_ts:int)->str:
+    return datetime.fromtimestamp(block_ts, tz=timezone.utc).isoformat()
+
+def _sym_dec(w3: Web3, token: str, cache: Dict[str, Tuple[str,int]]) -> Tuple[str,int]:
+    token = token.lower()
+    if token in cache: return cache[token]
+    abi = [
+        {"anonymous":False,"inputs":[{"indexed":True,"name":"from","type":"address"},{"indexed":True,"name":"to","type":"address"},{"indexed":False,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"},
+        {"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"stateMutability":"view","type":"function"},
+        {"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
+    ]
+    try:
+        c = w3.eth.contract(address=Web3.to_checksum_address(token), abi=abi)
+        sym = c.functions.symbol().call()
+        dec = int(c.functions.decimals().call())
+        cache[token]=(sym,dec)
+    except Exception:
+        cache[token]=(token[:6].upper(),18)
+    return cache[token]
 
 async def _send(send_fn, text: str, notify=True):
     if not notify: return
@@ -85,175 +96,143 @@ async def _send(send_fn, text: str, notify=True):
     except Exception:
         logging.exception("send_fn failed")
 
-# --- ΣΥΓΧΡΟΝΙΚΟ token meta (χωρίς run_until_complete) ---
-def _erc20_meta(w3: Web3, token: str, cache: Dict[str, Tuple[str,int]]) -> Tuple[str,int]:
-    token = token.lower()
-    if token in cache: return cache[token]
-    try:
-        c = w3.eth.contract(address=Web3.to_checksum_address(token), abi=[
-            {"anonymous":False,"inputs":[{"indexed":True,"name":"from","type":"address"},{"indexed":True,"name":"to","type":"address"},{"indexed":False,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"},
-            {"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"stateMutability":"view","type":"function"},
-            {"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
-        ])
-        sym = c.functions.symbol().call()
-        dec = c.functions.decimals().call()
-        cache[token]=(sym,int(dec))
-    except Exception:
-        cache[token]=(token[:6].upper(),18)
-    return cache[token]
+def _build_transfer_queries(wallet_topic: str, address_list: List[str], start_block: int, end_block: int):
+    # We must provide "address": [...] to satisfy publicnode restriction.
+    # Capture both directions: from=wallet OR to=wallet
+    q_from = {
+        "fromBlock": start_block, "toBlock": end_block,
+        "address": [Web3.to_checksum_address(a) for a in address_list],
+        "topics": [TRANSFER_TOPIC, wallet_topic, None]
+    }
+    q_to = {
+        "fromBlock": start_block, "toBlock": end_block,
+        "address": [Web3.to_checksum_address(a) for a in address_list],
+        "topics": [TRANSFER_TOPIC, None, wallet_topic]
+    }
+    return q_from, q_to
 
-# ΠΟΤΕ ξανά run_until_complete. Επιλέγουμε **ποιο** receipt θα τραβήξουμε:
-# - ΟΤΙΔΗΠΟΤΕ με from==wallet ή to==wallet
-# - Επίσης ό,τι πάει από wallet -> contract (router ή άλλο), αν έχει input (δηλ. contract call)
-def _tx_is_candidate(tx, wl: str, w3: Web3) -> bool:
-    to_l = (tx["to"] or "").lower() if tx.get("to") else ""
-    frm  = (tx["from"] or "").lower()
-    if frm == wl or to_l == wl:
-        return True
-    if frm == wl:
-        # αν είναι contract call (input μη κενό) τότε τράβα receipt (πιθανό swap)
-        try:
-            inp = tx.get("input")
-            if (isinstance(inp, (bytes, bytearray)) and len(inp)>0) or (isinstance(inp, str) and inp.startswith("0x") and len(inp)>2):
-                return True
-        except Exception:
-            return True
-    return False
-
-def _parse_receipt_for_wallet(w3: Web3, rc, wl: str, ts_iso: str, txh: str, meta_cache, lines_out: List[str]):
-    # ERC-20 Transfers + WCRO wrap/unwrap που ακουμπάνε το wallet
-    for lg in rc["logs"]:
-        try:
-            topic0 = lg["topics"][0].hex() if hasattr(lg["topics"][0],"hex") else str(lg["topics"][0])
-            if topic0 == TRANSFER_TOPIC:
-                from_addr = _hex_addr(lg["topics"][1]).lower()
-                to_addr   = _hex_addr(lg["topics"][2]).lower()
-                if wl not in (from_addr, to_addr): 
-                    continue
-                token = lg["address"]
-                sym, dec = _erc20_meta(w3, token, meta_cache)
-                data = lg["data"]
-                amount = int(str(data),16) if isinstance(data,str) else int.from_bytes(data,"big")
-                side = "OUT" if from_addr == wl else "IN"
-                q = _fmt_amt(amount, dec)
-                lines_out.append(f"{side} {q} {sym}")
-                _append_ledger(ts_iso, sym, "SELL" if side=="OUT" else "BUY", q, "0", "0", txh)
-            elif topic0 in (DEPOSIT_TOPIC, WITHDRAW_TOPIC):
-                who = _hex_addr(lg["topics"][1]).lower()
-                if who != wl: 
-                    continue
-                data = lg["data"]; amount = int(str(data),16) if isinstance(data,str) else int.from_bytes(data,"big")
-                q = _fmt_amt(amount, 18)
-                if topic0 == DEPOSIT_TOPIC:
-                    lines_out.append(f"IN {q} WCRO (wrap CRO)")
-                    _append_ledger(ts_iso, "WCRO", "BUY", q, "0", "0", txh)
-                else:
-                    lines_out.append(f"OUT {q} WCRO (unwrap)")
-                    _append_ledger(ts_iso, "WCRO", "SELL", q, "0", "0", txh)
-        except Exception:
-            continue
+def _build_wrap_queries(wallet_topic: str, start_block: int, end_block: int):
+    # WCRO wrap/unwrap happen on WCRO contracts; address must be specific WCRO address(es)
+    addr = [Web3.to_checksum_address(a) for a in WCRO_ADDRESSES]
+    q_dep = {"fromBlock": start_block, "toBlock": end_block, "address": addr, "topics":[DEPOSIT_TOPIC, wallet_topic]}
+    q_wdr = {"fromBlock": start_block, "toBlock": end_block, "address": addr, "topics":[WITHDRAW_TOPIC, wallet_topic]}
+    return q_dep, q_wdr
 
 async def monitor_wallet(send_fn, logger=logging.getLogger("realtime")):
     if not WALLET:
         logger.warning("No WALLET_ADDRESS set; realtime monitor disabled.")
         return
+    if not MONITOR_TOKEN_ADDRESSES:
+        logger.error("MONITOR_TOKEN_ADDRESSES is empty — add your token contracts (e.g. ADA, USDT, ...).")
+        await _send(send_fn, "⚠️ Set MONITOR_TOKEN_ADDRESSES in ENV (comma-separated CRC20 contracts).", True)
+        return
 
-    # Connect RPC
-    w3 = None; backoff=1.0
-    while w3 is None:
-        try:
-            w3 = _make_web3(logger)
-        except Exception as e:
-            logger.warning("Provider connect failed: %s", e)
-            await asyncio.sleep(min(BACKOFF_MAX_SEC, backoff))
-            backoff = min(BACKOFF_MAX_SEC, backoff*1.8+0.5)
+    w3 = _make_web3(logger)
+    wl_topic = _wallet_topic(WALLET)
 
-    wallet = Web3.to_checksum_address(WALLET)
-    wl = wallet.lower()
+    # Backfill (optional/tiny)
+    latest = w3.eth.block_number
+    start  = max(0, latest - BACKFILL_BLOCKS) if BACKFILL_BLOCKS>0 else latest
+    logger.info("Backfill %s..%s (notify=%s)", start, latest, BACKFILL_NOTIFY)
+
     meta_cache: Dict[str, Tuple[str,int]] = {}
 
-    # ---- Backfill (per-block, χωρίς getLogs) ----
-    try:
-        latest = w3.eth.get_block("latest").number
-        start  = max(0, latest - BACKFILL_BLOCKS)
-        logger.info("Backfill %s..%s (notify=%s)", start, latest, BACKFILL_NOTIFY)
-        for b in range(start, latest+1):
-            blk = w3.eth.get_block(b, full_transactions=True)
-            ts_iso = _ts(blk.timestamp)
-            for tx in blk.transactions:
-                try:
-                    if not _tx_is_candidate(tx, wl, w3):
-                        continue
-                    rc = w3.eth.get_transaction_receipt(tx["hash"])
-                    txh = tx["hash"].hex()
-                    # Native CRO leg
-                    if int(tx["value"])>0 and (tx["from"].lower()==wl or (tx["to"] and tx["to"].lower()==wl)):
-                        dirn = "OUT" if tx["from"].lower()==wl else "IN"
-                        val  = _to_dec18(int(tx["value"]))
-                        note = KNOWN_ROUTERS.get((tx["to"] or "").lower(),"") if tx["to"] else ""
-                        await _send(send_fn, f"💸 {dirn} {val:.6f} CRO{(' via '+note) if note else ''}\nTx: {txh[:10]}…{txh[-8:]}", BACKFILL_NOTIFY)
-                        _append_ledger(ts_iso, "CRO", "SELL" if dirn=="OUT" else "BUY", f"{val}", "0", "0", txh)
+    async def scan_range(b0: int, b1: int, notify: bool):
+        # Transfers for monitored token addresses
+        q_from, q_to = _build_transfer_queries(wl_topic, MONITOR_TOKEN_ADDRESSES, b0, b1)
+        logs = []
+        try:
+            logs += w3.eth.get_logs(q_from)
+        except Exception as e:
+            logger.warning("getLogs(from) %s-%s failed: %s", b0, b1, e)
+        try:
+            logs += w3.eth.get_logs(q_to)
+        except Exception as e:
+            logger.warning("getLogs(to) %s-%s failed: %s", b0, b1, e)
+        # Wrap/unwrap on WCRO
+        q_dep, q_wdr = _build_wrap_queries(wl_topic, b0, b1)
+        try:
+            logs += w3.eth.get_logs(q_dep)
+        except Exception as e:
+            logger.warning("getLogs(deposit) %s-%s failed: %s", b0, b1, e)
+        try:
+            logs += w3.eth.get_logs(q_wdr)
+        except Exception as e:
+            logger.warning("getLogs(withdraw) %s-%s failed: %s", b0, b1, e)
 
-                    lines: List[str] = []
-                    _parse_receipt_for_wallet(w3, rc, wl, ts_iso, txh, meta_cache, lines)
-                    if lines:
-                        head = "🔄 Swap" if (tx.get("to") and (tx["to"].lower() in KNOWN_ROUTERS)) else "🔔 Transfer"
-                        router_note = ""
-                        if tx.get("to") and tx["to"].lower() in KNOWN_ROUTERS:
-                            router_note = f" via {KNOWN_ROUTERS[tx['to'].lower()]}"
-                        await _send(send_fn, f"{head}{router_note}\n" + "\n".join(f"• {ln}" for ln in lines) + f"\nTx: {txh[:10]}…{txh[-8:]}", BACKFILL_NOTIFY)
+        # Group by tx
+        by_tx: Dict[str, List[dict]] = {}
+        for lg in logs:
+            txh = lg["transactionHash"].hex()
+            by_tx.setdefault(txh, []).append(lg)
+
+        # Emit
+        for txh, items in by_tx.items():
+            # Fetch block ts once
+            try:
+                rc = w3.eth.get_transaction_receipt(txh)
+                blk = w3.eth.get_block(rc["blockNumber"])
+                ts_iso = _ts(blk.timestamp)
+            except Exception:
+                ts_iso = datetime.now(timezone.utc).isoformat()
+
+            lines: List[str] = []
+            for lg in items:
+                try:
+                    t0 = lg["topics"][0].hex() if hasattr(lg["topics"][0],"hex") else str(lg["topics"][0])
+                    if t0 == TRANSFER_TOPIC:
+                        from_addr = "0x" + (lg["topics"][1].hex()[-40:] if hasattr(lg["topics"][1],"hex") else str(lg["topics"][1])[-40:])
+                        to_addr   = "0x" + (lg["topics"][2].hex()[-40:] if hasattr(lg["topics"][2],"hex") else str(lg["topics"][2])[-40:])
+                        side = "OUT" if from_addr.lower()==WALLET else "IN"
+                        token = lg["address"].lower()
+                        sym, dec = _sym_dec(w3, token, meta_cache)
+                        amount = int(lg["data"],16) if isinstance(lg["data"], str) else int.from_bytes(lg["data"], "big")
+                        qty = _fmt_amt(amount, dec)
+                        lines.append(f"{side} {qty} {sym}")
+                        _append_ledger(ts_iso, sym, "SELL" if side=="OUT" else "BUY", qty, "0", "0", txh)
+                    elif t0 in (DEPOSIT_TOPIC, WITHDRAW_TOPIC):
+                        who = "0x" + (lg["topics"][1].hex()[-40:] if hasattr(lg["topics"][1],"hex") else str(lg["topics"][1])[-40:])
+                        if who.lower() != WALLET: 
+                            continue
+                        amount = int(lg["data"],16) if isinstance(lg["data"], str) else int.from_bytes(lg["data"], "big")
+                        qty = _fmt_amt(amount, 18)
+                        if t0 == DEPOSIT_TOPIC:
+                            lines.append(f"IN {qty} WCRO (wrap CRO)")
+                            _append_ledger(ts_iso, "WCRO", "BUY", qty, "0", "0", txh)
+                        else:
+                            lines.append(f"OUT {qty} WCRO (unwrap)")
+                            _append_ledger(ts_iso, "WCRO", "SELL", qty, "0", "0", txh)
                 except Exception:
                     continue
-        last_handled = latest
-    except Exception as e:
-        logger.exception("Backfill failed: %s", e)
-        last_handled = w3.eth.get_block("latest").number
 
-    # ---- Live loop (per-block) ----
+            if lines:
+                await _send(send_fn, "🔄 Swap/Transfer\n" + "\n".join(f"• {ln}" for ln in lines) + f"\nTx: {txh[:10]}…{txh[-8:]}", notify)
+
+    # Initial scan (usually latest or tiny backfill)
+    if start <= latest:
+        await scan_range(start, latest, BACKFILL_NOTIFY)
+
+    # Live loop (incremental ranges)
+    last = latest
     while True:
         try:
-            latest = w3.eth.get_block("latest").number
-            target = latest - CONFIRMATIONS
-            if target < last_handled + 1:
-                await asyncio.sleep(POLL_INTERVAL); continue
-
-            for b in range(last_handled + 1, target + 1):
-                blk = w3.eth.get_block(b, full_transactions=True)
-                ts_iso = _ts(blk.timestamp)
-                for tx in blk.transactions:
-                    try:
-                        if not _tx_is_candidate(tx, wl, w3):
-                            continue
-                        rc = w3.eth.get_transaction_receipt(tx["hash"])
-                        txh = tx["hash"].hex()
-
-                        if int(tx["value"])>0 and (tx["from"].lower()==wl or (tx["to"] and tx["to"].lower()==wl)):
-                            dirn = "OUT" if tx["from"].lower()==wl else "IN"
-                            val  = _to_dec18(int(tx["value"]))
-                            note = KNOWN_ROUTERS.get((tx["to"] or "").lower(),"") if tx["to"] else ""
-                            await _send(send_fn, f"💸 {dirn} {val:.6f} CRO{(' via '+note) if note else ''}\nTx: {txh[:10]}…{txh[-8:]}")
-                            _append_ledger(ts_iso, "CRO", "SELL" if dirn=="OUT" else "BUY", f"{val}", "0", "0", txh)
-
-                        lines: List[str] = []
-                        _parse_receipt_for_wallet(w3, rc, wl, ts_iso, txh, meta_cache, lines)
-                        if lines:
-                            head = "🔄 Swap" if (tx.get("to") and (tx["to"].lower() in KNOWN_ROUTERS)) else "🔔 Transfer"
-                            router_note = ""
-                            if tx.get("to") and tx["to"].lower() in KNOWN_ROUTERS:
-                                router_note = f" via {KNOWN_ROUTERS[tx['to'].lower()]}"
-                            await _send(send_fn, f"{head}{router_note}\n" + "\n".join(f"• {ln}" for ln in lines) + f"\nTx: {txh[:10]}…{txh[-8:]}")
-                    except Exception:
-                        continue
-
-                last_handled = b
+            head = w3.eth.block_number
+            target = head - CONFIRMATIONS
+            if target > last:
+                # Scan in tiny slices to stay under rate limits
+                b0 = last + 1
+                b1 = target
+                # safety cap slice size
+                step = int(os.getenv("RT_SLICE", "40"))
+                cur = b0
+                while cur <= b1:
+                    hi = min(b1, cur + step - 1)
+                    await scan_range(cur, hi, True)
+                    cur = hi + 1
+                last = b1
             await asyncio.sleep(POLL_INTERVAL)
         except Exception as e:
-            logger.warning("Live loop error: %s — reconnecting…", e)
-            w3 = None; backoff=1.0
-            while w3 is None:
-                try:
-                    w3 = _make_web3(logger)
-                except Exception as e2:
-                    logger.warning("Reconnect failed: %s", e2)
-                    await asyncio.sleep(min(BACKOFF_MAX_SEC, backoff))
-                    backoff = min(BACKOFF_MAX_SEC, backoff*1.8+0.5)
+            logging.error("monitor_wallet crashed: %s", e)
+            # small backoff then reconnect provider
+            await asyncio.sleep(3)
+            w3 = _make_web3(logger)
