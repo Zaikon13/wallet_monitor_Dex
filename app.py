@@ -11,7 +11,7 @@ import time
 import asyncio
 import logging
 import requests
-from typing import Optional, List, Dict, Any, Tuple, Set
+from typing import Optional, List, Dict, Any, Tuple
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,12 +46,15 @@ LEDGER_CSV   = os.getenv("LEDGER_CSV", "./data/ledger.csv")
 # Holdings: προτιμά RPC, αν σκάσει -> explorer
 HOLDINGS_BACKEND = (os.getenv("HOLDINGS_BACKEND", "auto") or "auto").lower()
 
-# Explorer settings (ΠΡΟΣΟΧΗ: ΧΩΡΙΣ το 'S' όπως ζήτησες)
-# Παραδείγματα:
-#  - https://explorer-api.cronos.org/mainnet/api/v1
-#  - https://cronos.org/explorer/api
-CRONOS_EXPLORER_API_BASE = (os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api").rstrip("/"))
+# Explorer settings
+# ΔΕΧΕΤΑΙ ΠΟΛΛΑ BASES (comma-separated) π.χ.:
+#   CRONOS_EXPLORER_API_BASES="https://cronos.org/explorer/api,https://explorer-api.cronos.org/mainnet/api/v1"
+# Αν δεν δοθεί CRONOS_EXPLORER_API_BASES, παίρνει CRONOS_EXPLORER_API_BASE (χωρίς 'S').
+_bases_env = os.getenv("CRONOS_EXPLORER_API_BASES") or os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api")
+EXPLORER_BASES: List[str] = [b.strip().rstrip("/") for b in _bases_env.split(",") if b.strip()]
 CRONOS_EXPLORER_API_KEY  = os.getenv("CRONOS_EXPLORER_API_KEY", "").strip()
+if not EXPLORER_BASES:
+    EXPLORER_BASES = ["https://cronos.org/explorer/api"]
 
 # Realtime explorer poller (μέσα στο app.py)
 MONITOR_ENABLE  = (os.getenv("MONITOR_ENABLE", "0").strip().lower() in ("1","true","yes","on"))
@@ -62,7 +65,7 @@ RT_BACKOFF_MAX  = int(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="3.0")
+app = FastAPI(title="Cronos DeFi Sentinel", version="3.2")
 
 # --------------------------------------------------
 # Telegram send helpers (with safe split)
@@ -252,60 +255,110 @@ def _fmt_qty(x: Decimal) -> str:
         return f"{x:,.4f}"
     except Exception:
         return str(x)
-
 # --------------------------------------------------
-# Explorer API (δυο formats)
+# Explorer API (multi-base + δύο formats + smart fallbacks)
 # --------------------------------------------------
-def _explorer_is_v1_style(base: str) -> bool:
-    # π.χ. https://explorer-api.cronos.org/mainnet/api/v1
-    return "/api/v1" in base
 
-def _explorer_call(module: str, action: str, params: Dict[str, Any]) -> Any:
-    """
-    Υποστηρίζει:
-      1) v1 style: https://explorer-api.cronos.org/mainnet/api/v1/{module}/{action}?apikey=...
-      2) etherscan style: https://cronos.org/explorer/api/?module=account&action=tokentx&address=...
-    Επιστρέφει το .json() είτε ολόκληρο, είτε 'result' αν υπάρχει.
-    """
-    base = CRONOS_EXPLORER_API_BASE
-    headers = {"Accept": "application/json"}
+# Aliases για path-style variations όταν ο server γυρνά 404
+_MODULE_ALIASES: Dict[str, List[str]] = {
+    "account": ["account", "accounts", "address", "addresses"],
+}
+_ACTION_ALIASES: Dict[str, List[str]] = {
+    "txlist":     ["txlist", "txs", "transactions", "tx", "tx-history"],
+    "tokentx":    ["tokentx", "tokentxs", "token-tx", "tokentransfers", "token-transfers"],
+    "balance":    ["balance", "get-balance", "native-balance", "balances"],
+}
+
+def _explorer_request_etherscan_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
+    # Etherscan-like: {base}/?module=account&action=tokentx&address=...&sort=asc&apikey=...
+    p = {"module": module, "action": action}
+    p.update(params or {})
+    if CRONOS_EXPLORER_API_KEY:
+        p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
+    url = f"{base}/"
+    r = requests.get(url, params=p, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("result") if isinstance(data, dict) and "result" in data else data
+
+def _explorer_request_path_once(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
+    # Path-style: {base}/{module}/{action}?address=...&apikey=...
     p = dict(params or {})
     if CRONOS_EXPLORER_API_KEY:
-        # και στα δύο στυλ το ονομάζουμε apikey για συμβατότητα
         p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
+    url = f"{base}/{module}/{action}"
+    r = requests.get(url, params=p, timeout=20)
+    if r.status_code == 404:
+        raise requests.HTTPError("404", response=r)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "result" in data:
+        return data["result"]
+    return data
 
-    try:
-        if _explorer_is_v1_style(base):
-            # v1: /{module}/{action}
-            url = f"{base}/{module}/{action}"
-            r = requests.get(url, params=p, headers=headers, timeout=15)
-        else:
-            # etherscan-like: /?module=...&action=...
-            url = f"{base}/"
-            qp = {"module": module, "action": action}
-            qp.update(p)
-            r = requests.get(url, params=qp, headers=headers, timeout=15)
+def _explorer_request_path_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
+    # Δοκίμασε primary και aliases (module & action) σε 404.
+    mod_candidates = _MODULE_ALIASES.get(module, [module])
+    act_candidates = _ACTION_ALIASES.get(action, [action])
+    tried = []
+    for m in mod_candidates:
+        for a in act_candidates:
+            try:
+                return _explorer_request_path_once(base, m, a, params)
+            except requests.HTTPError as e:
+                tried.append(f"{m}/{a}")
+                if getattr(e, "response", None) is not None and e.response.status_code == 404:
+                    continue  # δοκίμασε το επόμενο alias
+                # άλλο error; σταμάτα και πέτα το προς τα πάνω
+                raise
+    logging.warning("Path-style aliases exhausted for base=%s, tried: %s", base, ", ".join(tried))
+    # Τελικά δεν βρέθηκε route
+    raise requests.HTTPError(f"No path matched for base={base}")
 
-        r.raise_for_status()
-        data = r.json()
-        # άλλες εκδόσεις δίνουν 'result', v1 συχνά γυρνά το payload σκέτο
-        if isinstance(data, dict) and "result" in data:
-            return data["result"]
-        return data
-    except Exception as e:
-        logger.warning(f"Explorer call fail [{module}.{action}]: {e}")
-        return None
+def _looks_etherscan(base: str) -> bool:
+    b = base.lower()
+    return b.endswith("/api") or "/explorer/api" in b
 
-def _explorer_tokentx(address: str) -> List[dict]:
-    res = _explorer_call("account", "tokentx", {"address": address, "sort": "asc"})
+def _explorer_call_multi(module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
+    """
+    Δοκιμάζει όλα τα bases με 2 modes:
+    1) Etherscan-style (/?module=...&action=...)
+    2) Path-style (/module/action + aliases)
+    Επιστρέφει το πρώτο valid result ή None.
+    """
+    for base in EXPLORER_BASES:
+        order = ("etherscan", "path") if _looks_etherscan(base) else ("path", "etherscan")
+        for mode in order:
+            try:
+                if mode == "etherscan":
+                    res = _explorer_request_etherscan_style(base, module, action, params)
+                else:
+                    res = _explorer_request_path_style(base, module, action, params)
+                return res
+            except requests.HTTPError as e:
+                code = getattr(e, "response", None).status_code if getattr(e, "response", None) else "?"
+                logging.warning(f"Explorer call fail [{module}.{action} @ {mode}] base={base}: {code} {e}")
+            except Exception as e:
+                logging.warning(f"Explorer call fail [{module}.{action} @ {mode}] base={base}: {e}")
+    logging.warning(f"Explorer call failed completely [{module}.{action}] — tried bases: {EXPLORER_BASES}")
+    return None
+
+def _explorer_tokentx(address: str, startblock: Optional[int] = None) -> List[dict]:
+    params = {"address": address, "sort": "asc"}
+    if startblock is not None:
+        params["startblock"] = startblock
+    res = _explorer_call_multi("account", "tokentx", params)
     return res or []
 
-def _explorer_txlist(address: str) -> List[dict]:
-    res = _explorer_call("account", "txlist", {"address": address, "sort": "asc"})
+def _explorer_txlist(address: str, startblock: Optional[int] = None) -> List[dict]:
+    params = {"address": address, "sort": "asc"}
+    if startblock is not None:
+        params["startblock"] = startblock
+    res = _explorer_call_multi("account", "txlist", params)
     return res or []
 
 def _explorer_balance_native(address: str) -> Decimal:
-    res = _explorer_call("account", "balance", {"address": address})
+    res = _explorer_call_multi("account", "balance", {"address": address})
     val = None
     if isinstance(res, dict):
         val = res.get("result")
@@ -313,10 +366,15 @@ def _explorer_balance_native(address: str) -> Decimal:
         val = res
     elif isinstance(res, (int, float)):
         val = res
+    elif isinstance(res, list) and res:
+        maybe = res[0] if isinstance(res[0], dict) else None
+        if maybe:
+            val = maybe.get("balance") or maybe.get("result")
     try:
         return _to_dec(val) / Decimal(10**18)
     except Exception:
         return Decimal("0")
+
 # --------------------------------------------------
 # Holdings via RPC (core.*) with Explorer fallback
 # --------------------------------------------------
@@ -352,7 +410,6 @@ def _holdings_auto(wallet: str) -> Tuple[List[Dict[str, Any]], str]:
             logger.warning("RPC holdings failed, switching to Explorer")
 
     # Explorer fallback
-    # φτιάχνουμε λίστα assets από tokentx aggregation + native CRO balance
     toks = _explorer_tokentx(wallet)
     agg: Dict[Tuple[str, str, int], Decimal] = OrderedDict()
     wl = wallet.lower()
@@ -446,7 +503,6 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         visible = visible[:limit]
 
     return visible, hidden
-
 def _assets_list_to_mapping(assets: list) -> dict:
     out: Dict[str, Dict[str, Any]] = OrderedDict()
     for item in assets:
@@ -515,7 +571,7 @@ def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> Tuple[Decimal, Deci
     return delta, pct, label
 
 # --------------------------------------------------
-# Ledger helpers (CSV)
+# Ledger helpers (CSV) & intraday backfill
 # --------------------------------------------------
 def _ensure_ledger():
     base = os.path.dirname(LEDGER_CSV)
@@ -596,9 +652,6 @@ def _format_trades_output(rows: List[dict], title: str) -> str:
     lines.append(f"\nNet USD flow today: ${_fmt_money(net_flow)}")
     return "\n".join(lines)
 
-# --------------------------------------------------
-# Explorer backfill (ΣΗΜΕΡΑ) -> ledger, με spot price
-# --------------------------------------------------
 def _explorer_backfill_today_to_ledger(wallet: str) -> int:
     _ensure_ledger()
     start, end = _today_range()
@@ -697,15 +750,15 @@ class _Dedup:
 
 async def _monitor_task(wallet: str, chat_id: Optional[int]):
     logger.info("Realtime: explorer poller enabled (%.2fs)", RT_POLL_SEC)
+    logger.info("Explorer bases: %s", EXPLORER_BASES)
     _ensure_ledger()
     dedup = _Dedup(RT_DEDUP_SEC)
     wl = wallet.lower()
 
-    # κρατάμε τελευταία timeStamp που στείλαμε για tokentx/txlist
     last_token_ts = 0
     last_native_ts = 0
-
     backoff = 1.0
+
     while True:
         try:
             # CRC20
@@ -726,14 +779,11 @@ async def _monitor_task(wallet: str, chat_id: Optional[int]):
                     px = _to_dec(get_spot_usd(sym, token_address=(r.get("contractAddress") or "").lower()))
                     ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
                     txh = r.get("hash") or ""
-                    # dedup on txhash+side+qty
                     key = f"TOK:{txh}:{side}:{sym}:{qty}"
                     if not dedup.seen(key):
-                        # write ledger
                         with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
                             w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
                             w.writerow({"ts": ts_iso, "symbol": sym, "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
-                        # alert
                         flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
                         send_message(f"🟡 Trade\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} {sym} {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}", chat_id)
                 except Exception:
@@ -778,6 +828,7 @@ async def _monitor_task(wallet: str, chat_id: Optional[int]):
             logger.warning(f"monitor loop error: {e}")
             backoff = min(RT_BACKOFF_MAX, backoff * 2)
             await asyncio.sleep(backoff)
+
 # --------------------------------------------------
 # Commands
 # --------------------------------------------------
@@ -1003,6 +1054,7 @@ async def healthz():
 @app.on_event("startup")
 async def on_startup():
     logging.info("✅ Cronos DeFi Sentinel started and is online.")
+    logging.info("Explorer bases configured: %s", EXPLORER_BASES)
     _ensure_dir("./data")
     _ensure_dir(SNAPSHOT_DIR)
     _ensure_ledger()
