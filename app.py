@@ -62,7 +62,7 @@ RT_BACKOFF_MAX  = int(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="3.3")
+app = FastAPI(title="Cronos DeFi Sentinel", version="3.4")
 
 # --------------------------------------------------
 # Telegram send helpers (with safe split)
@@ -253,31 +253,40 @@ def _fmt_qty(x: Decimal) -> str:
     except Exception:
         return str(x)
 # --------------------------------------------------
-# Explorer API (multi-base, per-base mode lock)
+# Explorer API (multi-base, per-base capability lock)
 # --------------------------------------------------
 
-# Aliases για path-style variations (όταν ο server γυρνά 404)
-_MODULE_ALIASES: Dict[str, List[str]] = {
-    "account": ["account", "accounts", "address", "addresses"],
-}
-_ACTION_ALIASES: Dict[str, List[str]] = {
-    "txlist":     ["txlist", "txs", "transactions", "tx", "tx-history"],
-    "tokentx":    ["tokentx", "tokentxs", "token-tx", "tokentransfers", "token-transfers"],
-    "balance":    ["balance", "get-balance", "native-balance", "balances"],
-}
-
-class _RateLimit(Exception): ...
-class _HardNotFound(Exception): ...
-
+# Mode detection per base
 def _base_mode(base: str) -> str:
-    """Return 'etherscan' for cronos.org/explorer/api, 'path' for /api/v1, else guess."""
     b = base.lower()
     if "/explorer/api" in b or b.endswith("/api"):
         return "etherscan"
     if "/api/v1" in b or b.endswith("/v1") or "/api/v2" in b:
         return "path"
-    # fallback heuristic
     return "etherscan" if b.endswith("/api") else "path"
+
+# Per-base capabilities (filled at startup)
+# - etherscan base: supports tokentx, txlist, balance
+# - path v1 base  : supports balance only (no more brute-forcing tokentx/txlist)
+_BASE_CAPS: Dict[str, Dict[str, Any]] = {}
+
+def _init_base_caps():
+    global _BASE_CAPS
+    _BASE_CAPS = {}
+    for b in EXPLORER_BASES:
+        mode = _base_mode(b)
+        if mode == "etherscan":
+            _BASE_CAPS[b] = {"mode": mode, "supports": {"tokentx": True, "txlist": True, "balance": True}}
+        else:
+            # be conservative: only balance is known to exist robustly
+            _BASE_CAPS[b] = {"mode": mode, "supports": {"tokentx": False, "txlist": False, "balance": True}}
+    logging.info("Explorer bases configured: %s", EXPLORER_BASES)
+
+class _RateLimit(Exception): ...
+def _http_raise_for_status(r: requests.Response):
+    if r.status_code == 429:
+        raise _RateLimit("rate limit")
+    r.raise_for_status()
 
 def _explorer_request_etherscan_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
     p = {"module": module, "action": action}
@@ -286,59 +295,37 @@ def _explorer_request_etherscan_style(base: str, module: str, action: str, param
         p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
     url = f"{base}/"
     r = requests.get(url, params=p, timeout=20)
-    if r.status_code == 429:
-        raise _RateLimit("etherscan 429")
-    r.raise_for_status()
+    _http_raise_for_status(r)
     data = r.json()
     return data.get("result") if isinstance(data, dict) and "result" in data else data
 
-def _explorer_request_path_once(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
+def _explorer_request_path_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
+    # Only call exact path; we no longer try aliases for tokentx/txlist
     p = dict(params or {})
     if CRONOS_EXPLORER_API_KEY:
         p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
     url = f"{base}/{module}/{action}"
     r = requests.get(url, params=p, timeout=20)
-    if r.status_code == 404:
-        raise _HardNotFound("path 404")
-    if r.status_code == 429:
-        raise _RateLimit("path 429")
-    r.raise_for_status()
+    _http_raise_for_status(r)
     data = r.json()
-    if isinstance(data, dict) and "result" in data:
-        return data["result"]
-    return data
-
-def _explorer_request_path_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    # Δοκίμασε primary και aliases (module & action) μόνο για PATH mode
-    mod_candidates = _MODULE_ALIASES.get(module, [module])
-    act_candidates = _ACTION_ALIASES.get(action, [action])
-    tried = []
-    for m in mod_candidates:
-        for a in act_candidates:
-            try:
-                return _explorer_request_path_once(base, m, a, params)
-            except _HardNotFound:
-                tried.append(f"{m}/{a}")
-                continue
-    logging.warning("Path-style aliases exhausted for base=%s, tried: %s", base, ", ".join(tried))
-    return None
+    return data["result"] if isinstance(data, dict) and "result" in data else data
 
 def _explorer_call_multi(module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    """
-    Για κάθε base: χρησιμοποιεί ΜΟΝΟ το σωστό mode.
-    etherscan-mode για cronos.org/explorer/api
-    path-mode για explorer-api.cronos.org/mainnet/api/v1
-    """
+    # Try only bases that advertise support for this action
     last_err = None
     for base in EXPLORER_BASES:
-        mode = _base_mode(base)
+        caps = _BASE_CAPS.get(base) or {}
+        mode = caps.get("mode", _base_mode(base))
+        supports = (caps.get("supports") or {})
+        if not supports.get(action, False):
+            continue  # skip bases that don't support this action
+
         try:
             if mode == "etherscan":
                 return _explorer_request_etherscan_style(base, module, action, params)
             else:
-                res = _explorer_request_path_style(base, module, action, params)
-                if res is not None:
-                    return res
+                # currently used only for balance
+                return _explorer_request_path_style(base, module, action, params)
         except _RateLimit as e:
             logging.warning(f"Explorer rate limit at base={base} mode={mode}: {e}")
             last_err = e
@@ -352,7 +339,11 @@ def _explorer_call_multi(module: str, action: str, params: Dict[str, Any]) -> Op
             logging.warning(f"Explorer call fail [{module}.{action}] base={base} mode={mode}: {e}")
             last_err = e
             continue
-    logging.warning(f"Explorer call failed completely [{module}.{action}] — tried bases: {EXPLORER_BASES} (last_err={last_err})")
+
+    # soft-fail: no base could serve the call
+    if action in ("tokentx", "txlist"):
+        # return empty list to keep the monitor alive without noisy logs
+        return []
     return None
 
 def _explorer_tokentx(address: str, startblock: Optional[int] = None) -> List[dict]:
@@ -1059,12 +1050,12 @@ async def healthz():
     return JSONResponse(content={"ok": True, "service": "wallet_monitor_Dex", "status": "running"})
 
 # --------------------------------------------------
-# Startup (start monitor if enabled)
+# Startup (init caps + start monitor if enabled)
 # --------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
     logging.info("✅ Cronos DeFi Sentinel started and is online.")
-    logging.info("Explorer bases configured: %s", EXPLORER_BASES)
+    _init_base_caps()
     _ensure_dir("./data")
     _ensure_dir(SNAPSHOT_DIR)
     _ensure_ledger()
