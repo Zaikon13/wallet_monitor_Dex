@@ -46,26 +46,23 @@ LEDGER_CSV   = os.getenv("LEDGER_CSV", "./data/ledger.csv")
 # Holdings: προτιμά RPC, αν σκάσει -> explorer
 HOLDINGS_BACKEND = (os.getenv("HOLDINGS_BACKEND", "auto") or "auto").lower()
 
-# Explorer settings
-# ΔΕΧΕΤΑΙ ΠΟΛΛΑ BASES (comma-separated) π.χ.:
-#   CRONOS_EXPLORER_API_BASES="https://cronos.org/explorer/api,https://explorer-api.cronos.org/mainnet/api/v1"
-# Αν δεν δοθεί CRONOS_EXPLORER_API_BASES, παίρνει CRONOS_EXPLORER_API_BASE (χωρίς 'S').
+# Explorer settings (πολλαπλές βάσεις)
 _bases_env = os.getenv("CRONOS_EXPLORER_API_BASES") or os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api")
 EXPLORER_BASES: List[str] = [b.strip().rstrip("/") for b in _bases_env.split(",") if b.strip()]
 CRONOS_EXPLORER_API_KEY  = os.getenv("CRONOS_EXPLORER_API_KEY", "").strip()
 if not EXPLORER_BASES:
     EXPLORER_BASES = ["https://cronos.org/explorer/api"]
 
-# Realtime explorer poller (μέσα στο app.py)
+# Realtime explorer poller
 MONITOR_ENABLE  = (os.getenv("MONITOR_ENABLE", "0").strip().lower() in ("1","true","yes","on"))
 RT_POLL_SEC     = float(os.getenv("RT_POLL_SEC", "1.2"))
-RT_DEDUP_SEC    = int(os.getenv("TG_DEDUP_WINDOW_SEC", "60"))  # αντιχρησιμοποιείται και εδώ
+RT_DEDUP_SEC    = int(os.getenv("TG_DEDUP_WINDOW_SEC", "60"))
 RT_BACKOFF_MAX  = int(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="3.2")
+app = FastAPI(title="Cronos DeFi Sentinel", version="3.3")
 
 # --------------------------------------------------
 # Telegram send helpers (with safe split)
@@ -256,10 +253,10 @@ def _fmt_qty(x: Decimal) -> str:
     except Exception:
         return str(x)
 # --------------------------------------------------
-# Explorer API (multi-base + δύο formats + smart fallbacks)
+# Explorer API (multi-base, per-base mode lock)
 # --------------------------------------------------
 
-# Aliases για path-style variations όταν ο server γυρνά 404
+# Aliases για path-style variations (όταν ο server γυρνά 404)
 _MODULE_ALIASES: Dict[str, List[str]] = {
     "account": ["account", "accounts", "address", "addresses"],
 }
@@ -269,27 +266,42 @@ _ACTION_ALIASES: Dict[str, List[str]] = {
     "balance":    ["balance", "get-balance", "native-balance", "balances"],
 }
 
+class _RateLimit(Exception): ...
+class _HardNotFound(Exception): ...
+
+def _base_mode(base: str) -> str:
+    """Return 'etherscan' for cronos.org/explorer/api, 'path' for /api/v1, else guess."""
+    b = base.lower()
+    if "/explorer/api" in b or b.endswith("/api"):
+        return "etherscan"
+    if "/api/v1" in b or b.endswith("/v1") or "/api/v2" in b:
+        return "path"
+    # fallback heuristic
+    return "etherscan" if b.endswith("/api") else "path"
+
 def _explorer_request_etherscan_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    # Etherscan-like: {base}/?module=account&action=tokentx&address=...&sort=asc&apikey=...
     p = {"module": module, "action": action}
     p.update(params or {})
     if CRONOS_EXPLORER_API_KEY:
         p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
     url = f"{base}/"
     r = requests.get(url, params=p, timeout=20)
+    if r.status_code == 429:
+        raise _RateLimit("etherscan 429")
     r.raise_for_status()
     data = r.json()
     return data.get("result") if isinstance(data, dict) and "result" in data else data
 
 def _explorer_request_path_once(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    # Path-style: {base}/{module}/{action}?address=...&apikey=...
     p = dict(params or {})
     if CRONOS_EXPLORER_API_KEY:
         p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
     url = f"{base}/{module}/{action}"
     r = requests.get(url, params=p, timeout=20)
     if r.status_code == 404:
-        raise requests.HTTPError("404", response=r)
+        raise _HardNotFound("path 404")
+    if r.status_code == 429:
+        raise _RateLimit("path 429")
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and "result" in data:
@@ -297,7 +309,7 @@ def _explorer_request_path_once(base: str, module: str, action: str, params: Dic
     return data
 
 def _explorer_request_path_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    # Δοκίμασε primary και aliases (module & action) σε 404.
+    # Δοκίμασε primary και aliases (module & action) μόνο για PATH mode
     mod_candidates = _MODULE_ALIASES.get(module, [module])
     act_candidates = _ACTION_ALIASES.get(action, [action])
     tried = []
@@ -305,42 +317,42 @@ def _explorer_request_path_style(base: str, module: str, action: str, params: Di
         for a in act_candidates:
             try:
                 return _explorer_request_path_once(base, m, a, params)
-            except requests.HTTPError as e:
+            except _HardNotFound:
                 tried.append(f"{m}/{a}")
-                if getattr(e, "response", None) is not None and e.response.status_code == 404:
-                    continue  # δοκίμασε το επόμενο alias
-                # άλλο error; σταμάτα και πέτα το προς τα πάνω
-                raise
+                continue
     logging.warning("Path-style aliases exhausted for base=%s, tried: %s", base, ", ".join(tried))
-    # Τελικά δεν βρέθηκε route
-    raise requests.HTTPError(f"No path matched for base={base}")
-
-def _looks_etherscan(base: str) -> bool:
-    b = base.lower()
-    return b.endswith("/api") or "/explorer/api" in b
+    return None
 
 def _explorer_call_multi(module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
     """
-    Δοκιμάζει όλα τα bases με 2 modes:
-    1) Etherscan-style (/?module=...&action=...)
-    2) Path-style (/module/action + aliases)
-    Επιστρέφει το πρώτο valid result ή None.
+    Για κάθε base: χρησιμοποιεί ΜΟΝΟ το σωστό mode.
+    etherscan-mode για cronos.org/explorer/api
+    path-mode για explorer-api.cronos.org/mainnet/api/v1
     """
+    last_err = None
     for base in EXPLORER_BASES:
-        order = ("etherscan", "path") if _looks_etherscan(base) else ("path", "etherscan")
-        for mode in order:
-            try:
-                if mode == "etherscan":
-                    res = _explorer_request_etherscan_style(base, module, action, params)
-                else:
-                    res = _explorer_request_path_style(base, module, action, params)
-                return res
-            except requests.HTTPError as e:
-                code = getattr(e, "response", None).status_code if getattr(e, "response", None) else "?"
-                logging.warning(f"Explorer call fail [{module}.{action} @ {mode}] base={base}: {code} {e}")
-            except Exception as e:
-                logging.warning(f"Explorer call fail [{module}.{action} @ {mode}] base={base}: {e}")
-    logging.warning(f"Explorer call failed completely [{module}.{action}] — tried bases: {EXPLORER_BASES}")
+        mode = _base_mode(base)
+        try:
+            if mode == "etherscan":
+                return _explorer_request_etherscan_style(base, module, action, params)
+            else:
+                res = _explorer_request_path_style(base, module, action, params)
+                if res is not None:
+                    return res
+        except _RateLimit as e:
+            logging.warning(f"Explorer rate limit at base={base} mode={mode}: {e}")
+            last_err = e
+            continue
+        except requests.HTTPError as e:
+            code = getattr(e, "response", None).status_code if getattr(e, "response", None) else "?"
+            logging.warning(f"Explorer call fail [{module}.{action}] base={base} mode={mode}: {code} {e}")
+            last_err = e
+            continue
+        except Exception as e:
+            logging.warning(f"Explorer call fail [{module}.{action}] base={base} mode={mode}: {e}")
+            last_err = e
+            continue
+    logging.warning(f"Explorer call failed completely [{module}.{action}] — tried bases: {EXPLORER_BASES} (last_err={last_err})")
     return None
 
 def _explorer_tokentx(address: str, startblock: Optional[int] = None) -> List[dict]:
@@ -739,7 +751,6 @@ class _Dedup:
 
     def seen(self, key: str) -> bool:
         now = time.time()
-        # καθάρισε παλιά
         for k, t0 in list(self.last.items()):
             if now - t0 > self.window:
                 del self.last[k]
@@ -1009,7 +1020,6 @@ def _dispatch_command(text: str) -> str:
     if cmd == "/snapshots":
         return _handle_snapshots()
     if cmd == "/pnl":
-        # υποστηρίζει: /pnl <date/stamp>  ΚΑΙ /pnl today [SYM]
         if len(parts) >= 2 and parts[1].lower() == "today":
             sym = parts[2].upper() if len(parts) >= 3 else None
             return _handle_pnl_today(sym)
