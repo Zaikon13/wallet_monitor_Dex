@@ -11,7 +11,7 @@ import time
 import asyncio
 import logging
 import requests
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,23 +46,79 @@ LEDGER_CSV   = os.getenv("LEDGER_CSV", "./data/ledger.csv")
 # Holdings: προτιμά RPC, αν σκάσει -> explorer
 HOLDINGS_BACKEND = (os.getenv("HOLDINGS_BACKEND", "auto") or "auto").lower()
 
-# Explorer settings (πολλαπλές βάσεις)
-_bases_env = os.getenv("CRONOS_EXPLORER_API_BASES") or os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api")
-EXPLORER_BASES: List[str] = [b.strip().rstrip("/") for b in _bases_env.split(",") if b.strip()]
+# Explorer settings (ΠΡΟΣΟΧΗ: ΧΩΡΙΣ το 'S' όπως ζήτησες)
+# Παραδείγματα:
+#  - https://explorer-api.cronos.org/mainnet/api/v1
+#  - https://cronos.org/explorer/api
+CRONOS_EXPLORER_API_BASE = (os.getenv("CRONOS_EXPLORER_API_BASE", "https://cronos.org/explorer/api").rstrip("/"))
 CRONOS_EXPLORER_API_KEY  = os.getenv("CRONOS_EXPLORER_API_KEY", "").strip()
-if not EXPLORER_BASES:
-    EXPLORER_BASES = ["https://cronos.org/explorer/api"]
 
-# Realtime explorer poller
+# Optional multi-base list (comma-separated). If not provided, we compose it from BASE and the v1 path.
+CRONOS_EXPLORER_API_BASES = os.getenv(
+    "CRONOS_EXPLORER_API_BASES",
+    f"{CRONOS_EXPLORER_API_BASE},https://explorer-api.cronos.org/mainnet/api/v1"
+)
+
+# Realtime explorer poller (μέσα στο app.py)
 MONITOR_ENABLE  = (os.getenv("MONITOR_ENABLE", "0").strip().lower() in ("1","true","yes","on"))
 RT_POLL_SEC     = float(os.getenv("RT_POLL_SEC", "1.2"))
-RT_DEDUP_SEC    = int(os.getenv("TG_DEDUP_WINDOW_SEC", "60"))
-RT_BACKOFF_MAX  = int(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
+RT_DEDUP_SEC    = int(os.getenv("TG_DEDUP_WINDOW_SEC", "60"))  # αντιχρησιμοποιείται και εδώ
+RT_BACKOFF_MAX  = float(os.getenv("RT_BACKOFF_MAX_SEC", "20"))
+
+# Circuit breaker & logging throttling envs
+_CB_MAX_FAIL = int(os.getenv("EXPLORER_CB_MAX_FAIL", "3"))
+_CB_OPEN_SEC = int(os.getenv("EXPLORER_CB_OPEN_SEC", "30"))
+_LOG_SUPPRESS_SEC = int(os.getenv("EXPLORER_LOG_SUPPRESS_SEC", "60"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = FastAPI(title="Cronos DeFi Sentinel", version="3.4")
+app = FastAPI(title="Cronos DeFi Sentinel", version="3.1")
+
+# --------------------------------------------------
+# Throttled logging & circuit breaker helpers
+# --------------------------------------------------
+class _LogThrottler:
+    def __init__(self):
+        self._last: Dict[str, float] = {}
+
+    def should_log(self, key: str, every_sec: int = 60) -> bool:
+        now = time.time()
+        t0 = self._last.get(key, 0)
+        if now - t0 >= every_sec:
+            self._last[key] = now
+            return True
+        return False
+
+class _CircuitBreaker:
+    """
+    Opens when too many recent 5xx/429s occur on a base.
+    Closes automatically after 'open_sec'.
+    """
+    def __init__(self, max_failures: int, open_sec: int):
+        self.max_failures = max_failures
+        self.open_sec = open_sec
+        self.fail_count = 0
+        self.open_until = 0.0
+
+    def allow(self) -> bool:
+        return time.time() >= self.open_until
+
+    def record_success(self) -> None:
+        self.fail_count = 0
+        self.open_until = 0.0
+
+    def record_failure(self, status_code: Optional[int] = None) -> None:
+        # count only hard/soft rate faults
+        if status_code is None or status_code >= 500 or status_code == 429:
+            self.fail_count += 1
+            if self.fail_count >= self.max_failures:
+                self.open_until = time.time() + self.open_sec
+                # keep one failure so we don’t re-open immediately after cool down
+                self.fail_count = 1
+
+_LOG_THR = _LogThrottler()
+_CB_BY_BASE: Dict[str, _CircuitBreaker] = {}
 
 # --------------------------------------------------
 # Telegram send helpers (with safe split)
@@ -253,126 +309,95 @@ def _fmt_qty(x: Decimal) -> str:
     except Exception:
         return str(x)
 # --------------------------------------------------
-# Explorer API (multi-base, per-base capability lock)
+# Explorer API (multi-base, etherscan-like, throttled logs + CB)
 # --------------------------------------------------
+def _explorer_bases() -> List[str]:
+    bases = [b.strip().rstrip("/") for b in CRONOS_EXPLORER_API_BASES.split(",") if b.strip()]
+    logging.info("Explorer bases: %s", bases)
+    return bases
 
-# Mode detection per base
-def _base_mode(base: str) -> str:
-    b = base.lower()
-    if "/explorer/api" in b or b.endswith("/api"):
-        return "etherscan"
-    if "/api/v1" in b or b.endswith("/v1") or "/api/v2" in b:
-        return "path"
-    return "etherscan" if b.endswith("/api") else "path"
+def _cb_for(base: str) -> _CircuitBreaker:
+    cb = _CB_BY_BASE.get(base)
+    if not cb:
+        cb = _CircuitBreaker(_CB_MAX_FAIL, _CB_OPEN_SEC)
+        _CB_BY_BASE[base] = cb
+    return cb
 
-# Per-base capabilities (filled at startup)
-# - etherscan base: supports tokentx, txlist, balance
-# - path v1 base  : supports balance only (no more brute-forcing tokentx/txlist)
-_BASE_CAPS: Dict[str, Dict[str, Any]] = {}
-
-def _init_base_caps():
-    global _BASE_CAPS
-    _BASE_CAPS = {}
-    for b in EXPLORER_BASES:
-        mode = _base_mode(b)
-        if mode == "etherscan":
-            _BASE_CAPS[b] = {"mode": mode, "supports": {"tokentx": True, "txlist": True, "balance": True}}
-        else:
-            # be conservative: only balance is known to exist robustly
-            _BASE_CAPS[b] = {"mode": mode, "supports": {"tokentx": False, "txlist": False, "balance": True}}
-    logging.info("Explorer bases configured: %s", EXPLORER_BASES)
-
-class _RateLimit(Exception): ...
-def _http_raise_for_status(r: requests.Response):
-    if r.status_code == 429:
-        raise _RateLimit("rate limit")
-    r.raise_for_status()
-
-def _explorer_request_etherscan_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    p = {"module": module, "action": action}
-    p.update(params or {})
-    if CRONOS_EXPLORER_API_KEY:
-        p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
-    url = f"{base}/"
-    r = requests.get(url, params=p, timeout=20)
-    _http_raise_for_status(r)
-    data = r.json()
-    return data.get("result") if isinstance(data, dict) and "result" in data else data
-
-def _explorer_request_path_style(base: str, module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    # Only call exact path; we no longer try aliases for tokentx/txlist
+def _explorer_call_any(module: str, action: str, params: Dict[str, Any]) -> Any:
+    """
+    Tries all configured bases with etherscan-like query:
+      <base>/?module=account&action=tokentx&...
+    Circuit-breakers per base + throttled warnings.
+    Returns parsed JSON ('result' if present) or None.
+    """
+    headers = {"Accept": "application/json"}
     p = dict(params or {})
     if CRONOS_EXPLORER_API_KEY:
         p.setdefault("apikey", CRONOS_EXPLORER_API_KEY)
-    url = f"{base}/{module}/{action}"
-    r = requests.get(url, params=p, timeout=20)
-    _http_raise_for_status(r)
-    data = r.json()
-    return data["result"] if isinstance(data, dict) and "result" in data else data
 
-def _explorer_call_multi(module: str, action: str, params: Dict[str, Any]) -> Optional[Any]:
-    # Try only bases that advertise support for this action
-    last_err = None
-    for base in EXPLORER_BASES:
-        caps = _BASE_CAPS.get(base) or {}
-        mode = caps.get("mode", _base_mode(base))
-        supports = (caps.get("supports") or {})
-        if not supports.get(action, False):
-            continue  # skip bases that don't support this action
+    last_err: Optional[Exception] = None
+    for base in _explorer_bases():
+        cb = _cb_for(base)
+        if not cb.allow():
+            if _LOG_THR.should_log(f"cb.open.{base}", _LOG_SUPPRESS_SEC):
+                logging.warning("Explorer base paused by circuit-breaker: %s", base)
+            continue
+
+        url = f"{base}/"
+        qp = {"module": module, "action": action}
+        qp.update(p)
 
         try:
-            if mode == "etherscan":
-                return _explorer_request_etherscan_style(base, module, action, params)
-            else:
-                # currently used only for balance
-                return _explorer_request_path_style(base, module, action, params)
-        except _RateLimit as e:
-            logging.warning(f"Explorer rate limit at base={base} mode={mode}: {e}")
+            r = requests.get(url, params=qp, headers=headers, timeout=15)
+            if r.status_code >= 500 or r.status_code == 429:
+                cb.record_failure(status_code=r.status_code)
+                if _LOG_THR.should_log(f"expl.fail.{base}.{module}.{action}", _LOG_SUPPRESS_SEC):
+                    logging.warning("Explorer soft-fail [%s.%s] base=%s: %s %s",
+                                    module, action, base, r.status_code, r.text[:160])
+                last_err = requests.HTTPError(f"{r.status_code} {r.reason}")
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            cb.record_success()
+
+            # Etherscan-like: dict with 'result'
+            if isinstance(data, dict) and "result" in data:
+                return data["result"]
+            return data
+        except requests.RequestException as e:
+            cb.record_failure(status_code=None)
             last_err = e
-            continue
-        except requests.HTTPError as e:
-            code = getattr(e, "response", None).status_code if getattr(e, "response", None) else "?"
-            logging.warning(f"Explorer call fail [{module}.{action}] base={base} mode={mode}: {code} {e}")
-            last_err = e
+            if _LOG_THR.should_log(f"expl.exc.{base}.{module}.{action}", _LOG_SUPPRESS_SEC):
+                logging.warning("Explorer call exception [%s.%s] base=%s: %s",
+                                module, action, base, repr(e))
             continue
         except Exception as e:
-            logging.warning(f"Explorer call fail [{module}.{action}] base={base} mode={mode}: {e}")
             last_err = e
+            if _LOG_THR.should_log(f"expl.other.{base}.{module}.{action}", _LOG_SUPPRESS_SEC):
+                logging.warning("Explorer unexpected error [%s.%s] base=%s: %s",
+                                module, action, base, repr(e))
             continue
 
-    # soft-fail: no base could serve the call
-    if action in ("tokentx", "txlist"):
-        # return empty list to keep the monitor alive without noisy logs
-        return []
+    if last_err and _LOG_THR.should_log(f"expl.fail.final.{module}.{action}", _LOG_SUPPRESS_SEC):
+        logging.warning("Explorer call failed completely [%s.%s] — all bases exhausted.", module, action)
     return None
 
-def _explorer_tokentx(address: str, startblock: Optional[int] = None) -> List[dict]:
-    params = {"address": address, "sort": "asc"}
-    if startblock is not None:
-        params["startblock"] = startblock
-    res = _explorer_call_multi("account", "tokentx", params)
+def _explorer_tokentx(address: str) -> List[dict]:
+    res = _explorer_call_any("account", "tokentx", {"address": address, "sort": "asc"})
     return res or []
 
-def _explorer_txlist(address: str, startblock: Optional[int] = None) -> List[dict]:
-    params = {"address": address, "sort": "asc"}
-    if startblock is not None:
-        params["startblock"] = startblock
-    res = _explorer_call_multi("account", "txlist", params)
+def _explorer_txlist(address: str) -> List[dict]:
+    res = _explorer_call_any("account", "txlist", {"address": address, "sort": "asc"})
     return res or []
 
 def _explorer_balance_native(address: str) -> Decimal:
-    res = _explorer_call_multi("account", "balance", {"address": address})
+    res = _explorer_call_any("account", "balance", {"address": address})
     val = None
     if isinstance(res, dict):
         val = res.get("result")
-    elif isinstance(res, str):
+    elif isinstance(res, (str, int, float)):
         val = res
-    elif isinstance(res, (int, float)):
-        val = res
-    elif isinstance(res, list) and res:
-        maybe = res[0] if isinstance(res[0], dict) else None
-        if maybe:
-            val = maybe.get("balance") or maybe.get("result")
     try:
         return _to_dec(val) / Decimal(10**18)
     except Exception:
@@ -410,7 +435,7 @@ def _holdings_auto(wallet: str) -> Tuple[List[Dict[str, Any]], str]:
                 a["value_usd"] = _to_dec(a.get("value_usd", amt * px)) or (amt * px)
             return assets, "rpc"
         except Exception:
-            logger.warning("RPC holdings failed, switching to Explorer")
+            logging.warning("RPC holdings failed, switching to Explorer")
 
     # Explorer fallback
     toks = _explorer_tokentx(wallet)
@@ -506,6 +531,7 @@ def _filter_and_sort_assets(assets: list) -> tuple[list, int]:
         visible = visible[:limit]
 
     return visible, hidden
+
 def _assets_list_to_mapping(assets: list) -> dict:
     out: Dict[str, Dict[str, Any]] = OrderedDict()
     for item in assets:
@@ -574,7 +600,7 @@ def _compare_to_snapshot(curr_total: Decimal, snap: dict) -> Tuple[Decimal, Deci
     return delta, pct, label
 
 # --------------------------------------------------
-# Ledger helpers (CSV) & intraday backfill
+# Ledger helpers (CSV)
 # --------------------------------------------------
 def _ensure_ledger():
     base = os.path.dirname(LEDGER_CSV)
@@ -655,6 +681,9 @@ def _format_trades_output(rows: List[dict], title: str) -> str:
     lines.append(f"\nNet USD flow today: ${_fmt_money(net_flow)}")
     return "\n".join(lines)
 
+# --------------------------------------------------
+# Explorer backfill (ΣΗΜΕΡΑ) -> ledger, με spot price
+# --------------------------------------------------
 def _explorer_backfill_today_to_ledger(wallet: str) -> int:
     _ensure_ledger()
     start, end = _today_range()
@@ -731,9 +760,8 @@ def _explorer_backfill_today_to_ledger(wallet: str) -> int:
                 continue
 
     return wrote
-
 # --------------------------------------------------
-# Realtime monitor (Explorer polling, CRC20 + CRO)
+# Realtime monitor (Explorer polling, CRC20 + CRO) with adaptive backoff
 # --------------------------------------------------
 class _Dedup:
     def __init__(self, window_sec: int = 60):
@@ -751,85 +779,109 @@ class _Dedup:
         return False
 
 async def _monitor_task(wallet: str, chat_id: Optional[int]):
-    logger.info("Realtime: explorer poller enabled (%.2fs)", RT_POLL_SEC)
-    logger.info("Explorer bases: %s", EXPLORER_BASES)
+    logging.info("Realtime: explorer poller enabled (%.2fs)", RT_POLL_SEC)
     _ensure_ledger()
     dedup = _Dedup(RT_DEDUP_SEC)
     wl = wallet.lower()
 
     last_token_ts = 0
     last_native_ts = 0
-    backoff = 1.0
 
+    sleep_sec = RT_POLL_SEC
     while True:
         try:
-            # CRC20
+            made_progress = False
+
+            # --- CRC20 ---
             tok = _explorer_tokentx(wallet) or []
-            for r in tok:
-                try:
-                    ts = int(r.get("timeStamp", "0"))
-                    if ts <= last_token_ts:
-                        continue
-                    frm = (r.get("from") or "").lower()
-                    to  = (r.get("to") or "").lower()
-                    if wl not in (frm, to):
-                        continue
-                    sym = (r.get("tokenSymbol") or "").upper() or "TOKEN"
-                    dec = int(r.get("tokenDecimal") or 18)
-                    qty = _to_dec(r.get("value")) / (Decimal(10) ** dec)
-                    side = "IN" if to == wl else "OUT"
-                    px = _to_dec(get_spot_usd(sym, token_address=(r.get("contractAddress") or "").lower()))
-                    ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
-                    txh = r.get("hash") or ""
-                    key = f"TOK:{txh}:{side}:{sym}:{qty}"
-                    if not dedup.seen(key):
-                        with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
-                            w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
-                            w.writerow({"ts": ts_iso, "symbol": sym, "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
-                        flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
-                        send_message(f"🟡 Trade\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} {sym} {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}", chat_id)
-                except Exception:
-                    continue
             if tok:
-                last_token_ts = max(last_token_ts, max(int(x.get("timeStamp", "0")) for x in tok if x.get("timeStamp")))
+                new_max_ts = last_token_ts
+                for r in tok:
+                    try:
+                        ts = int(r.get("timeStamp", "0"))
+                        if ts <= last_token_ts:
+                            continue
+                        frm = (r.get("from") or "").lower()
+                        to  = (r.get("to") or "").lower()
+                        if wl not in (frm, to):
+                            continue
+                        sym = (r.get("tokenSymbol") or "").upper() or "TOKEN"
+                        dec = int(r.get("tokenDecimal") or 18)
+                        qty = _to_dec(r.get("value")) / (Decimal(10) ** dec)
+                        side = "IN" if to == wl else "OUT"
+                        px = _to_dec(get_spot_usd(sym, token_address=(r.get("contractAddress") or "").lower()))
+                        ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
+                        txh = r.get("hash") or ""
+                        key = f"TOK:{txh}:{side}:{sym}:{qty}"
+                        if not dedup.seen(key):
+                            with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
+                                w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
+                                w.writerow({"ts": ts_iso, "symbol": sym, "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
+                            flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
+                            send_message(
+                                f"🟡 Trade\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} {sym} {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}",
+                                chat_id
+                            )
+                            made_progress = True
+                        if ts > new_max_ts:
+                            new_max_ts = ts
+                    except Exception:
+                        continue
+                if new_max_ts > last_token_ts:
+                    last_token_ts = new_max_ts
 
-            # Native CRO
+            # --- Native CRO ---
             txs = _explorer_txlist(wallet) or []
-            for r in txs:
-                try:
-                    ts = int(r.get("timeStamp", "0"))
-                    if ts <= last_native_ts:
-                        continue
-                    frm = (r.get("from") or "").lower()
-                    to  = (r.get("to") or "").lower()
-                    if wl not in (frm, to):
-                        continue
-                    value_wei = _to_dec(r.get("value"))
-                    if value_wei <= 0:
-                        continue
-                    qty = value_wei / Decimal(10**18)
-                    side = "IN" if to == wl else "OUT"
-                    px = _to_dec(get_spot_usd("CRO", token_address=None))
-                    ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
-                    txh = r.get("hash") or ""
-                    key = f"NAT:{txh}:{side}:{qty}"
-                    if not dedup.seen(key):
-                        with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
-                            w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
-                            w.writerow({"ts": ts_iso, "symbol": "CRO", "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
-                        flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
-                        send_message(f"🟡 Transfer\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} CRO {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}", chat_id)
-                except Exception:
-                    continue
             if txs:
-                last_native_ts = max(last_native_ts, max(int(x.get("timeStamp", "0")) for x in txs if x.get("timeStamp")))
+                new_max_ts = last_native_ts
+                for r in txs:
+                    try:
+                        ts = int(r.get("timeStamp", "0"))
+                        if ts <= last_native_ts:
+                            continue
+                        frm = (r.get("from") or "").lower()
+                        to  = (r.get("to") or "").lower()
+                        if wl not in (frm, to):
+                            continue
+                        value_wei = _to_dec(r.get("value"))
+                        if value_wei <= 0:
+                            continue
+                        qty = value_wei / Decimal(10**18)
+                        side = "IN" if to == wl else "OUT"
+                        px = _to_dec(get_spot_usd("CRO", token_address=None))
+                        ts_iso = datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).isoformat()
+                        txh = r.get("hash") or ""
+                        key = f"NAT:{txh}:{side}:{qty}"
+                        if not dedup.seen(key):
+                            with open(LEDGER_CSV, "a", newline="", encoding="utf-8") as f:
+                                w = csv.DictWriter(f, fieldnames=["ts","symbol","qty","side","price_usd","tx"])
+                                w.writerow({"ts": ts_iso, "symbol": "CRO", "qty": str(qty), "side": side, "price_usd": str(px), "tx": txh})
+                            flow = qty * px * (Decimal(1) if side=="IN" else Decimal(-1))
+                            send_message(
+                                f"🟡 Transfer\n• {datetime.fromtimestamp(ts, tz=ZoneInfo(TZ)).strftime('%H:%M:%S')} — {side} CRO {_fmt_qty(qty)} @ ${_fmt_price(px)}  (${_fmt_money(flow)})\n{txh}",
+                                chat_id
+                            )
+                            made_progress = True
+                        if ts > new_max_ts:
+                            new_max_ts = ts
+                    except Exception:
+                        continue
+                if new_max_ts > last_native_ts:
+                    last_native_ts = new_max_ts
 
-            backoff = 1.0
-            await asyncio.sleep(RT_POLL_SEC)
+            # adaptive backoff: if no new data, increase up to RT_BACKOFF_MAX; else reset
+            if made_progress:
+                sleep_sec = RT_POLL_SEC
+            else:
+                sleep_sec = min(RT_BACKOFF_MAX, max(RT_POLL_SEC, sleep_sec * 1.5))
+
+            await asyncio.sleep(sleep_sec)
+
         except Exception as e:
-            logger.warning(f"monitor loop error: {e}")
-            backoff = min(RT_BACKOFF_MAX, backoff * 2)
-            await asyncio.sleep(backoff)
+            if _LOG_THR.should_log("monitor.loop.error", _LOG_SUPPRESS_SEC):
+                logging.warning("monitor loop error: %s", repr(e))
+            sleep_sec = min(RT_BACKOFF_MAX, max(RT_POLL_SEC, sleep_sec * 2))
+            await asyncio.sleep(sleep_sec)
 
 # --------------------------------------------------
 # Commands
@@ -1050,17 +1102,18 @@ async def healthz():
     return JSONResponse(content={"ok": True, "service": "wallet_monitor_Dex", "status": "running"})
 
 # --------------------------------------------------
-# Startup (init caps + start monitor if enabled)
+# Startup (start monitor if enabled)
 # --------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
     logging.info("✅ Cronos DeFi Sentinel started and is online.")
-    _init_base_caps()
+    logging.info("Explorer bases configured: %s", [b.strip() for b in CRONOS_EXPLORER_API_BASES.split(",") if b.strip()])
     _ensure_dir("./data")
     _ensure_dir(SNAPSHOT_DIR)
     _ensure_ledger()
     try:
-        send_message("✅ Cronos DeFi Sentinel started and is online.", CHAT_ID)
+        if CHAT_ID:
+            send_message("✅ Cronos DeFi Sentinel started and is online.", CHAT_ID)
     except Exception:
         pass
 
@@ -1073,7 +1126,7 @@ async def on_startup():
                 try:
                     await _runner()
                 except Exception as e:
-                    logging.exception(f"monitor crashed: {e}")
+                    # throttled inside monitor; small pause before restart
                     await asyncio.sleep(3)
 
         asyncio.create_task(_supervisor())
