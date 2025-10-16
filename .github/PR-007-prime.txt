@@ -1,0 +1,1 @@
+PR-007′ executed: attempted merges 001→002→003 gated by CI status. See PR timelines for comments if blocked.
